@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 64" width="280" height="64" role="img" aria-label="MemeLab CDA v3">
+  <defs>
+    <linearGradient id="agar" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ea580c"/>
+      <stop offset="1" stop-color="#c2410c"/>
+    </linearGradient>
+    <radialGradient id="dish" cx="50%" cy="50%" r="50%">
+      <stop offset="60%" stop-color="#ea580c" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ea580c" stop-opacity="0.0"/>
+    </radialGradient>
+  </defs>
+  <g transform="translate(0 0)">
+    <circle cx="32" cy="32" r="28" fill="url(#dish)" stroke="url(#agar)" stroke-width="2.4"/>
+    <circle cx="32" cy="32" r="20" fill="none" stroke="url(#agar)" stroke-width="1" opacity="0.55"/>
+    <path d="M32 12 C 27.5 17, 27.5 22, 32 27 C 36.5 32, 36.5 37, 32 42 C 27.5 47, 27.5 52, 32 52"
+          fill="none" stroke="url(#agar)" stroke-width="2.2" stroke-linecap="round"/>
+    <g stroke="url(#agar)" stroke-width="1.6" stroke-linecap="round">
+      <line x1="28.5" y1="14.6" x2="35.5" y2="14.6"/>
+      <line x1="28.6" y1="20.0" x2="35.4" y2="20.0"/>
+      <line x1="28.5" y1="33.5" x2="35.5" y2="33.5"/>
+      <line x1="28.5" y1="39.0" x2="35.5" y2="39.0"/>
+      <line x1="28.5" y1="49.0" x2="35.5" y2="49.0"/>
+    </g>
+    <g transform="translate(46 22)">
+      <circle r="4.6" fill="url(#agar)"/>
+      <circle r="1.8" fill="#fff8e6"/>
+      <g stroke="url(#agar)" stroke-width="1.2" stroke-linecap="round">
+        <line x1="0" y1="-4.6" x2="0" y2="-7.6"/>
+        <line x1="0" y1="4.6" x2="0" y2="7.6"/>
+        <line x1="-4.6" y1="0" x2="-7.6" y2="0"/>
+        <line x1="4.6" y1="0" x2="7.6" y2="0"/>
+      </g>
+    </g>
+  </g>
+  <g font-family="Space Grotesk, system-ui, sans-serif" font-weight="700">
+    <text x="74" y="34" font-size="22" fill="#2a2317">MemeLab</text>
+    <text x="74" y="50" font-size="11" fill="#6b5e44" letter-spacing="2">CELLULAR DEFENSE AUTOMATA</text>
+    <g transform="translate(196 18)">
+      <rect width="32" height="18" rx="9" fill="url(#agar)"/>
+      <text x="16" y="13" font-size="11" font-weight="700" fill="#fff8e6" text-anchor="middle">v3</text>
+    </g>
+  </g>
+</svg>
