@@ -278,11 +278,15 @@ export class ControlPanel {
         onChange: (v) => { this.cfg.strain.range = v | 0; this.dirty(); },
       }),
       immunityDays: new Slider({
-        id: 'imm', label: 'Immunity duration', min: 90, max: 36500, step: 5,
-        value: Math.max(90, s.immunityDays),
+        // Log-scaled 0..1000 → 90 days .. 36500 days. Linear was useless: 25%
+        // of slider already read "lifelong" and 99% of the dial sat in years
+        // 25-100. Log distribution puts 1 year at ~25%, 10 years at ~62%,
+        // and "lifelong" at the very top.
+        id: 'imm', label: 'Immunity duration', min: 0, max: 1000, step: 1,
+        value: immunityDaysToPos(Math.max(90, s.immunityDays)),
         hint: 'Mean days a recovered cell stays immune before becoming susceptible again. With a finite window plus a large enough population, infections persist endemically — the classic CDA insight.',
-        format: (v) => formatDays(v),
-        onChange: (v) => { this.cfg.strain.immunityDays = Math.max(90, v | 0); this.dirty(); },
+        format: (pos) => formatDays(immunityPosToDays(pos)),
+        onChange: (pos) => { this.cfg.strain.immunityDays = immunityPosToDays(pos); this.dirty(); },
       }),
       mutationRate: new Slider({
         id: 'mut', label: 'Mutation rate', min: 0, max: 50, step: 1, unit: '%',
@@ -412,7 +416,7 @@ export class ControlPanel {
     this.strainSliders.infectious.setValue(g.infectious, true);
     this.strainSliders.ifr.setValue(Math.round(g.ifr * 100), true);
     this.strainSliders.range.setValue(g.range, true);
-    this.strainSliders.immunityDays.setValue(g.immunityDays, true);
+    this.strainSliders.immunityDays.setValue(immunityDaysToPos(Math.max(90, g.immunityDays)), true);
     this.strainSliders.mutationRate.setValue(Math.round(g.mutationRate * 100), true);
   }
 
@@ -490,7 +494,8 @@ export class ControlPanel {
 }
 
 function formatDays(v: number): string {
-  if (v >= 365 * 25) return 'lifelong';
+  // "lifelong" reserved for the very top of the slider — see IMMUNITY_MAX_DAYS.
+  if (v >= IMMUNITY_MAX_DAYS) return 'lifelong';
   if (v >= 365 * 2) {
     const years = v / 365;
     return `${years % 1 === 0 ? years.toFixed(0) : years.toFixed(1)} years`;
@@ -500,4 +505,24 @@ function formatDays(v: number): string {
     return `${months % 1 === 0 ? months.toFixed(0) : months.toFixed(1)} months`;
   }
   return `${v} day${v === 1 ? '' : 's'}`;
+}
+
+// Logarithmic mapping for the immunity-duration slider. Pos is the underlying
+// integer slider value (0..1000); days is what the engine actually consumes.
+const IMMUNITY_MIN_DAYS = 90;
+const IMMUNITY_MAX_DAYS = 36500;
+const IMMUNITY_POS_RANGE = 1000;
+const IMMUNITY_LOG_RATIO = Math.log(IMMUNITY_MAX_DAYS / IMMUNITY_MIN_DAYS);
+
+function immunityPosToDays(pos: number): number {
+  const p = pos / IMMUNITY_POS_RANGE;
+  if (p <= 0) return IMMUNITY_MIN_DAYS;
+  if (p >= 1) return IMMUNITY_MAX_DAYS;
+  return Math.round(IMMUNITY_MIN_DAYS * Math.exp(IMMUNITY_LOG_RATIO * p));
+}
+
+function immunityDaysToPos(days: number): number {
+  if (days <= IMMUNITY_MIN_DAYS) return 0;
+  if (days >= IMMUNITY_MAX_DAYS) return IMMUNITY_POS_RANGE;
+  return Math.round(IMMUNITY_POS_RANGE * Math.log(days / IMMUNITY_MIN_DAYS) / IMMUNITY_LOG_RATIO);
 }

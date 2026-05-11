@@ -589,6 +589,7 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   font-variant-numeric: tabular-nums;
 }
 .slider-info {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -609,6 +610,18 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 .slider-info:hover {
   background: var(--accent);
   color: var(--bg-elevated);
+}
+/* Invisible 36px tap target around the visible icon — keeps the icon
+   compact on desktop while giving touch users a comfortable hit area. */
+.slider-info::before {
+  content: '';
+  position: absolute;
+  inset: -12px;
+  border-radius: 50%;
+}
+@media (pointer: coarse) {
+  .slider-info { width: 18px; height: 18px; font-size: 11px; margin-left: 8px; }
+  .slider-info::before { inset: -14px; }
 }
 
 /* ==== Preset picker ==== */
@@ -1023,7 +1036,7 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   .left-panel  { order: 1; }
   .right-panel { order: 2; }
   .left-panel, .right-panel { flex-direction: row; flex-wrap: wrap; overflow: visible; }
-  .left-panel .panel, .right-panel .panel { flex: 1 1 280px; }
+  .left-panel > .panel, .right-panel > .panel { flex: 1 1 280px; }
   .stats-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   /* The single-column layout has no row constraint, so 100cqh resolves to
      undefined or zero and the dish disappears. Replace the cq math with a

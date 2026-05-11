@@ -291,9 +291,20 @@ export class Engine {
     //    endemic. With small populations, stochastic dynamics will sometimes
     //    drive E+I to zero before a wane resupplies S. When that happens AND
     //    immunity is not lifelong AND the user enabled the reseed flag (true
-    //    by default), we re-introduce one infectious cell to keep the dynamic
-    //    going. This mirrors the "external import" mechanism that real-world
-    //    SEIRS sims need to model migration / out-of-network exposure.
+    //    by default), we attempt to re-introduce one infectious cell. This
+    //    mirrors the "external import" mechanism that real-world SEIRS sims
+    //    need to model migration / out-of-network exposure.
+    //
+    //    The import attempt is subject to the same defenses an ordinary
+    //    transmission would face — every active intervention gates the import
+    //    so that fully-tuned interventions actually halt the outbreak instead
+    //    of being silently overridden by a uniform reseed:
+    //      • mask + vaccine protection of the target cell (via protectionMultiplier)
+    //      • lockdown transmission reduction (global)
+    //      • quarantine source control (modeled as border-enforcement against
+    //        the incoming infected case — there's no in-sim source to control,
+    //        so we apply it as a global gate when quarantine is active)
+    //      • quarantine protection if the target is currently quarantined
     if (this.config.reseedOnExtinction !== false) {
       const seedStrain = this.strains.get(0);
       if (seedStrain.immunityDays < 36500 && this.tick > 30) {
@@ -306,14 +317,19 @@ export class Engine {
           }
         }
         if (extant === 0) {
-          // Pick a random S, or fall back to any non-D cell.
           let attempts = 0;
           while (attempts < 16) {
             const idx = rng.intRange(cur.length);
             if (cur[idx] === CellState.Susceptible) {
-              cur[idx] = CellState.Infectious;
-              this.pop.infectedAge[idx] = seedStrain.incubation;
-              this.pop.strainId[idx] = 0;
+              let protMul = protectionMultiplier(D, this.pop.defenses[idx]);
+              if (quarantineOn && quarantined[idx]) protMul *= qProtMul;
+              let importP = protMul * lockdownTransMul;
+              if (quarantineOn) importP *= qSrcMul;
+              if (importP > 0 && rng.bernoulli(importP)) {
+                cur[idx] = CellState.Infectious;
+                this.pop.infectedAge[idx] = seedStrain.incubation;
+                this.pop.strainId[idx] = 0;
+              }
               break;
             }
             attempts++;

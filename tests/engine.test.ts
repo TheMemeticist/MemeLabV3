@@ -237,6 +237,81 @@ describe('Engine', () => {
     for (let i = 0; i < q3.length; i++) if (q3[i]) qCount3++;
     expect(qCount3).toBe(0);
   });
+
+  it('full mask coverage blocks all infections across a long endemic run', () => {
+    // Regression: previously the anti-extinction reseed force-seeded an
+    // infectious cell every time E+I hit zero, bypassing all defenses. With
+    // 100% mask uptake + 100% protection + 100% source control, neighbour
+    // transmission was correctly blocked, but each reseed planted a fresh
+    // infectious cell that proceeded to die per IFR, grinding the population
+    // down despite "perfect" masks. The import attempt now rolls against the
+    // target cell's protection.
+    const cfg = baseConfig({
+      seedInfections: 0,
+      strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
+    });
+    cfg.defenses[0].enabled = true;
+    cfg.defenses[0].uptake = 1;
+    cfg.defenses[0].protection = 1;
+    cfg.defenses[0].sourceControl = 1;
+    const engine = new Engine(cfg);
+    for (let t = 0; t < 1000; t++) engine.step();
+    const tail = engine.longStats;
+    // No cell should ever leave Susceptible state — patient zero is masked too,
+    // and protectionMultiplier on a fully-masked cell makes both the seed-time
+    // patient and any reseed attempts a no-op.
+    const peakInfected = Math.max(...tail.e.map((x, k) => x + (tail.i[k] ?? 0)));
+    expect(peakInfected).toBeLessThanOrEqual(1);
+    // And no deaths from steady reseeding.
+    expect(tail.d.at(-1) ?? 0).toBeLessThanOrEqual(1);
+  });
+
+  it('full lockdown transmission reduction prevents reseed imports', () => {
+    const cfg = baseConfig({
+      seedInfections: 0,
+      strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
+    });
+    cfg.lockdown = { enabled: true, mobilityReduction: 0, transmissionReduction: 1, compliance: 1 };
+    const engine = new Engine(cfg);
+    for (let t = 0; t < 1000; t++) engine.step();
+    // Lockdown trans=1 → importP=0 → no reseed ever succeeds, no spread either.
+    const tail = engine.longStats;
+    expect(tail.d.at(-1) ?? 0).toBeLessThanOrEqual(1);
+  });
+
+  it('full vaccine coverage blocks all infections across a long endemic run', () => {
+    const cfg = baseConfig({
+      seedInfections: 0,
+      strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
+    });
+    cfg.defenses[1].enabled = true;
+    cfg.defenses[1].uptake = 1;
+    cfg.defenses[1].protection = 1;
+    cfg.defenses[1].sourceControl = 1;
+    const engine = new Engine(cfg);
+    for (let t = 0; t < 1000; t++) engine.step();
+    const tail = engine.longStats;
+    const peakInfected = Math.max(...tail.e.map((x, k) => x + (tail.i[k] ?? 0)));
+    expect(peakInfected).toBeLessThanOrEqual(1);
+    expect(tail.d.at(-1) ?? 0).toBeLessThanOrEqual(1);
+  });
+
+  it('full quarantine source control blocks reseed imports', () => {
+    const cfg = baseConfig({
+      seedInfections: 0,
+      strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
+    });
+    cfg.quarantine = { enabled: true, detectionRate: 1, contactsRange: 1, protection: 1, sourceControl: 1, duration: 30 };
+    const engine = new Engine(cfg);
+    for (let t = 0; t < 1000; t++) engine.step();
+    // With quarantine src=1, importP is multiplied by 0 → no reseed succeeds.
+    // Patient zero plus its immediate contacts can still die during the first
+    // infection course (quarantine doesn't reduce mortality), but the long-run
+    // population should remain almost entirely susceptible.
+    const tail = engine.longStats;
+    const finalS = tail.s.at(-1) ?? 0;
+    expect(finalS).toBeGreaterThan(50); // 64-cell grid; very few deaths expected
+  });
 });
 
 function countMaskBit(defenses: Uint8Array): number {
