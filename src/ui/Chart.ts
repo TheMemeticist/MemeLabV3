@@ -1,6 +1,20 @@
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
-import type { LongStats } from '../types';
+import type { InterventionEvent, LongStats } from '../types';
+
+const MARKER_COLORS: Record<string, string> = {
+  mask: 'rgb(38, 169, 198)',
+  vaccine: 'rgb(156, 89, 209)',
+  lockdown: 'rgb(245, 158, 11)',
+  quarantine: 'rgb(225, 178, 25)',
+};
+
+const MARKER_LABELS: Record<string, string> = {
+  mask: 'Mask',
+  vaccine: 'Vaccine',
+  lockdown: 'Lockdown',
+  quarantine: 'Quarantine',
+};
 
 export class Chart {
   private host: HTMLElement;
@@ -9,6 +23,10 @@ export class Chart {
   private lastW = 0;
   private lastH = 0;
   private resizeRaf = 0;
+  private markers: InterventionEvent[] = [];
+  private markerTip: HTMLElement | null = null;
+  private mouseHandler: ((ev: MouseEvent) => void) | null = null;
+  private leaveHandler: (() => void) | null = null;
 
   constructor(host: HTMLElement) {
     this.host = host;
@@ -23,6 +41,13 @@ export class Chart {
       });
     });
     this.resizeObs.observe(host);
+  }
+
+  setMarkers(events: InterventionEvent[]): void {
+    this.markers = events;
+    // Don't call plot.redraw() — uPlot 1.x's redraw() can clear cached series
+    // paths in a way that wipes the visible traces. The next setData() (which
+    // arrives at every sim tick) re-fires hooks.draw and paints markers fresh.
   }
 
   private relayout(): void {
@@ -44,6 +69,12 @@ export class Chart {
         this.plot = null;
         this.lastW = 0;
         this.lastH = 0;
+        if (this.mouseHandler) this.host.removeEventListener('mousemove', this.mouseHandler);
+        if (this.leaveHandler) this.host.removeEventListener('mouseleave', this.leaveHandler);
+        this.mouseHandler = null;
+        this.leaveHandler = null;
+        this.markerTip?.remove();
+        this.markerTip = null;
       }
       this.host.innerHTML = '<div class="chart-empty">Waiting for first tick…</div>';
       return;
@@ -65,12 +96,27 @@ export class Chart {
       const opts: uPlot.Options = {
         width: this.host.clientWidth,
         height: this.host.clientHeight,
-        scales: { x: { time: false } },
+        scales: {
+          x: { time: false },
+          y: {
+            auto: true,
+            // Tight-fit to visible series. uPlot already excludes hidden
+            // series from dataMin/dataMax computation when `series.show=false`;
+            // we just add a small headroom so traces don't kiss the axes.
+            range: (_u, dataMin, dataMax) => {
+              if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) return [0, 1];
+              if (dataMin === dataMax) return [dataMin - 1, dataMax + 1];
+              const pad = (dataMax - dataMin) * 0.08;
+              return [Math.max(0, dataMin - pad), dataMax + pad];
+            },
+          },
+        },
         axes: [
           { stroke: accent('--text-muted'), grid: { stroke: accent('--grid-color') } },
           { stroke: accent('--text-muted'), grid: { stroke: accent('--grid-color') } },
         ],
         legend: { show: true, live: true },
+        cursor: { focus: { prox: 16 } },
         series: [
           { label: 'Day' },
           { label: 'Susceptible', stroke: rgbCss('--cell-s'), width: 1.4 },
@@ -79,11 +125,145 @@ export class Chart {
           { label: 'Recovered', stroke: rgbCss('--cell-r'), width: 1.4 },
           { label: 'Dead', stroke: rgbCss('--cell-d'), width: 1.4 },
         ],
+        hooks: {
+          draw: [(u) => this.paintMarkers(u)],
+        },
       };
       this.plot = new uPlot(opts, data, this.host);
+      this.installMarkerTooltip();
+      this.annotateLegend();
     } else {
       this.plot.setData(data);
     }
+  }
+
+  private annotateLegend(): void {
+    // Make it obvious the legend entries are clickable for show/hide.
+    // uPlot binds the toggle handler to the <th> child, so style that.
+    const rows = this.host.querySelectorAll('.u-legend .u-series');
+    rows.forEach((row, idx) => {
+      if (idx === 0) return; // skip x-axis row
+      const th = row.querySelector('th') as HTMLElement | null;
+      if (!th) return;
+      th.title = 'Click to show/hide this series';
+      th.style.cursor = 'pointer';
+    });
+  }
+
+  private paintMarkers(u: uPlot): void {
+    if (this.markers.length === 0) return;
+    const ctx = u.ctx;
+    const top = u.bbox.top;
+    const h = u.bbox.height;
+    const left = u.bbox.left;
+    const right = left + u.bbox.width;
+    const dpr = (window.devicePixelRatio || 1);
+    // Layout chips at the top — track occupied x-ranges so two close-by toggles
+    // stack vertically instead of overlapping.
+    const occupied: Array<{ row: number; minX: number; maxX: number }> = [];
+    const rowH = 16 * dpr;
+    const padX = 6 * dpr;
+    const padY = 3 * dpr;
+    const fontPx = 10 * dpr;
+    const lineW = 2 * dpr;
+    ctx.save();
+    ctx.font = `600 ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textBaseline = 'middle';
+    for (const ev of this.markers) {
+      const x = u.valToPos(ev.tick, 'x', true);
+      if (x < left || x > right) continue;
+      const color = MARKER_COLORS[ev.intervention] ?? '#888';
+      const label = `${MARKER_LABELS[ev.intervention] ?? ev.intervention} ${ev.on ? 'ON' : 'OFF'}`;
+      const textW = ctx.measureText(label).width;
+      const chipW = textW + padX * 2;
+      const chipH = rowH;
+      // Vertical line — thick, solid for ON, dashed for OFF.
+      ctx.setLineDash(ev.on ? [] : [4 * dpr, 3 * dpr]);
+      ctx.lineWidth = lineW;
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = ev.on ? 0.95 : 0.7;
+      ctx.beginPath();
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, top + h);
+      ctx.stroke();
+      // Pick a row that doesn't overlap any prior chip.
+      let row = 0;
+      const halfW = chipW / 2;
+      let chipX = x - halfW;
+      // Keep chip inside the chart bbox horizontally.
+      if (chipX < left) chipX = left;
+      if (chipX + chipW > right) chipX = right - chipW;
+      while (occupied.some((o) => o.row === row && !(chipX + chipW < o.minX - 2 || chipX > o.maxX + 2))) row++;
+      occupied.push({ row, minX: chipX, maxX: chipX + chipW });
+      const chipY = top + 2 + row * (chipH + 2);
+      // Chip background (filled, opaque) + outline.
+      ctx.globalAlpha = 1;
+      ctx.setLineDash([]);
+      ctx.fillStyle = color;
+      this.roundRect(ctx, chipX, chipY, chipW, chipH, 3 * dpr);
+      ctx.fill();
+      // Chip label — white text for max contrast on saturated bg.
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'left';
+      ctx.fillText(label, chipX + padX, chipY + chipH / 2 + padY * 0.1);
+    }
+    ctx.restore();
+  }
+
+  private roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.lineTo(x + w - rr, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    ctx.lineTo(x + w, y + h - rr);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    ctx.lineTo(x + rr, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    ctx.lineTo(x, y + rr);
+    ctx.quadraticCurveTo(x, y, x + rr, y);
+    ctx.closePath();
+  }
+
+  private installMarkerTooltip(): void {
+    if (!this.plot) return;
+    const tip = document.createElement('div');
+    tip.className = 'chart-marker-tip';
+    tip.style.display = 'none';
+    this.host.appendChild(tip);
+    this.markerTip = tip;
+
+    const handler = (ev: MouseEvent): void => {
+      if (!this.plot || this.markers.length === 0) { tip.style.display = 'none'; return; }
+      const rect = this.host.getBoundingClientRect();
+      const px = ev.clientX - rect.left;
+      // Need device-pixel x for valToPos with true (canvas-space) flag.
+      const dpr = window.devicePixelRatio || 1;
+      const canvasX = (ev.clientX - rect.left) * dpr;
+      const tick = this.plot.posToVal(canvasX, 'x', true);
+      // Find nearest within 2 ticks.
+      let best: InterventionEvent | null = null;
+      let bestD = Infinity;
+      for (const m of this.markers) {
+        const d = Math.abs(m.tick - tick);
+        if (d < bestD) { bestD = d; best = m; }
+      }
+      if (best && bestD <= 2) {
+        const label = MARKER_LABELS[best.intervention] ?? best.intervention;
+        tip.textContent = `${label} ${best.on ? 'enabled' : 'disabled'} · day ${best.tick}`;
+        tip.style.display = 'block';
+        tip.style.left = `${px + 8}px`;
+        tip.style.top = `${ev.clientY - rect.top - 22}px`;
+        tip.style.borderColor = MARKER_COLORS[best.intervention] ?? '#888';
+      } else {
+        tip.style.display = 'none';
+      }
+    };
+    const leave = (): void => { tip.style.display = 'none'; };
+    this.host.addEventListener('mousemove', handler);
+    this.host.addEventListener('mouseleave', leave);
+    this.mouseHandler = handler;
+    this.leaveHandler = leave;
   }
 
   exportCsv(long: LongStats): string {
@@ -101,6 +281,10 @@ export class Chart {
     this.resizeObs.disconnect();
     this.plot?.destroy();
     this.plot = null;
+    if (this.mouseHandler) this.host.removeEventListener('mousemove', this.mouseHandler);
+    if (this.leaveHandler) this.host.removeEventListener('mouseleave', this.leaveHandler);
+    this.markerTip?.remove();
+    this.markerTip = null;
   }
 }
 

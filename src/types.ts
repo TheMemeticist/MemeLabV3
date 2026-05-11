@@ -35,6 +35,9 @@ export interface Strain extends StrainGenes {
 export interface DefenseSpec {
   id: string;
   label: string;
+  /** Header quick-toggle. When false, this defense's per-cell flag is preserved
+   *  in the buffer but its multipliers behave as identity (no effect). */
+  enabled: boolean;
   /** Reduces incoming attack success against the wearer. 0..1. */
   protection: number;
   /** Reduces outgoing attack success from the wearer. 0..1. */
@@ -43,6 +46,30 @@ export interface DefenseSpec {
   mortalityReduction: number;
   /** Population uptake. 0..1. */
   uptake: number;
+}
+
+export interface LockdownSpec {
+  enabled: boolean;
+  /** Probabilistically skips neighbor visits for compliant cells. 0..1. */
+  mobilityReduction: number;
+  /** Global multiplicative reduction on transmission. 0..1. */
+  transmissionReduction: number;
+  /** Per-cell stochastic adherence. 0..1. */
+  compliance: number;
+}
+
+export interface QuarantineSpec {
+  enabled: boolean;
+  /** Per-tick probability that an infectious cell is detected. 0..1. */
+  detectionRate: number;
+  /** Manhattan radius of "close contacts" isolated alongside a detected case. */
+  contactsRange: number;
+  /** Reduces transmission INTO quarantined cells. 0..1. */
+  protection: number;
+  /** Reduces transmission FROM quarantined cells. 0..1. */
+  sourceControl: number;
+  /** Quarantine persistence, in ticks. */
+  duration: number;
 }
 
 export interface SimConfig {
@@ -57,6 +84,17 @@ export interface SimConfig {
   reseedOnExtinction?: boolean;
   strain: StrainGenes;
   defenses: DefenseSpec[];
+  lockdown: LockdownSpec;
+  quarantine: QuarantineSpec;
+}
+
+export type InterventionKey = 'mask' | 'vaccine' | 'lockdown' | 'quarantine';
+
+export interface InterventionEvent {
+  tick: number;
+  intervention: InterventionKey;
+  on: boolean;
+  label?: string;
 }
 
 export interface SimStats {
@@ -78,6 +116,8 @@ export interface FrameMessage {
   state: Uint8Array;
   /** Defense bitmask byte buffer, transferable. */
   defenses: Uint8Array;
+  /** Per-cell quarantined flag (0/1). Null when quarantine isn't active. */
+  quarantined: Uint8Array | null;
   size: number;
   stats: SimStats;
   longStats: LongStats;
@@ -100,4 +140,5 @@ export type WorkerCommand =
   | { cmd: 'pause' }
   | { cmd: 'step'; n: number }
   | { cmd: 'reset'; config: SimConfig }
-  | { cmd: 'updateConfig'; config: SimConfig };
+  | { cmd: 'updateConfig'; config: SimConfig }
+  | { cmd: 'patchConfig'; config: SimConfig };

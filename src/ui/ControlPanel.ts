@@ -1,4 +1,4 @@
-import type { SimConfig, StrainGenes } from '../types';
+import type { InterventionKey, SimConfig, StrainGenes } from '../types';
 import { Slider } from './Slider';
 import { PresetPicker } from './PresetPicker';
 import { findPreset, type DiseasePreset } from '../sim/presets';
@@ -7,6 +7,7 @@ export interface ControlPanelEvents {
   onConfigChange: (cfg: SimConfig) => void;
   onPresetChange: (preset: DiseasePreset) => void;
   onCustomNameChange?: (name: string | null) => void;
+  onInterventionToggle?: (key: InterventionKey, on: boolean) => void;
 }
 
 export class ControlPanel {
@@ -20,8 +21,11 @@ export class ControlPanel {
   private birthSlider!: Slider;
   private maskSliders!: { protection: Slider; sourceControl: Slider; mortalityReduction: Slider; uptake: Slider };
   private vaxSliders!: { protection: Slider; sourceControl: Slider; mortalityReduction: Slider; uptake: Slider };
+  private lockdownSliders!: { mobility: Slider; transmission: Slider; compliance: Slider };
+  private quarantineSliders!: { detection: Slider; range: Slider; protection: Slider; sourceControl: Slider; duration: Slider };
   private strainSliders!: { attackRate: Slider; incubation: Slider; infectious: Slider; ifr: Slider; range: Slider; immunityDays: Slider; mutationRate: Slider };
   private picker!: PresetPicker;
+  private switches: Record<string, HTMLInputElement> = {};
 
   constructor(cfg: SimConfig, presetId: string, events: ControlPanelEvents) {
     this.cfg = cfg;
@@ -31,35 +35,32 @@ export class ControlPanel {
 
   buildLeft(host: HTMLElement): void {
     host.innerHTML = `
-      <section class="panel" aria-label="Population">
-        <header class="panel-head">
+      <section class="panel collapsible" aria-label="Population" data-collapsed="true">
+        <button type="button" class="panel-head" aria-expanded="false" data-toggle="population">
           <h3>Population <span class="rate-badge" data-badge="popsize">—</span></h3>
           <span class="panel-icon" aria-hidden="true">👥</span>
-        </header>
+          <span class="panel-chevron" aria-hidden="true">▾</span>
+        </button>
         <div class="panel-body" data-section="population"></div>
       </section>
-      <section class="panel collapsible" aria-label="Mask defense" data-collapsed="true">
-        <button type="button" class="panel-head" aria-expanded="false" data-toggle="mask">
-          <h3>Mask <span class="rate-badge" data-badge="mask">50%</span></h3>
-          <span class="panel-summary" data-summary="mask"></span>
-          <span class="panel-icon" aria-hidden="true">😷</span>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
-        </button>
-        <div class="panel-body" data-section="mask"></div>
-      </section>
-      <section class="panel collapsible" aria-label="Vaccine defense" data-collapsed="true">
-        <button type="button" class="panel-head" aria-expanded="false" data-toggle="vaccine">
-          <h3>Vaccine <span class="rate-badge" data-badge="vaccine">12%</span></h3>
-          <span class="panel-summary" data-summary="vaccine"></span>
-          <span class="panel-icon" aria-hidden="true">💉</span>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
-        </button>
-        <div class="panel-body" data-section="vaccine"></div>
+      <section class="panel" aria-label="Interventions">
+        <header class="panel-head">
+          <h3>Interventions</h3>
+          <span class="panel-icon" aria-hidden="true">🛡️</span>
+        </header>
+        <div class="panel-body intervention-stack">
+          ${this.interventionCardMarkup('mask', 'Mask', '😷')}
+          ${this.interventionCardMarkup('vaccine', 'Vaccine', '💉')}
+          ${this.interventionCardMarkup('lockdown', 'Lockdown', '🚧')}
+          ${this.interventionCardMarkup('quarantine', 'Quarantine', '🚷')}
+        </div>
       </section>
     `;
     const popHost = host.querySelector('[data-section="population"]') as HTMLElement;
     const maskHost = host.querySelector('[data-section="mask"]') as HTMLElement;
     const vaxHost = host.querySelector('[data-section="vaccine"]') as HTMLElement;
+    const lockHost = host.querySelector('[data-section="lockdown"]') as HTMLElement;
+    const qHost = host.querySelector('[data-section="quarantine"]') as HTMLElement;
 
     // Population
     this.popSlider = new Slider({
@@ -69,19 +70,19 @@ export class ControlPanel {
       onChange: (v) => {
         this.cfg.size = v | 0;
         this.refreshPopBadge(this.cfg.size);
-        this.dirty(true);
+        this.dirty();
       },
     });
     this.refreshPopBadge(this.cfg.size);
     this.seedInfSlider = new Slider({
       id: 'seed-inf', label: 'Seed infections', min: 0, max: 100, step: 1, unit: '%',
       value: Math.round(this.cfg.seedInfections * 100),
-      onChange: (v) => { this.cfg.seedInfections = v / 100; this.dirty(true); },
+      onChange: (v) => { this.cfg.seedInfections = v / 100; this.dirty(); },
     });
     this.birthSlider = new Slider({
       id: 'birth-rate', label: 'Birth rate', min: 0, max: 5, step: 1, unit: '%',
       value: Math.round(this.cfg.birthRate * 100),
-      onChange: (v) => { this.cfg.birthRate = v / 100; this.dirty(false); },
+      onChange: (v) => { this.cfg.birthRate = v / 100; this.dirty(); },
     });
     popHost.appendChild(this.popSlider.el);
     popHost.appendChild(this.seedInfSlider.el);
@@ -103,30 +104,114 @@ export class ControlPanel {
     this.vaxSliders.mortalityReduction.onValueChange(() => this.refreshSummary('vaccine'));
     this.refreshBadge('vaccine', Math.round(this.cfg.defenses[1].uptake * 100));
     this.refreshSummary('vaccine');
+    // Lockdown
+    this.lockdownSliders = this.buildLockdownSliders(lockHost);
+    this.lockdownSliders.transmission.onValueChange((v) => { this.refreshBadge('lockdown', v); this.refreshSummary('lockdown'); });
+    this.lockdownSliders.mobility.onValueChange(() => this.refreshSummary('lockdown'));
+    this.lockdownSliders.compliance.onValueChange(() => this.refreshSummary('lockdown'));
+    this.refreshBadge('lockdown', Math.round(this.cfg.lockdown.transmissionReduction * 100));
+    this.refreshSummary('lockdown');
+    // Quarantine
+    this.quarantineSliders = this.buildQuarantineSliders(qHost);
+    this.quarantineSliders.detection.onValueChange((v) => { this.refreshBadge('quarantine', v); this.refreshSummary('quarantine'); });
+    this.quarantineSliders.protection.onValueChange(() => this.refreshSummary('quarantine'));
+    this.quarantineSliders.sourceControl.onValueChange(() => this.refreshSummary('quarantine'));
+    this.quarantineSliders.range.onValueChange(() => this.refreshSummary('quarantine'));
+    this.quarantineSliders.duration.onValueChange(() => this.refreshSummary('quarantine'));
+    this.refreshBadge('quarantine', Math.round(this.cfg.quarantine.detectionRate * 100));
+    this.refreshSummary('quarantine');
 
-    // Collapsible toggles
+    // Collapsible toggles (ignore clicks landing inside [data-stop] like switches)
     host.querySelectorAll<HTMLButtonElement>('.panel-head[data-toggle]').forEach((btn) => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', (e) => {
+        if ((e.target as HTMLElement | null)?.closest('[data-stop]')) return;
         const panel = btn.closest('.panel') as HTMLElement;
         const collapsed = panel.dataset['collapsed'] === 'true';
         panel.dataset['collapsed'] = collapsed ? 'false' : 'true';
         btn.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
       });
     });
+
+    // Wire intervention quick-toggle switches.
+    this.switches = {};
+    host.querySelectorAll<HTMLInputElement>('input[data-switch]').forEach((input) => {
+      const key = input.dataset['switch'] as InterventionKey;
+      this.switches[key] = input;
+      // Initial state reflects config.
+      input.checked = this.isInterventionEnabled(key);
+      // Reflect on the panel for CSS styling cues.
+      this.markInterventionState(key, input.checked);
+      input.addEventListener('change', () => {
+        this.setInterventionEnabled(key, input.checked);
+        this.markInterventionState(key, input.checked);
+        this.events.onInterventionToggle?.(key, input.checked);
+        this.dirty();
+      });
+    });
   }
 
-  private refreshSummary(key: 'mask' | 'vaccine'): void {
+  private interventionCardMarkup(key: InterventionKey, label: string, icon: string): string {
+    return `
+      <section class="panel collapsible intervention-item" aria-label="${label}" data-collapsed="true" data-intervention="${key}">
+        <button type="button" class="panel-head" aria-expanded="false" data-toggle="${key}">
+          <h3>${label} <span class="rate-badge" data-badge="${key}">—</span></h3>
+          <span class="panel-summary" data-summary="${key}"></span>
+          <span class="panel-icon" aria-hidden="true">${icon}</span>
+          <label class="panel-switch" data-stop title="Enable / disable ${label}">
+            <input type="checkbox" data-switch="${key}" aria-label="${label} enabled" />
+            <span class="panel-switch-track" aria-hidden="true"></span>
+          </label>
+          <span class="panel-chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body" data-section="${key}"></div>
+      </section>
+    `;
+  }
+
+  private isInterventionEnabled(key: InterventionKey): boolean {
+    if (key === 'mask') return this.cfg.defenses[0]?.enabled !== false;
+    if (key === 'vaccine') return this.cfg.defenses[1]?.enabled !== false;
+    if (key === 'lockdown') return this.cfg.lockdown.enabled;
+    if (key === 'quarantine') return this.cfg.quarantine.enabled;
+    return false;
+  }
+
+  private setInterventionEnabled(key: InterventionKey, on: boolean): void {
+    if (key === 'mask') this.cfg.defenses[0].enabled = on;
+    else if (key === 'vaccine') this.cfg.defenses[1].enabled = on;
+    else if (key === 'lockdown') this.cfg.lockdown.enabled = on;
+    else if (key === 'quarantine') this.cfg.quarantine.enabled = on;
+  }
+
+  private markInterventionState(key: InterventionKey, on: boolean): void {
+    const panel = document.querySelector(`[data-intervention="${key}"]`) as HTMLElement | null;
+    if (panel) panel.dataset['enabled'] = on ? 'true' : 'false';
+  }
+
+  private refreshSummary(key: InterventionKey): void {
     const el = document.querySelector(`[data-summary="${key}"]`);
     if (!el) return;
-    const def = key === 'mask' ? this.cfg.defenses[0] : this.cfg.defenses[1];
     const parts: string[] = [];
-    parts.push(`${Math.round(def.protection * 100)}% prot`);
-    parts.push(`${Math.round(def.sourceControl * 100)}% src`);
-    parts.push(`${Math.round(def.mortalityReduction * 100)}% mort`);
+    if (key === 'mask' || key === 'vaccine') {
+      const def = key === 'mask' ? this.cfg.defenses[0] : this.cfg.defenses[1];
+      parts.push(`${Math.round(def.protection * 100)}% prot`);
+      parts.push(`${Math.round(def.sourceControl * 100)}% src`);
+      parts.push(`${Math.round(def.mortalityReduction * 100)}% mort`);
+    } else if (key === 'lockdown') {
+      const l = this.cfg.lockdown;
+      parts.push(`${Math.round(l.mobilityReduction * 100)}% mob`);
+      parts.push(`${Math.round(l.transmissionReduction * 100)}% trans`);
+      parts.push(`${Math.round(l.compliance * 100)}% comp`);
+    } else if (key === 'quarantine') {
+      const q = this.cfg.quarantine;
+      parts.push(`${Math.round(q.protection * 100)}% prot`);
+      parts.push(`${Math.round(q.sourceControl * 100)}% src`);
+      parts.push(`±${q.contactsRange} · ${q.duration}d`);
+    }
     el.textContent = parts.join(' · ');
   }
 
-  private refreshBadge(key: 'mask' | 'vaccine', value: number): void {
+  private refreshBadge(key: InterventionKey, value: number): void {
     const el = document.querySelector(`[data-badge="${key}"]`);
     if (el) el.textContent = `${Math.round(value)}%`;
   }
@@ -166,44 +251,44 @@ export class ControlPanel {
         id: 'attack-rate', label: 'Attack rate', min: 0, max: 100, step: 1, unit: '%',
         value: Math.round(s.attackRate * 100),
         hint: 'Per-contact transmission probability.',
-        onChange: (v) => { this.cfg.strain.attackRate = v / 100; this.dirty(false); },
+        onChange: (v) => { this.cfg.strain.attackRate = v / 100; this.dirty(); },
       }),
       incubation: new Slider({
         id: 'incubation', label: 'Incubation', min: 1, max: 60, step: 1, unit: 'days',
         value: s.incubation,
         hint: 'Days from exposure to becoming infectious.',
-        onChange: (v) => { this.cfg.strain.incubation = v | 0; this.dirty(false); },
+        onChange: (v) => { this.cfg.strain.incubation = v | 0; this.dirty(); },
       }),
       infectious: new Slider({
         id: 'infectious', label: 'Infectious period', min: 1, max: 60, step: 1, unit: 'days',
         value: s.infectious,
         hint: 'Days the host can transmit.',
-        onChange: (v) => { this.cfg.strain.infectious = v | 0; this.dirty(false); },
+        onChange: (v) => { this.cfg.strain.infectious = v | 0; this.dirty(); },
       }),
       ifr: new Slider({
         id: 'ifr', label: 'Kill rate (IFR)', min: 0, max: 100, step: 1, unit: '%',
         value: Math.round(s.ifr * 100),
         hint: 'Infection-fatality rate at recovery roll.',
-        onChange: (v) => { this.cfg.strain.ifr = v / 100; this.dirty(false); },
+        onChange: (v) => { this.cfg.strain.ifr = v / 100; this.dirty(); },
       }),
       range: new Slider({
         id: 'range', label: 'Transmission range', min: 1, max: 6, step: 1, unit: 'tiles',
         value: s.range,
         hint: 'Manhattan radius. 1 = nearest neighbors.',
-        onChange: (v) => { this.cfg.strain.range = v | 0; this.dirty(true); },
+        onChange: (v) => { this.cfg.strain.range = v | 0; this.dirty(); },
       }),
       immunityDays: new Slider({
         id: 'imm', label: 'Immunity duration', min: 90, max: 36500, step: 5,
         value: Math.max(90, s.immunityDays),
         hint: 'Mean days a recovered cell stays immune before becoming susceptible again. With a finite window plus a large enough population, infections persist endemically — the classic CDA insight.',
         format: (v) => formatDays(v),
-        onChange: (v) => { this.cfg.strain.immunityDays = Math.max(90, v | 0); this.dirty(false); },
+        onChange: (v) => { this.cfg.strain.immunityDays = Math.max(90, v | 0); this.dirty(); },
       }),
       mutationRate: new Slider({
         id: 'mut', label: 'Mutation rate', min: 0, max: 50, step: 1, unit: '%',
         value: Math.round(s.mutationRate * 100),
         hint: 'Per-replication chance per gene to drift (when natural selection is on).',
-        onChange: (v) => { this.cfg.strain.mutationRate = v / 100; this.dirty(false); },
+        onChange: (v) => { this.cfg.strain.mutationRate = v / 100; this.dirty(); },
       }),
     };
     for (const k of Object.keys(this.strainSliders) as (keyof typeof this.strainSliders)[]) {
@@ -235,29 +320,89 @@ export class ControlPanel {
     const uptake = new Slider({
       id: `${idPrefix}-rate`, label: 'Rate', min: 0, max: 100, step: 1, unit: '%',
       value: Math.round(def().uptake * 100),
-      hint: 'Fraction of the population that has this defense at start.',
-      onChange: (v) => { def().uptake = v / 100; this.dirty(true); },
+      hint: 'Fraction of the population that has this defense. Changes apply mid-run via stochastic adjustment.',
+      onChange: (v) => { def().uptake = v / 100; this.dirty(); },
     });
     const protection = new Slider({
       id: `${idPrefix}-prot`, label: 'Protection', min: 0, max: 100, step: 1, unit: '%',
       value: Math.round(def().protection * 100),
       hint: 'Reduces incoming infection chance against the wearer.',
-      onChange: (v) => { def().protection = v / 100; this.dirty(false); },
+      onChange: (v) => { def().protection = v / 100; this.dirty(); },
     });
     const sourceControl = new Slider({
       id: `${idPrefix}-src`, label: 'Source control', min: 0, max: 100, step: 1, unit: '%',
       value: Math.round(def().sourceControl * 100),
       hint: 'Reduces outgoing infection from a sick wearer.',
-      onChange: (v) => { def().sourceControl = v / 100; this.dirty(false); },
+      onChange: (v) => { def().sourceControl = v / 100; this.dirty(); },
     });
     const mortalityReduction = new Slider({
       id: `${idPrefix}-mort`, label: 'Mortality reduction', min: 0, max: 100, step: 1, unit: '%',
       value: Math.round(def().mortalityReduction * 100),
       hint: 'Reduces fatality if a wearer is infected.',
-      onChange: (v) => { def().mortalityReduction = v / 100; this.dirty(false); },
+      onChange: (v) => { def().mortalityReduction = v / 100; this.dirty(); },
     });
     [uptake, protection, sourceControl, mortalityReduction].forEach((s) => host.appendChild(s.el));
     return { protection, sourceControl, mortalityReduction, uptake };
+  }
+
+  private buildLockdownSliders(host: HTMLElement) {
+    const ld = () => this.cfg.lockdown;
+    const mobility = new Slider({
+      id: 'ld-mob', label: 'Mobility reduction', min: 0, max: 100, step: 1, unit: '%',
+      value: Math.round(ld().mobilityReduction * 100),
+      hint: 'Stay-at-home effect: compliant cells skip neighbor contacts with this probability per attempt.',
+      onChange: (v) => { ld().mobilityReduction = v / 100; this.dirty(); },
+    });
+    const transmission = new Slider({
+      id: 'ld-trans', label: 'Transmission reduction', min: 0, max: 100, step: 1, unit: '%',
+      value: Math.round(ld().transmissionReduction * 100),
+      hint: 'Global multiplicative reduction on transmission while lockdown is on.',
+      onChange: (v) => { ld().transmissionReduction = v / 100; this.dirty(); },
+    });
+    const compliance = new Slider({
+      id: 'ld-comp', label: 'Compliance', min: 0, max: 100, step: 1, unit: '%',
+      value: Math.round(ld().compliance * 100),
+      hint: 'Per-cell adherence. Non-compliant cells move and transmit normally.',
+      onChange: (v) => { ld().compliance = v / 100; this.dirty(); },
+    });
+    [mobility, transmission, compliance].forEach((s) => host.appendChild(s.el));
+    return { mobility, transmission, compliance };
+  }
+
+  private buildQuarantineSliders(host: HTMLElement) {
+    const q = () => this.cfg.quarantine;
+    const detection = new Slider({
+      id: 'q-rate', label: 'Detection rate', min: 0, max: 100, step: 1, unit: '%',
+      value: Math.round(q().detectionRate * 100),
+      hint: 'Per-tick probability that an infectious case is detected and isolated along with close contacts.',
+      onChange: (v) => { q().detectionRate = v / 100; this.dirty(); },
+    });
+    const range = new Slider({
+      id: 'q-range', label: 'Close-contacts range', min: 1, max: 5, step: 1, unit: 'tiles',
+      value: q().contactsRange,
+      hint: 'Manhattan radius of neighbors quarantined alongside a detected case.',
+      onChange: (v) => { q().contactsRange = v | 0; this.dirty(); },
+    });
+    const protection = new Slider({
+      id: 'q-prot', label: 'Protection', min: 0, max: 100, step: 1, unit: '%',
+      value: Math.round(q().protection * 100),
+      hint: 'Reduces incoming transmission to a quarantined cell.',
+      onChange: (v) => { q().protection = v / 100; this.dirty(); },
+    });
+    const sourceControl = new Slider({
+      id: 'q-src', label: 'Source control', min: 0, max: 100, step: 1, unit: '%',
+      value: Math.round(q().sourceControl * 100),
+      hint: 'Reduces outgoing transmission from a quarantined cell.',
+      onChange: (v) => { q().sourceControl = v / 100; this.dirty(); },
+    });
+    const duration = new Slider({
+      id: 'q-dur', label: 'Duration', min: 1, max: 60, step: 1, unit: 'days',
+      value: q().duration,
+      hint: 'How long a quarantine persists from the tick of detection.',
+      onChange: (v) => { q().duration = v | 0; this.dirty(); },
+    });
+    [detection, range, protection, sourceControl, duration].forEach((s) => host.appendChild(s.el));
+    return { detection, range, protection, sourceControl, duration };
   }
 
   applyStrain(g: StrainGenes): void {
@@ -284,19 +429,46 @@ export class ControlPanel {
     this.maskSliders.mortalityReduction.setValue(Math.round(m.mortalityReduction * 100), true);
     this.maskSliders.uptake.setValue(Math.round(m.uptake * 100), true);
     this.refreshBadge('mask', Math.round(m.uptake * 100));
+    this.refreshSummary('mask');
     const v = cfg.defenses[1];
     this.vaxSliders.protection.setValue(Math.round(v.protection * 100), true);
     this.vaxSliders.sourceControl.setValue(Math.round(v.sourceControl * 100), true);
     this.vaxSliders.mortalityReduction.setValue(Math.round(v.mortalityReduction * 100), true);
     this.vaxSliders.uptake.setValue(Math.round(v.uptake * 100), true);
     this.refreshBadge('vaccine', Math.round(v.uptake * 100));
+    this.refreshSummary('vaccine');
+    // Lockdown
+    const ld = cfg.lockdown;
+    this.lockdownSliders.mobility.setValue(Math.round(ld.mobilityReduction * 100), true);
+    this.lockdownSliders.transmission.setValue(Math.round(ld.transmissionReduction * 100), true);
+    this.lockdownSliders.compliance.setValue(Math.round(ld.compliance * 100), true);
+    this.refreshBadge('lockdown', Math.round(ld.transmissionReduction * 100));
+    this.refreshSummary('lockdown');
+    // Quarantine
+    const q = cfg.quarantine;
+    this.quarantineSliders.detection.setValue(Math.round(q.detectionRate * 100), true);
+    this.quarantineSliders.range.setValue(q.contactsRange, true);
+    this.quarantineSliders.protection.setValue(Math.round(q.protection * 100), true);
+    this.quarantineSliders.sourceControl.setValue(Math.round(q.sourceControl * 100), true);
+    this.quarantineSliders.duration.setValue(q.duration, true);
+    this.refreshBadge('quarantine', Math.round(q.detectionRate * 100));
+    this.refreshSummary('quarantine');
+    // Switches
+    for (const key of ['mask', 'vaccine', 'lockdown', 'quarantine'] as InterventionKey[]) {
+      const input = this.switches[key];
+      if (!input) continue;
+      const on = this.isInterventionEnabled(key);
+      input.checked = on;
+      this.markInterventionState(key, on);
+    }
     this.applyStrain(cfg.strain);
     this.picker.setCurrent(presetId);
     this.recheckCustom();
   }
 
-  /** Notify listener — `structural` means the population must be re-seeded. */
-  private dirty(_structural: boolean): void {
+  /** Notify the host App that config changed. App decides whether to rebuild
+   *  the engine or live-patch based on which fields actually differ. */
+  private dirty(): void {
     this.events.onConfigChange(this.cfg);
   }
 

@@ -40,17 +40,31 @@ export function encode(opts: PermalinkOptions): string {
   params.set('mutRate', round3(c.strain.mutationRate).toString());
   // Defenses — mask
   if (m) {
+    params.set('maskOn', m.enabled ? '1' : '0');
     params.set('maskRate', round3(m.uptake).toString());
     params.set('maskProt', round3(m.protection).toString());
     params.set('maskSrc', round3(m.sourceControl).toString());
     params.set('maskMort', round3(m.mortalityReduction).toString());
   }
   if (v) {
+    params.set('vaxOn', v.enabled ? '1' : '0');
     params.set('vaxRate', round3(v.uptake).toString());
     params.set('vaxProt', round3(v.protection).toString());
     params.set('vaxSrc', round3(v.sourceControl).toString());
     params.set('vaxMort', round3(v.mortalityReduction).toString());
   }
+  // Lockdown
+  params.set('ldOn', c.lockdown.enabled ? '1' : '0');
+  params.set('ldM', round3(c.lockdown.mobilityReduction).toString());
+  params.set('ldT', round3(c.lockdown.transmissionReduction).toString());
+  params.set('ldC', round3(c.lockdown.compliance).toString());
+  // Quarantine
+  params.set('qOn', c.quarantine.enabled ? '1' : '0');
+  params.set('qRate', round3(c.quarantine.detectionRate).toString());
+  params.set('qRange', String(c.quarantine.contactsRange));
+  params.set('qProt', round3(c.quarantine.protection).toString());
+  params.set('qSrc', round3(c.quarantine.sourceControl).toString());
+  params.set('qDur', String(c.quarantine.duration));
   // UI
   params.set('theme', opts.theme);
   params.set('speed', String(opts.speed));
@@ -76,10 +90,10 @@ export function applyEncoded(p: URLSearchParams, base: SimConfig): {
   presetId?: string;
 } {
   const m = base.defenses.find((d) => d.id === 'mask') ?? {
-    id: 'mask', label: 'Mask', protection: 0.2, sourceControl: 0.81, mortalityReduction: 0, uptake: 0.5,
+    id: 'mask', label: 'Mask', enabled: true, protection: 0.2, sourceControl: 0.81, mortalityReduction: 0, uptake: 0.5,
   };
   const v = base.defenses.find((d) => d.id === 'vaccine') ?? {
-    id: 'vaccine', label: 'Vaccine', protection: 0.8, sourceControl: 0, mortalityReduction: 0.8, uptake: 0.12,
+    id: 'vaccine', label: 'Vaccine', enabled: true, protection: 0.8, sourceControl: 0, mortalityReduction: 0.8, uptake: 0.12,
   };
   const config: SimConfig = {
     seed: int(p, 'seed', base.seed) >>> 0,
@@ -99,6 +113,7 @@ export function applyEncoded(p: URLSearchParams, base: SimConfig): {
     defenses: [
       {
         ...m,
+        enabled: bool(p, 'maskOn', m.enabled ?? true),
         uptake: clamp01(num(p, 'maskRate', m.uptake)),
         protection: clamp01(num(p, 'maskProt', m.protection)),
         sourceControl: clamp01(num(p, 'maskSrc', m.sourceControl)),
@@ -106,12 +121,27 @@ export function applyEncoded(p: URLSearchParams, base: SimConfig): {
       },
       {
         ...v,
+        enabled: bool(p, 'vaxOn', v.enabled ?? true),
         uptake: clamp01(num(p, 'vaxRate', v.uptake)),
         protection: clamp01(num(p, 'vaxProt', v.protection)),
         sourceControl: clamp01(num(p, 'vaxSrc', v.sourceControl)),
         mortalityReduction: clamp01(num(p, 'vaxMort', v.mortalityReduction)),
       },
     ],
+    lockdown: {
+      enabled: bool(p, 'ldOn', base.lockdown.enabled),
+      mobilityReduction: clamp01(num(p, 'ldM', base.lockdown.mobilityReduction)),
+      transmissionReduction: clamp01(num(p, 'ldT', base.lockdown.transmissionReduction)),
+      compliance: clamp01(num(p, 'ldC', base.lockdown.compliance)),
+    },
+    quarantine: {
+      enabled: bool(p, 'qOn', base.quarantine.enabled),
+      detectionRate: clamp01(num(p, 'qRate', base.quarantine.detectionRate)),
+      contactsRange: clampInt(int(p, 'qRange', base.quarantine.contactsRange), 1, 5),
+      protection: clamp01(num(p, 'qProt', base.quarantine.protection)),
+      sourceControl: clamp01(num(p, 'qSrc', base.quarantine.sourceControl)),
+      duration: clampInt(int(p, 'qDur', base.quarantine.duration), 1, 365),
+    },
   };
   return {
     config,

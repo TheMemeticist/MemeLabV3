@@ -20,10 +20,16 @@ function ensure(config?: SimConfig): Engine {
 
 function postFrame(): void {
   if (!engine) return;
-  const { state, defenses, size } = engine.buffers();
+  const { state, defenses, quarantined, size } = engine.buffers();
   // Copy buffers so we can transfer ownership without losing the engine state.
   const stateCopy = new Uint8Array(state);
   const defCopy = new Uint8Array(defenses);
+  // Only send the quarantine buffer when there's at least one quarantined cell —
+  // saves a per-frame transfer when the intervention is unused.
+  let qCopy: Uint8Array | null = null;
+  for (let i = 0; i < quarantined.length; i++) {
+    if (quarantined[i]) { qCopy = new Uint8Array(quarantined); break; }
+  }
   const stats = lastStats
     ? lastStats
     : { tick: 0, s: size * size, e: 0, i: 0, r: 0, d: 0, newInfections: 0, reff: 0, strains: 1 };
@@ -33,12 +39,15 @@ function postFrame(): void {
     tick: engine.tick,
     state: stateCopy,
     defenses: defCopy,
+    quarantined: qCopy,
     size,
     stats,
     longStats: cloneLong(engine.longStats),
     rNaught: engine.rNaught,
   };
-  self.postMessage(msg, [stateCopy.buffer, defCopy.buffer]);
+  const transfer: Transferable[] = [stateCopy.buffer, defCopy.buffer];
+  if (qCopy) transfer.push(qCopy.buffer);
+  self.postMessage(msg, transfer);
 }
 
 function cloneLong<T>(long: T): T {
@@ -84,10 +93,19 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
       break;
     }
     case 'updateConfig': {
-      // Soft update: rebuild but preserve seed unless changed by caller.
+      // Hard update: rebuild for changes that alter sim shape (size, seed,
+      // strain genes). Resets RNG trajectory + population.
       engine = new Engine(m.config);
       lastFrame = performance.now();
       lastStats = null;
+      postFrame();
+      break;
+    }
+    case 'patchConfig': {
+      // Soft update: change intervention / defense parameters mid-run without
+      // a reset. Engine applies minimal stochastic adjustment.
+      if (!engine) engine = new Engine(m.config);
+      else engine.patchConfig(m.config);
       postFrame();
       break;
     }

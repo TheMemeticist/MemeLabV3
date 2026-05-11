@@ -10,6 +10,9 @@ export interface PopulationBuffers {
   infectedAge: Uint16Array; // ticks since exposure (capped)
   defenses: Uint8Array; // bitmask
   strainId: Uint16Array;
+  lockdownCompliant: Uint8Array; // 0/1 — per-cell adherence to lockdown
+  quarantined: Uint8Array; // 0/1 — currently isolated
+  quarantineExpiry: Int32Array; // tick at which quarantine lifts
 }
 
 export function allocate(size: number): PopulationBuffers {
@@ -23,6 +26,9 @@ export function allocate(size: number): PopulationBuffers {
     infectedAge: new Uint16Array(n),
     defenses: new Uint8Array(n),
     strainId: new Uint16Array(n),
+    lockdownCompliant: new Uint8Array(n),
+    quarantined: new Uint8Array(n),
+    quarantineExpiry: new Int32Array(n),
   };
 }
 
@@ -30,11 +36,12 @@ export interface SeedOptions {
   seedInfections: number; // 0..1
   maskUptake: number;
   vaccineUptake: number;
+  lockdownCompliance: number;
   patientZero: boolean;
 }
 
 export function seed(buf: PopulationBuffers, rng: Rng, opts: SeedOptions): void {
-  const { state, defenses, age, infectedAge, strainId, n } = buf;
+  const { state, defenses, age, infectedAge, strainId, lockdownCompliant, quarantined, quarantineExpiry, n } = buf;
   for (let i = 0; i < n; i++) {
     state[i] = CellState.Susceptible;
     age[i] = 0;
@@ -44,6 +51,9 @@ export function seed(buf: PopulationBuffers, rng: Rng, opts: SeedOptions): void 
     if (rng.bernoulli(opts.maskUptake)) flags |= DefenseFlag.Mask;
     if (rng.bernoulli(opts.vaccineUptake)) flags |= DefenseFlag.Vaccine;
     defenses[i] = flags;
+    lockdownCompliant[i] = rng.bernoulli(opts.lockdownCompliance) ? 1 : 0;
+    quarantined[i] = 0;
+    quarantineExpiry[i] = 0;
   }
   if (opts.seedInfections > 0) {
     for (let i = 0; i < n; i++) {

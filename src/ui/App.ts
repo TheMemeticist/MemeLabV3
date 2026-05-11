@@ -1,4 +1,4 @@
-import type { FrameMessage, SimConfig, WorkerCommand } from '../types';
+import type { FrameMessage, InterventionEvent, InterventionKey, SimConfig, WorkerCommand } from '../types';
 import { findPreset, DEFAULT_PRESET_ID } from '../sim/presets';
 import { Petri } from './Petri';
 import { Chart } from './Chart';
@@ -35,6 +35,8 @@ export class App {
   private about = new AboutModal();
   private toastEl!: HTMLElement;
   private lastFrame: FrameMessage | null = null;
+  private interventionEvents: InterventionEvent[] = [];
+  private prevConfig: SimConfig | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -79,6 +81,7 @@ export class App {
     this.worker = new Worker(new URL('../worker/sim.worker.ts', import.meta.url), { type: 'module' });
     this.worker.onmessage = (ev: MessageEvent<FrameMessage>) => this.onFrame(ev.data);
     this.send({ cmd: 'init', config: initialConfig });
+    this.prevConfig = structuredClone(initialConfig);
 
     // Onboarding (first visit only)
     const onboarded = read<boolean>('onboarded', false);
@@ -98,14 +101,12 @@ export class App {
       this.root.appendChild(overlay);
       new Onboarding(overlay, () => {
         write('onboarded', true);
-        const sars2 = findPreset('sars2-delta');
-        this.controls.applyStrain(sars2.genes);
-        this.controls.hydrate(this.controls.config(), sars2.id);
+        // Default disease (Andes Hantavirus) is already loaded; just press play.
         this.handlePlay();
         setTimeout(() => overlay.remove(), 260);
       });
       // Also dismiss overlay when card removes itself, and auto-play once
-      // the user has acknowledged onboarding (whether via SARS-2 CTA or "Explore").
+      // the user has acknowledged onboarding (CTA or "Explore on my own").
       const obs = new MutationObserver(() => {
         if (!overlay.querySelector('.onboard-card')) {
           overlay.remove();
@@ -217,6 +218,7 @@ export class App {
       onConfigChange: () => this.onConfigChange(),
       onPresetChange: () => this.onConfigChange(),
       onCustomNameChange: () => this.persist(),
+      onInterventionToggle: (key, on) => this.recordInterventionToggle(key, on),
     });
     this.controls.buildLeft(left);
     this.controls.buildRight(right);
@@ -256,9 +258,23 @@ export class App {
         mutate: false,
         strain: { ...preset.genes },
         defenses: [
-          { id: 'mask', label: 'Mask', protection: 0.20, sourceControl: 0.81, mortalityReduction: 0.0, uptake: 0.5 },
-          { id: 'vaccine', label: 'Vaccine', protection: 0.80, sourceControl: 0.0, mortalityReduction: 0.80, uptake: 0.12 },
+          { id: 'mask', label: 'Mask', enabled: false, protection: 0.20, sourceControl: 0.81, mortalityReduction: 0.0, uptake: 0.5 },
+          { id: 'vaccine', label: 'Vaccine', enabled: false, protection: 0.80, sourceControl: 0.0, mortalityReduction: 0.80, uptake: 0.12 },
         ],
+        lockdown: {
+          enabled: false,
+          mobilityReduction: 0.5,
+          transmissionReduction: 0.3,
+          compliance: 0.7,
+        },
+        quarantine: {
+          enabled: false,
+          detectionRate: 0.1,
+          contactsRange: 1,
+          protection: 0.7,
+          sourceControl: 0.7,
+          duration: 14,
+        },
       },
       presetId: preset.id,
     };
@@ -272,7 +288,7 @@ export class App {
 
   private onFrame(msg: FrameMessage): void {
     this.lastFrame = msg;
-    this.petri.paint(msg.state, msg.defenses, msg.size);
+    this.petri.paint(msg.state, msg.defenses, msg.quarantined, msg.size);
     this.chart.update(msg.longStats);
     this.stats.update(msg.stats, msg.size * msg.size);
     this.stats.setRNaught(msg.rNaught);
@@ -288,10 +304,35 @@ export class App {
 
   private onConfigChange(): void {
     const cfg = this.controls.config();
-    this.send({ cmd: 'updateConfig', config: cfg });
+    const cmd: 'updateConfig' | 'patchConfig' =
+      this.needsRebuild(this.prevConfig, cfg) ? 'updateConfig' : 'patchConfig';
+    this.send({ cmd, config: cfg });
+    this.prevConfig = structuredClone(cfg);
     if (this.playing) {
       this.send({ cmd: 'play', tps: this.tps() });
     }
+    this.persist();
+  }
+
+  private needsRebuild(prev: SimConfig | null, next: SimConfig): boolean {
+    if (!prev) return true;
+    if (prev.size !== next.size) return true;
+    if (prev.seed !== next.seed) return true;
+    // Strain genes alter R₀ + neighbor cache + seeding behaviour — full rebuild.
+    const a = prev.strain, b = next.strain;
+    return a.attackRate !== b.attackRate
+      || a.incubation !== b.incubation
+      || a.infectious !== b.infectious
+      || a.ifr !== b.ifr
+      || a.range !== b.range
+      || a.immunityDays !== b.immunityDays
+      || a.mutationRate !== b.mutationRate;
+  }
+
+  private recordInterventionToggle(key: InterventionKey, on: boolean): void {
+    const tick = this.lastFrame?.tick ?? 0;
+    this.interventionEvents.push({ tick, intervention: key, on });
+    this.chart.setMarkers(this.interventionEvents);
     this.persist();
   }
 
@@ -328,6 +369,12 @@ export class App {
     this.playing = false;
     this.refreshPlayLabel();
     const cfg = this.controls.config();
+    // Reset clears the chart history, so the intervention markers — which are
+    // pinned to specific ticks — would no longer correspond to any data. Wipe
+    // them too.
+    this.interventionEvents = [];
+    this.chart.setMarkers(this.interventionEvents);
+    this.prevConfig = structuredClone(cfg);
     // Bump seed to give a fresh trajectory; keep configured seed otherwise.
     this.send({ cmd: 'reset', config: cfg });
   }
@@ -352,7 +399,7 @@ export class App {
     this.refreshThemeLabel();
     this.petri.refreshPalette();
     if (this.lastFrame) {
-      this.petri.paint(this.lastFrame.state, this.lastFrame.defenses, this.lastFrame.size);
+      this.petri.paint(this.lastFrame.state, this.lastFrame.defenses, this.lastFrame.quarantined, this.lastFrame.size);
     }
     this.persist();
   }
@@ -426,6 +473,9 @@ export class App {
     this.refreshSpeedLabel();
     this.refreshMutateLabel();
     this.refreshThemeLabel();
+    this.interventionEvents = [];
+    this.chart.setMarkers(this.interventionEvents);
+    this.prevConfig = structuredClone(applied.config);
     this.send({ cmd: 'reset', config: applied.config });
   }
 

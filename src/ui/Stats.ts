@@ -9,7 +9,7 @@ export class Stats {
     host.classList.add('stats-host');
     host.innerHTML = `
       <div class="stat" data-key="day"><span class="stat-label">Day</span><span class="stat-value">0</span></div>
-      <div class="stat" data-key="i"><span class="stat-label">Infectious</span><span class="stat-value">0%</span></div>
+      <div class="stat" data-key="i"><span class="stat-label">Infected</span><span class="stat-value">0%</span></div>
       <div class="stat" data-key="r"><span class="stat-label">Recovered</span><span class="stat-value">0%</span></div>
       <div class="stat" data-key="d"><span class="stat-label">Dead</span><span class="stat-value">0%</span></div>
       <div class="stat" data-key="reff"><span class="stat-label">R<sub>eff</sub></span><span class="stat-value">—</span></div>
@@ -29,7 +29,10 @@ export class Stats {
 
   update(stats: SimStats, n: number): void {
     this.items['day'].textContent = stats.tick.toString();
-    this.items['i'].textContent = pct(stats.i, n);
+    // "Infected" = Exposed + Infectious. With long-incubation pathogens (Hanta:
+    // 18d incubation, 3d infectious), most sick cells are E not I — showing only
+    // I would read as 0% while the petri visibly has orange-sprite cells.
+    this.items['i'].textContent = pct(stats.e + stats.i, n);
     this.items['r'].textContent = pct(stats.r, n);
     this.items['d'].textContent = pct(stats.d, n);
     this.items['reff'].textContent = stats.reff > 0 ? stats.reff.toFixed(2) : '—';

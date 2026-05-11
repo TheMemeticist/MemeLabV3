@@ -28,6 +28,13 @@ export function resolveDefenses(specs: DefenseSpec[]): ResolvedDefenses {
     if (!flag) continue;
     flags |= flag;
     const idx = bitIndex(flag);
+    // Disabled defense: leave multipliers at identity (1) so flagged cells
+    // experience no effect. Uptake also clamped to 0 so birth re-rolls don't
+    // grant new flags while off.
+    if (spec.enabled === false) {
+      uptake[idx] = 0;
+      continue;
+    }
     protection[idx] = 1 - clamp01(spec.protection);
     sourceControl[idx] = 1 - clamp01(spec.sourceControl);
     mortalityReduction[idx] = 1 - clamp01(spec.mortalityReduction);

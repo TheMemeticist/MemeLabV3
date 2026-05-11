@@ -103,10 +103,43 @@ export class Petri {
     this.renderLegend();
   }
 
-  paint(state: Uint8Array, defenses: Uint8Array, size: number): void {
+  paint(state: Uint8Array, defenses: Uint8Array, quarantined: Uint8Array | null, size: number): void {
     if (size !== this.size) this.resize(size);
     if (this.mode === 'sprite') this.paintSprites(state, defenses, size);
     else this.paintPixels(state, defenses, size);
+    if (quarantined) this.drawQuarantineBorders(quarantined, size);
+  }
+
+  private drawQuarantineBorders(q: Uint8Array, size: number): void {
+    const tile = this.canvas.width / size;
+    if (tile < 3) return;
+    const ctx = this.ctx;
+    const lineW = Math.max(2, tile * 0.16);
+    const dashOn = Math.max(3, tile * 0.32);
+    const dashOff = Math.max(2, tile * 0.18);
+    ctx.save();
+    ctx.setLineDash([dashOn, dashOff]);
+    ctx.lineJoin = 'miter';
+    // Two-pass stroke: dark backing for legibility on light cells, warm amber on top.
+    // First pass: thick dark outline.
+    ctx.lineWidth = lineW + 1;
+    ctx.strokeStyle = 'rgba(50, 30, 0, 0.85)';
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (!q[y * size + x]) continue;
+        ctx.strokeRect(x * tile + 0.5, y * tile + 0.5, tile - 1, tile - 1);
+      }
+    }
+    // Second pass: bolder amber inside the dark outline.
+    ctx.lineWidth = lineW;
+    ctx.strokeStyle = 'rgb(200, 140, 20)';
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (!q[y * size + x]) continue;
+        ctx.strokeRect(x * tile + 0.5, y * tile + 0.5, tile - 1, tile - 1);
+      }
+    }
+    ctx.restore();
   }
 
   private paintPixels(state: Uint8Array, defenses: Uint8Array, size: number): void {

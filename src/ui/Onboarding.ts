@@ -38,7 +38,7 @@ export class Onboarding {
         <li><strong>Share</strong> — Permalink button copies a deterministic URL anyone can replay.</li>
       </ol>
       <div class="onboard-actions">
-        <button class="btn btn-primary" data-cta="sars2">Run a SARS-2 outbreak →</button>
+        <button class="btn btn-primary" data-cta="hanta">Run an Andes Hantavirus outbreak →</button>
         <button class="btn" data-cta="dismiss">Explore on my own</button>
       </div>
       <p class="onboard-foot">Institute of Armchair Epidemiology · clean-room V3 rebuild</p>
@@ -47,7 +47,7 @@ export class Onboarding {
 
     const closeBtn = card.querySelector('.onboard-close') as HTMLButtonElement;
     closeBtn.addEventListener('click', () => this.dismiss());
-    card.querySelector('[data-cta="sars2"]')?.addEventListener('click', () => {
+    card.querySelector('[data-cta="hanta"]')?.addEventListener('click', () => {
       this.onAccept();
       this.dismiss();
     });
