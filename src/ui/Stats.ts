@@ -4,6 +4,8 @@ export class Stats {
   private el: HTMLElement;
   private items: Record<string, HTMLElement> = {};
   private rNaughtVal: HTMLElement;
+  private lastReff: number | null = null;
+  private lastTick = 0;
 
   constructor(host: HTMLElement) {
     host.classList.add('stats-host');
@@ -28,6 +30,9 @@ export class Stats {
   }
 
   update(stats: SimStats, n: number): void {
+    // Detect a reset / new run: tick rewound to 0 (or below previous).
+    if (stats.tick < this.lastTick) this.lastReff = null;
+    this.lastTick = stats.tick;
     this.items['day'].textContent = stats.tick.toString();
     // "Infected" = Exposed + Infectious. With long-incubation pathogens (Hanta:
     // 18d incubation, 3d infectious), most sick cells are E not I — showing only
@@ -35,7 +40,22 @@ export class Stats {
     this.items['i'].textContent = pct(stats.e + stats.i, n);
     this.items['r'].textContent = pct(stats.r, n);
     this.items['d'].textContent = pct(stats.d, n);
-    this.items['reff'].textContent = stats.reff > 0 ? stats.reff.toFixed(2) : '—';
+    // R_eff is window-based (rolling new-infections / new-infectious). With
+    // long-incubation pathogens, the denominator is often zero for stretches
+    // even though the epidemic is clearly active. Treat zero as "no new data"
+    // and hold the last measured value so the readout stays useful.
+    const cell = this.items['reff'];
+    if (stats.reff > 0) {
+      this.lastReff = stats.reff;
+      cell.textContent = stats.reff.toFixed(2);
+      cell.classList.remove('stale');
+    } else if (this.lastReff != null && (stats.e + stats.i) > 0) {
+      cell.textContent = this.lastReff.toFixed(2);
+      cell.classList.add('stale');
+    } else {
+      cell.textContent = '—';
+      cell.classList.remove('stale');
+    }
   }
 
   // For tests / debugging.

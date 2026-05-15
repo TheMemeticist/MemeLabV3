@@ -78,9 +78,10 @@ export interface SimConfig {
   seedInfections: number; // 0..1 fraction starting as Exposed
   birthRate: number; // 0..1 per-tick respawn chance for dead cells with healthy neighbors
   mutate: boolean;
-  /** When true (default), forcibly reseed one infectious cell whenever E+I=0
-   *  and immunity is not lifelong — keeps endemic dynamics from going extinct
-   *  due to stochastic flutter on small grids. */
+  /** When true, force-import one infectious cell whenever E+I=0 and immunity
+   *  is finite — mirrors external migration in a SEIRS model. Defaults to
+   *  false so that effective measures actually end an outbreak instead of
+   *  triggering perpetual reseeds. */
   reseedOnExtinction?: boolean;
   strain: StrainGenes;
   defenses: DefenseSpec[];

@@ -248,6 +248,7 @@ describe('Engine', () => {
     // target cell's protection.
     const cfg = baseConfig({
       seedInfections: 0,
+      reseedOnExtinction: true,
       strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
     });
     cfg.defenses[0].enabled = true;
@@ -269,6 +270,7 @@ describe('Engine', () => {
   it('full lockdown transmission reduction prevents reseed imports', () => {
     const cfg = baseConfig({
       seedInfections: 0,
+      reseedOnExtinction: true,
       strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
     });
     cfg.lockdown = { enabled: true, mobilityReduction: 0, transmissionReduction: 1, compliance: 1 };
@@ -282,6 +284,7 @@ describe('Engine', () => {
   it('full vaccine coverage blocks all infections across a long endemic run', () => {
     const cfg = baseConfig({
       seedInfections: 0,
+      reseedOnExtinction: true,
       strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
     });
     cfg.defenses[1].enabled = true;
@@ -299,6 +302,7 @@ describe('Engine', () => {
   it('full quarantine source control blocks reseed imports', () => {
     const cfg = baseConfig({
       seedInfections: 0,
+      reseedOnExtinction: true,
       strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 2, immunityDays: 3650, mutationRate: 0 },
     });
     cfg.quarantine = { enabled: true, detectionRate: 1, contactsRange: 1, protection: 1, sourceControl: 1, duration: 30 };

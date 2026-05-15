@@ -266,11 +266,19 @@ input[type='range']::-moz-range-thumb {
 
 .center-panel {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 14px;
   min-width: 0;
   min-height: 0;
 }
+/* Pin children to explicit rows so the petri keeps the flex track even when
+   the ended-banner is hidden (auto-placement otherwise shifts everything up
+   and the petri ends up in an `auto` track at zero height). */
+.center-panel > .ended-banner { grid-row: 1; }
+.center-panel > .stats-row    { grid-row: 2; }
+.center-panel > .petri-area   { grid-row: 3; min-height: 0; }
+.center-panel > .chart-wrap   { grid-row: 4; }
+.center-panel .ended-banner[hidden] { display: none; }
 
 /* ==== Stats row ==== */
 
@@ -307,6 +315,7 @@ input[type='range']::-moz-range-thumb {
 .stat[data-key='i'] .stat-value { color: rgb(var(--cell-i)); }
 .stat[data-key='r'] .stat-value { color: rgb(var(--cell-r)); }
 .stat[data-key='d'] .stat-value { color: rgb(var(--cell-d)); filter: brightness(1.2); }
+.stat .stat-value.stale { opacity: 0.6; font-style: italic; }
 :root[data-theme='lab'] .stat[data-key='d'] .stat-value { color: var(--text-muted); }
 
 /* ==== Petri ==== */
@@ -438,12 +447,26 @@ input[type='range']::-moz-range-thumb {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 12px;
-  height: 200px;
+  padding: 12px 12px 8px;
+  /* Canvas is sized explicitly by Chart.ts; the host grows naturally to fit
+     the canvas plus a legend that may wrap to multiple rows on narrow widths.
+     A min-height keeps the canvas visible before first data arrives. */
+  min-height: 200px;
   min-width: 0;
   position: relative;
   box-shadow: var(--shadow-sm);
-  overflow: hidden;
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
+}
+.chart-host .uplot { flex: 0 0 auto; position: relative; width: 100%; }
+.chart-host .uplot .u-legend {
+  position: static !important;
+  top: auto !important;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  background: transparent;
 }
 .chart-empty {
   display: flex;
@@ -458,12 +481,162 @@ input[type='range']::-moz-range-thumb {
   font-family: var(--font-mono);
   font-size: 11px;
 }
-.u-legend { color: var(--text-muted); }
-.u-legend .u-marker { border-radius: 2px; }
-.u-legend .u-series.u-off { opacity: 0.4; }
-.u-legend .u-series.u-off .u-marker { background: transparent !important; }
-.u-legend th { user-select: none; }
-.u-legend th:hover { color: var(--text-primary); }
+/* Legend — restyled to render as chip-rows with stable widths so hover
+   doesn't shift layout, and live values get a fixed column. */
+.u-legend { color: var(--text-muted); position: relative; max-width: 100%; }
+.u-legend table { border-collapse: separate; border-spacing: 4px 2px; table-layout: auto; width: auto; max-width: 100%; }
+.u-legend tbody { display: block; }
+.u-legend tbody tr { display: inline-flex; }
+.u-legend .u-marker { display: none !important; }
+.u-legend .u-series { display: inline-block; }
+.u-legend .u-series th,
+.u-legend .u-series td {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+.u-legend th {
+  user-select: none;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  transition: background 100ms ease, border-color 100ms ease, color 100ms ease;
+  cursor: pointer;
+  gap: 6px;
+}
+.u-legend th:hover { border-color: var(--accent); background: var(--accent-soft); }
+.u-legend .u-series:first-child th {
+  /* "Day" row — not toggleable, keep visually distinct */
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  cursor: default;
+  font-weight: 500;
+}
+.u-legend .u-series:first-child th:hover { background: transparent; border-color: transparent; }
+.u-legend .u-series.u-off th {
+  background: transparent;
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+.u-legend .u-toggle-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot-color, var(--accent));
+  flex-shrink: 0;
+}
+.u-legend .u-series.u-off .u-toggle-dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--border-strong);
+}
+.u-legend .u-value {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 44px;
+  justify-content: flex-end;
+  padding: 0 6px 0 0;
+}
+.u-legend-hint {
+  width: 100%;
+  display: block;
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-subtle);
+  font-style: italic;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+  pointer-events: none;
+}
+
+/* ==== Chart tabs ==== */
+.chart-wrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.chart-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.chart-tab {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 6px 14px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+}
+.chart-tab:hover { background: var(--accent-soft); color: var(--text); }
+.chart-tab[aria-selected='true'],
+.chart-tab.active {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+.chart-tab sub { font-size: 9px; }
+
+/* ==== Epidemic-ended banner ==== */
+.ended-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  background: linear-gradient(180deg, var(--accent-soft), var(--bg-panel));
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  animation: rise-in 260ms cubic-bezier(0.2, 0.7, 0.25, 1);
+}
+.ended-banner .ended-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.ended-banner .ended-text { flex: 1; min-width: 0; }
+.ended-banner .ended-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.005em;
+}
+.ended-banner .ended-sub {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  letter-spacing: 0.01em;
+}
+.ended-banner .ended-reset {
+  flex-shrink: 0;
+  font-size: 12px;
+  padding: 6px 14px;
+}
 
 /* ==== Panels ==== */
 
@@ -1078,7 +1251,14 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   .app-main { padding: 12px; gap: 10px; }
   .stats-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .stat-value { font-size: 18px; }
-  .chart-host { height: 180px; }
+  /* Chart on mobile: canvas is fixed-height (170px from Chart.ts); host grows
+     to fit the canvas plus a legend that wraps to multiple rows on narrow
+     widths. No fixed height here — let it size to content. */
+  .chart-host { padding: 10px 10px 6px; min-height: 0; }
+  .chart-tab { padding: 5px 12px; font-size: 11px; }
+  .u-legend th { height: 20px; padding: 0 8px; font-size: 10.5px; }
+  .u-legend .u-toggle-dot { width: 7px; height: 7px; }
+  .u-legend .u-value { min-width: 38px; font-size: 10.5px; }
   .footer { flex-direction: column; gap: 4px; align-items: flex-start; }
 }
 

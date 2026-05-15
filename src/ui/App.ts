@@ -1,7 +1,7 @@
 import type { FrameMessage, InterventionEvent, InterventionKey, SimConfig, WorkerCommand } from '../types';
 import { findPreset, DEFAULT_PRESET_ID } from '../sim/presets';
 import { Petri } from './Petri';
-import { Chart } from './Chart';
+import { Chart, type ChartView } from './Chart';
 import { Stats } from './Stats';
 import { ControlPanel } from './ControlPanel';
 import { Onboarding } from './Onboarding';
@@ -37,6 +37,10 @@ export class App {
   private lastFrame: FrameMessage | null = null;
   private interventionEvents: InterventionEvent[] = [];
   private prevConfig: SimConfig | null = null;
+  private epidemicStarted = false;
+  private epidemicEnded = false;
+  private endedBanner: HTMLElement | null = null;
+  private chartView: ChartView = 'compartments';
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -188,9 +192,16 @@ export class App {
       <main class="app-main">
         <aside class="left-panel" aria-label="Population and defenses"></aside>
         <section class="center-panel">
+          <div class="ended-banner" data-section="ended-banner" hidden></div>
           <div class="stats-row" data-section="stats"></div>
           <div class="petri-area" data-section="petri"></div>
-          <div class="chart-area" data-section="chart"></div>
+          <div class="chart-wrap">
+            <div class="chart-tabs" role="tablist" aria-label="Chart view">
+              <button class="chart-tab" role="tab" data-view="compartments" aria-selected="true">Compartments</button>
+              <button class="chart-tab" role="tab" data-view="reff" aria-selected="false">R<sub>eff</sub></button>
+            </div>
+            <div class="chart-area" data-section="chart"></div>
+          </div>
         </section>
         <aside class="right-panel" aria-label="Disease"></aside>
       </main>
@@ -213,6 +224,15 @@ export class App {
     this.stats = new Stats(statsHost);
     this.petri = new Petri(petriHost);
     this.chart = new Chart(chartHost);
+    this.endedBanner = this.root.querySelector('[data-section="ended-banner"]') as HTMLElement;
+
+    // Chart tabs
+    this.root.querySelectorAll<HTMLButtonElement>('.chart-tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const view = (btn.dataset['view'] as ChartView) ?? 'compartments';
+        this.setChartView(view);
+      });
+    });
 
     this.controls = new ControlPanel(this.defaultConfig().config, DEFAULT_PRESET_ID, {
       onConfigChange: () => this.onConfigChange(),
@@ -256,6 +276,7 @@ export class App {
         seedInfections: 0.001,
         birthRate: 0,
         mutate: false,
+        reseedOnExtinction: false,
         strain: { ...preset.genes },
         defenses: [
           { id: 'mask', label: 'Mask', enabled: false, protection: 0.20, sourceControl: 0.81, mortalityReduction: 0.0, uptake: 0.5 },
@@ -269,10 +290,10 @@ export class App {
         },
         quarantine: {
           enabled: false,
-          detectionRate: 0.1,
+          detectionRate: 0.7,
           contactsRange: 1,
-          protection: 0.7,
-          sourceControl: 0.7,
+          protection: 0.4,
+          sourceControl: 0.4,
           duration: 14,
         },
       },
@@ -296,18 +317,92 @@ export class App {
     this.metaSet('rN', `R₀ = ${rNStr}`);
     this.metaSet('strains', `Strains: ${msg.stats.strains}`);
 
+    this.checkEpidemicEnded(msg);
+
     // Persist last config snapshot.
     this.persist();
+  }
+
+  private checkEpidemicEnded(msg: FrameMessage): void {
+    if (this.epidemicEnded) return;
+    const { e, i } = msg.stats;
+    if (!this.epidemicStarted) {
+      if (e + i > 0) this.epidemicStarted = true;
+      return;
+    }
+    if (e + i === 0) {
+      this.epidemicEnded = true;
+      // Auto-pause the clock — the outbreak is over.
+      if (this.playing) {
+        this.playing = false;
+        this.send({ cmd: 'pause' });
+        this.refreshPlayLabel();
+      }
+      this.showEndedBanner(msg);
+    }
+  }
+
+  private showEndedBanner(msg: FrameMessage): void {
+    if (!this.endedBanner) return;
+    const n = msg.size * msg.size;
+    const { r, d, s } = msg.stats;
+    const pct = (v: number) => `${((v / n) * 100).toFixed(1)}%`;
+    const verdict = d === 0
+      ? 'Contained — no fatalities.'
+      : r === 0
+        ? 'All cases were fatal.'
+        : `${pct(r)} recovered, ${pct(d)} dead.`;
+    this.endedBanner.innerHTML = `
+      <div class="ended-icon" aria-hidden="true">✓</div>
+      <div class="ended-text">
+        <div class="ended-title">Epidemic ended · Day ${msg.tick}</div>
+        <div class="ended-sub">${verdict} ${s} susceptible remain.</div>
+      </div>
+      <button class="btn ended-reset" type="button">Reset</button>
+    `;
+    this.endedBanner.hidden = false;
+    this.endedBanner.querySelector('.ended-reset')?.addEventListener(
+      'click',
+      () => this.handleReset(),
+      { once: true },
+    );
+  }
+
+  private hideEndedBanner(): void {
+    if (this.endedBanner) {
+      this.endedBanner.hidden = true;
+      this.endedBanner.innerHTML = '';
+    }
+    this.epidemicStarted = false;
+    this.epidemicEnded = false;
+  }
+
+  private setChartView(view: ChartView): void {
+    if (this.chartView === view) return;
+    this.chartView = view;
+    this.chart.setView(view);
+    this.root.querySelectorAll<HTMLButtonElement>('.chart-tab').forEach((b) => {
+      const on = b.dataset['view'] === view;
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+      b.classList.toggle('active', on);
+    });
   }
 
   // ---- handlers ----
 
   private onConfigChange(): void {
     const cfg = this.controls.config();
-    const cmd: 'updateConfig' | 'patchConfig' =
-      this.needsRebuild(this.prevConfig, cfg) ? 'updateConfig' : 'patchConfig';
+    const rebuild = this.needsRebuild(this.prevConfig, cfg);
+    const cmd: 'updateConfig' | 'patchConfig' = rebuild ? 'updateConfig' : 'patchConfig';
     this.send({ cmd, config: cfg });
     this.prevConfig = structuredClone(cfg);
+    if (rebuild) {
+      // Engine just reset — patient zero is fresh, so the ended state no longer applies.
+      this.hideEndedBanner();
+      // Auto-play the fresh run regardless of prior state — same UX as Reset.
+      this.playing = true;
+      this.refreshPlayLabel();
+    }
     if (this.playing) {
       this.send({ cmd: 'play', tps: this.tps() });
     }
@@ -366,17 +461,20 @@ export class App {
   }
 
   private handleReset(): void {
-    this.playing = false;
-    this.refreshPlayLabel();
     const cfg = this.controls.config();
     // Reset clears the chart history, so the intervention markers — which are
     // pinned to specific ticks — would no longer correspond to any data. Wipe
     // them too.
     this.interventionEvents = [];
     this.chart.setMarkers(this.interventionEvents);
+    this.hideEndedBanner();
     this.prevConfig = structuredClone(cfg);
-    // Bump seed to give a fresh trajectory; keep configured seed otherwise.
     this.send({ cmd: 'reset', config: cfg });
+    // Reset auto-starts the simulation — the user almost always wants to see
+    // the new run play out immediately.
+    this.playing = true;
+    this.send({ cmd: 'play', tps: this.tps() });
+    this.refreshPlayLabel();
   }
 
   private cycleSpeed(): void {
@@ -475,6 +573,7 @@ export class App {
     this.refreshThemeLabel();
     this.interventionEvents = [];
     this.chart.setMarkers(this.interventionEvents);
+    this.hideEndedBanner();
     this.prevConfig = structuredClone(applied.config);
     this.send({ cmd: 'reset', config: applied.config });
   }

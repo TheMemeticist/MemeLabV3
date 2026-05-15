@@ -287,13 +287,13 @@ export class Engine {
 
     this.tick++;
 
-    // Anti-extinction: in a finite-immunity world the disease should be
-    //    endemic. With small populations, stochastic dynamics will sometimes
-    //    drive E+I to zero before a wane resupplies S. When that happens AND
-    //    immunity is not lifelong AND the user enabled the reseed flag (true
-    //    by default), we attempt to re-introduce one infectious cell. This
-    //    mirrors the "external import" mechanism that real-world SEIRS sims
-    //    need to model migration / out-of-network exposure.
+    // Optional external-import reseed. OFF by default — the point of the sim
+    //    is to test whether measures can end an outbreak, and a uniform reseed
+    //    silently extends every run. When opted-in (reseedOnExtinction === true)
+    //    AND immunity is not lifelong AND E+I=0, we attempt to re-introduce
+    //    one infectious cell, mirroring out-of-network exposure in a SEIRS
+    //    model. Originally on-by-default for endemic dynamics on small grids
+    //    — flipped off so that 100%-effective interventions visibly succeed.
     //
     //    The import attempt is subject to the same defenses an ordinary
     //    transmission would face — every active intervention gates the import
@@ -305,7 +305,7 @@ export class Engine {
     //        the incoming infected case — there's no in-sim source to control,
     //        so we apply it as a global gate when quarantine is active)
     //      • quarantine protection if the target is currently quarantined
-    if (this.config.reseedOnExtinction !== false) {
+    if (this.config.reseedOnExtinction === true) {
       const seedStrain = this.strains.get(0);
       if (seedStrain.immunityDays < 36500 && this.tick > 30) {
         const cur = pop.state;

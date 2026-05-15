@@ -16,6 +16,8 @@ const MARKER_LABELS: Record<string, string> = {
   quarantine: 'Quarantine',
 };
 
+export type ChartView = 'compartments' | 'reff';
+
 export class Chart {
   private host: HTMLElement;
   private plot: uPlot | null = null;
@@ -27,6 +29,8 @@ export class Chart {
   private markerTip: HTMLElement | null = null;
   private mouseHandler: ((ev: MouseEvent) => void) | null = null;
   private leaveHandler: (() => void) | null = null;
+  private view: ChartView = 'compartments';
+  private lastLong: LongStats | null = null;
 
   constructor(host: HTMLElement) {
     this.host = host;
@@ -50,17 +54,50 @@ export class Chart {
     // arrives at every sim tick) re-fires hooks.draw and paints markers fresh.
   }
 
+  setView(view: ChartView): void {
+    if (this.view === view) return;
+    this.view = view;
+    // Tear down the existing plot — series list changes between views, and
+    // uPlot doesn't support live series-list mutation. Next update() rebuilds.
+    if (this.plot) {
+      this.plot.destroy();
+      this.plot = null;
+      this.lastW = 0;
+      this.lastH = 0;
+      if (this.mouseHandler) this.host.removeEventListener('mousemove', this.mouseHandler);
+      if (this.leaveHandler) this.host.removeEventListener('mouseleave', this.leaveHandler);
+      this.mouseHandler = null;
+      this.leaveHandler = null;
+      this.markerTip?.remove();
+      this.markerTip = null;
+    }
+    if (this.lastLong) this.update(this.lastLong);
+  }
+
+  getView(): ChartView {
+    return this.view;
+  }
+
   private relayout(): void {
     if (!this.plot) return;
     const w = this.host.clientWidth;
-    const h = this.host.clientHeight;
+    const h = this.canvasHeight();
     if (w === this.lastW && h === this.lastH) return;
     this.lastW = w;
     this.lastH = h;
     this.plot.setSize({ width: w, height: h });
   }
 
+  private canvasHeight(): number {
+    // The host grows to fit canvas + legend (legend may wrap on narrow
+    // widths), so the canvas gets a fixed target height based on viewport.
+    // This keeps the x-axis labels readable and stops the legend from
+    // overflowing the host bottom when it wraps to two or three rows.
+    return window.matchMedia('(max-width: 700px)').matches ? 170 : 200;
+  }
+
   update(long: LongStats): void {
+    this.lastLong = long;
     if (long.tick.length === 0) {
       // Tear down any existing plot before wiping the DOM, otherwise the next
       // non-empty update would call setData() on a detached uPlot instance.
@@ -80,22 +117,32 @@ export class Chart {
       return;
     }
 
-    const data: uPlot.AlignedData = [
-      Float64Array.from(long.tick),
-      Float64Array.from(long.s),
-      Float64Array.from(long.e),
-      Float64Array.from(long.i),
-      Float64Array.from(long.r),
-      Float64Array.from(long.d),
-    ];
+    const data = this.buildData(long);
 
     if (!this.plot) {
       this.host.innerHTML = '';
       const css = getComputedStyle(document.documentElement);
       const accent = (k: string) => css.getPropertyValue(k).trim() || '#888';
+      const series = this.view === 'reff'
+        ? [
+            { label: 'Day' },
+            { label: 'R_eff', stroke: rgbCss('--accent') || '#3b82f6', width: 1.8 },
+          ]
+        : [
+            { label: 'Day' },
+            // Default-hide Susceptible / Exposed / Recovered — S typically
+            // dwarfs everything else and crushes the y-axis. The user can
+            // toggle them back on via the legend.
+            { label: 'Susceptible', stroke: rgbCss('--cell-s'), width: 1.4, show: false },
+            { label: 'Exposed', stroke: rgbCss('--cell-e'), width: 1.4, show: false },
+            { label: 'Infectious', stroke: rgbCss('--cell-i'), width: 1.8 },
+            { label: 'Recovered', stroke: rgbCss('--cell-r'), width: 1.4, show: false },
+            { label: 'Dead', stroke: rgbCss('--cell-d'), width: 1.4 },
+          ];
+      const isReff = this.view === 'reff';
       const opts: uPlot.Options = {
         width: this.host.clientWidth,
-        height: this.host.clientHeight,
+        height: this.canvasHeight(),
         scales: {
           x: { time: false },
           y: {
@@ -104,10 +151,17 @@ export class Chart {
             // series from dataMin/dataMax computation when `series.show=false`;
             // we just add a small headroom so traces don't kiss the axes.
             range: (_u, dataMin, dataMax) => {
-              if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) return [0, 1];
+              if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) {
+                return isReff ? [0, 2] : [0, 1];
+              }
               if (dataMin === dataMax) return [dataMin - 1, dataMax + 1];
               const pad = (dataMax - dataMin) * 0.08;
-              return [Math.max(0, dataMin - pad), dataMax + pad];
+              const lo = Math.max(0, dataMin - pad);
+              const hi = dataMax + pad;
+              // R_eff: always include 1 in the range so the herd-immunity
+              // threshold line is visible at the top or bottom of the chart.
+              if (isReff) return [Math.min(lo, 0), Math.max(hi, 1.2)];
+              return [lo, hi];
             },
           },
         },
@@ -117,16 +171,12 @@ export class Chart {
         ],
         legend: { show: true, live: true },
         cursor: { focus: { prox: 16 } },
-        series: [
-          { label: 'Day' },
-          { label: 'Susceptible', stroke: rgbCss('--cell-s'), width: 1.4 },
-          { label: 'Exposed', stroke: rgbCss('--cell-e'), width: 1.4 },
-          { label: 'Infectious', stroke: rgbCss('--cell-i'), width: 1.8 },
-          { label: 'Recovered', stroke: rgbCss('--cell-r'), width: 1.4 },
-          { label: 'Dead', stroke: rgbCss('--cell-d'), width: 1.4 },
-        ],
+        series,
         hooks: {
-          draw: [(u) => this.paintMarkers(u)],
+          draw: [
+            (u) => { if (isReff) this.paintReffThreshold(u); },
+            (u) => this.paintMarkers(u),
+          ],
         },
       };
       this.plot = new uPlot(opts, data, this.host);
@@ -137,16 +187,77 @@ export class Chart {
     }
   }
 
+  private buildData(long: LongStats): uPlot.AlignedData {
+    if (this.view === 'reff') {
+      return [
+        Float64Array.from(long.tick),
+        Float64Array.from(long.reff),
+      ];
+    }
+    return [
+      Float64Array.from(long.tick),
+      Float64Array.from(long.s),
+      Float64Array.from(long.e),
+      Float64Array.from(long.i),
+      Float64Array.from(long.r),
+      Float64Array.from(long.d),
+    ];
+  }
+
+  private paintReffThreshold(u: uPlot): void {
+    // Draw a dashed horizontal at R=1 — the herd-immunity threshold.
+    const y = u.valToPos(1, 'y', true);
+    if (!Number.isFinite(y)) return;
+    const ctx = u.ctx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.7)'; // muted red
+    ctx.lineWidth = 1 * dpr;
+    ctx.setLineDash([5 * dpr, 4 * dpr]);
+    ctx.beginPath();
+    ctx.moveTo(u.bbox.left, y);
+    ctx.lineTo(u.bbox.left + u.bbox.width, y);
+    ctx.stroke();
+    // Label
+    ctx.setLineDash([]);
+    ctx.font = `600 ${10 * dpr}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.95)';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('R = 1', u.bbox.left + u.bbox.width - 4 * dpr, y - 2 * dpr);
+    ctx.restore();
+  }
+
   private annotateLegend(): void {
     // Make it obvious the legend entries are clickable for show/hide.
     // uPlot binds the toggle handler to the <th> child, so style that.
+    const legend = this.host.querySelector('.u-legend') as HTMLElement | null;
+    if (legend && !legend.querySelector('.u-legend-hint')) {
+      const hint = document.createElement('div');
+      hint.className = 'u-legend-hint';
+      hint.textContent = 'click a series to hide/show';
+      legend.prepend(hint);
+    }
     const rows = this.host.querySelectorAll('.u-legend .u-series');
+    const plot = this.plot;
     rows.forEach((row, idx) => {
       if (idx === 0) return; // skip x-axis row
       const th = row.querySelector('th') as HTMLElement | null;
       if (!th) return;
       th.title = 'Click to show/hide this series';
-      th.style.cursor = 'pointer';
+      // Inject a small toggle indicator before the label so the affordance is
+      // obvious without inspecting cursor state.
+      let dot = th.querySelector('.u-toggle-dot') as HTMLElement | null;
+      if (!dot) {
+        dot = document.createElement('span');
+        dot.className = 'u-toggle-dot';
+        dot.setAttribute('aria-hidden', 'true');
+        th.prepend(dot);
+      }
+      // Tint the dot with the actual series stroke colour.
+      const stroke = plot?.series?.[idx]?.stroke;
+      const color = typeof stroke === 'function' ? null : (stroke as string | null | undefined);
+      if (color) dot.style.setProperty('--dot-color', color);
     });
   }
 
