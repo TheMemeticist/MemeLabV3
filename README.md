@@ -1,5 +1,7 @@
 # MemeLab · Cellular Defense Automata v3
 
+**[→ Live Demo: thememeticist.github.io/MemeLabV3](https://thememeticist.github.io/MemeLabV3/)**
+
 > Simulate outbreaks. Evolve strains. Master defenses.
 >
 > Institute of Armchair Epidemiology — clean-room V3 rebuild.
@@ -17,7 +19,7 @@ npm run test         # run the engine unit tests
 npm run typecheck    # tsc strict
 ```
 
-## The epi model
+## Model
 
 MemeLab is a discrete-time cellular automaton over an N×N torus grid. Each tick is one simulated day. Every cell is one individual in exactly one of five compartments — the classic **SEIRS** structure plus a terminal **Dead** state:
 
@@ -50,7 +52,7 @@ Each day, in this order:
 
 ### What R₀ and R_eff mean here
 
-- **R₀** is computed analytically from strain genes: distinct reachable neighbors × `1 − (1 − attackRate)^infectious`. It's a property of the disease, not the run, and is independent of seed.
+- **R₀** is computed analytically from strain phenotype: distinct reachable neighbors × `1 − (1 − attackRate)^infectious`. It's a property of the disease, not the run, and is independent of seed.
 - **R_eff** is measured as a 14-tick rolling average of new infections ÷ new infectious cells. It reflects what the active interventions are actually doing.
 
 ### Interventions
@@ -68,7 +70,7 @@ Adjusting any slider while the sim is running uses a live-patch path: per-cell f
 
 - Patient zero is planted at the grid centre at tick 0 (Exposed). With `seedInfections > 0`, additional cells are seeded uniformly at random.
 - **Anti-extinction reseed is OFF by default.** Once the epidemic dies, it stays dead — that's what lets you observe whether your interventions actually ended it. Opt back into reseeding by setting `reseedOnExtinction: true` in config.
-- Default preset: **Andes Hantavirus**. 8×8 grid. All four interventions disabled. Themes: `Petri` (light) and `Lab` (dark).
+- Default preset: **Bundibugyo ebolavirus (BDBV)**. 8×8 grid. All four interventions disabled. Themes: `Petri` (light) and `Lab` (dark).
 
 ## Determinism
 
@@ -102,7 +104,3 @@ Every run is reproducible. Click **Permalink** in the topbar to copy a URL that 
 - Lockup: `public/assets/logo-lockup.svg`
 - Themes: `Petri` (light, agar) and `Lab` (dark, oscilloscope).
 - Cell-state colors are color-blind safe (encoded by lightness as well as hue) and parsed from CSS variables, so retheming is purely a stylesheet edit.
-
-## License
-
-See `LICENSE` (inherited from the v1 repo) — MIT-compatible.

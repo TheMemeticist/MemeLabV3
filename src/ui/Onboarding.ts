@@ -38,7 +38,7 @@ export class Onboarding {
         <li><strong>Share</strong> — Permalink button copies a deterministic URL anyone can replay.</li>
       </ol>
       <div class="onboard-actions">
-        <button class="btn btn-primary" data-cta="hanta">Run an Andes Hantavirus outbreak →</button>
+        <button class="btn btn-primary" data-cta="hanta">Run a Bundibugyo Ebola outbreak →</button>
         <button class="btn" data-cta="dismiss">Explore on my own</button>
       </div>
       <p class="onboard-foot">Institute of Armchair Epidemiology · clean-room V3 rebuild</p>

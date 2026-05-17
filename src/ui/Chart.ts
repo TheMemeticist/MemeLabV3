@@ -137,7 +137,7 @@ export class Chart {
             { label: 'Exposed', stroke: rgbCss('--cell-e'), width: 1.4, show: false },
             { label: 'Infectious', stroke: rgbCss('--cell-i'), width: 1.8 },
             { label: 'Recovered', stroke: rgbCss('--cell-r'), width: 1.4, show: false },
-            { label: 'Dead', stroke: rgbCss('--cell-d'), width: 1.4 },
+            { label: 'Dead', stroke: cssVar('--chart-dead'), width: 1.6 },
           ];
       const isReff = this.view === 'reff';
       const opts: uPlot.Options = {
@@ -404,4 +404,9 @@ function rgbCss(varName: string): string {
   if (!css) return '#888';
   if (css.startsWith('#') || css.startsWith('rgb')) return css;
   return `rgb(${css})`;
+}
+
+function cssVar(varName: string): string {
+  const css = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  return css || '#888';
 }

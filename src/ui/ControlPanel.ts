@@ -35,19 +35,20 @@ export class ControlPanel {
 
   buildLeft(host: HTMLElement): void {
     host.innerHTML = `
-      <section class="panel collapsible" aria-label="Population" data-collapsed="true">
-        <button type="button" class="panel-head" aria-expanded="false" data-toggle="population">
+      <section class="panel collapsible" aria-label="Population" data-collapsed="false">
+        <button type="button" class="panel-head" aria-expanded="true" data-toggle="population">
           <h3>Population <span class="rate-badge" data-badge="popsize">—</span></h3>
           <span class="panel-icon" aria-hidden="true">👥</span>
           <span class="panel-chevron" aria-hidden="true">▾</span>
         </button>
         <div class="panel-body" data-section="population"></div>
       </section>
-      <section class="panel" aria-label="Interventions">
-        <header class="panel-head">
+      <section class="panel collapsible" aria-label="Interventions" data-collapsed="false">
+        <button type="button" class="panel-head" aria-expanded="true" data-toggle="interventions">
           <h3>Interventions</h3>
           <span class="panel-icon" aria-hidden="true">🛡️</span>
-        </header>
+          <span class="panel-chevron" aria-hidden="true">▾</span>
+        </button>
         <div class="panel-body intervention-stack">
           ${this.interventionCardMarkup('mask', 'Mask', '😷')}
           ${this.interventionCardMarkup('vaccine', 'Vaccine', '💉')}
@@ -77,6 +78,8 @@ export class ControlPanel {
     this.seedInfSlider = new Slider({
       id: 'seed-inf', label: 'Seed infections', min: 0, max: 100, step: 1, unit: '%',
       value: Math.round(this.cfg.seedInfections * 100),
+      hint: '0% = single Exposed cell planted at the grid center. Any value above 0% seeds that fraction of cells uniformly at random in addition to the center cell.',
+      format: (v) => v === 0 ? '1 cell (center)' : `${v}%`,
       onChange: (v) => { this.cfg.seedInfections = v / 100; this.dirty(); },
     });
     this.birthSlider = new Slider({
@@ -148,6 +151,15 @@ export class ControlPanel {
         this.dirty();
       });
     });
+
+    // On mobile, collapse all top-level panels by default.
+    if (window.matchMedia('(max-width: 1080px)').matches) {
+      host.querySelectorAll<HTMLElement>(':scope > .panel.collapsible').forEach((panel) => {
+        panel.dataset['collapsed'] = 'true';
+        const btn = panel.querySelector<HTMLButtonElement>('[data-toggle]');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      });
+    }
   }
 
   private interventionCardMarkup(key: InterventionKey, label: string, icon: string): string {
@@ -223,11 +235,12 @@ export class ControlPanel {
 
   buildRight(host: HTMLElement): void {
     host.innerHTML = `
-      <section class="panel" aria-label="Disease">
-        <header class="panel-head">
+      <section class="panel collapsible" aria-label="Disease" data-collapsed="false">
+        <button type="button" class="panel-head" aria-expanded="true" data-toggle="disease">
           <h3>Disease</h3>
           <span class="panel-icon" aria-hidden="true">🦠</span>
-        </header>
+          <span class="panel-chevron" aria-hidden="true">▾</span>
+        </button>
         <div class="panel-body">
           <div class="preset-host"></div>
           <div class="strain-sliders" data-section="strain"></div>
@@ -300,6 +313,25 @@ export class ControlPanel {
       // Whenever any disease gene changes, re-check whether we've drifted from
       // the current preset and reflect that in the picker label.
       this.strainSliders[k].onValueChange(() => this.recheckCustom());
+    }
+
+    // Collapsible toggle for the Disease panel.
+    host.querySelectorAll<HTMLButtonElement>('.panel-head[data-toggle]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const panel = btn.closest('.panel') as HTMLElement;
+        const collapsed = panel.dataset['collapsed'] === 'true';
+        panel.dataset['collapsed'] = collapsed ? 'false' : 'true';
+        btn.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
+      });
+    });
+
+    // On mobile, collapse all top-level panels by default.
+    if (window.matchMedia('(max-width: 1080px)').matches) {
+      host.querySelectorAll<HTMLElement>(':scope > .panel.collapsible').forEach((panel) => {
+        panel.dataset['collapsed'] = 'true';
+        const btn = panel.querySelector<HTMLButtonElement>('[data-toggle]');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      });
     }
   }
 

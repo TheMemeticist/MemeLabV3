@@ -12,6 +12,12 @@ export interface DiseasePreset {
 // immunity window plus a large enough population, infections persist endemically.
 export const PRESETS: DiseasePreset[] = [
   {
+    id: 'bdbv',
+    label: 'Bundibugyo ebolavirus (BDBV)',
+    blurb: 'Sudan lineage Ebola variant. High IFR, direct-contact transmission. First identified Uganda 2007.',
+    genes: { attackRate: 0.07, incubation: 6, infectious: 9, ifr: 0.34, range: 1, immunityDays: 3650, mutationRate: 0.008 },
+  },
+  {
     id: 'hanta-andes',
     label: 'Andes Hantavirus',
     blurb: 'Rare person-to-person transmission via prolonged close contact. Long incubation (9–40 days). High fatality.',
@@ -75,7 +81,7 @@ export const PRESETS: DiseasePreset[] = [
   },
 ];
 
-export const DEFAULT_PRESET_ID = 'hanta-andes';
+export const DEFAULT_PRESET_ID = 'bdbv';
 
 export function findPreset(id: string): DiseasePreset {
   return PRESETS.find((p) => p.id === id) ?? PRESETS.find((p) => p.id === DEFAULT_PRESET_ID)!;

@@ -41,6 +41,7 @@
   --cell-i: 218 60 50;           /* infectious — coral */
   --cell-r: 70 110 145;          /* recovered — slate-blue */
   --cell-d: 40 35 30;             /* dead — near-black slate */
+  --chart-dead: rgb(40, 35, 30);  /* dead series line — dark on light bg */
   --cell-ring-mask: 38 169 198;
   --cell-ring-vax: 156 89 209;
   --grid-color: rgba(60, 38, 8, 0.10);
@@ -91,6 +92,7 @@
   --cell-i: 255 92 92;            /* infectious — neon red */
   --cell-r: 130 165 195;         /* recovered — slate-cyan */
   --cell-d: 30 35 42;             /* dead — graphite */
+  --chart-dead: rgb(175, 180, 192); /* dead series line — light gray on dark bg */
   --cell-ring-mask: 92 222 236;
   --cell-ring-vax: 195 145 255;
   --grid-color: rgba(120, 200, 235, 0.10);
