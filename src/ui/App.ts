@@ -42,6 +42,7 @@ export class App {
   private endedBanner: HTMLElement | null = null;
   private chartView: ChartView = 'compartments';
 
+
   constructor(root: HTMLElement) {
     this.root = root;
   }

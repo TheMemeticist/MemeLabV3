@@ -410,3 +410,4 @@ function cssVar(varName: string): string {
   const css = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
   return css || '#888';
 }
+
