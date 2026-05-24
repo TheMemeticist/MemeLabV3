@@ -3,7 +3,7 @@ import type { LongStats, SimConfig, SimStats } from '../types';
 import { Rng } from './rng';
 import { StrainPool } from './strain';
 import { allocate, seed, type PopulationBuffers } from './population';
-import { getOffsets, torus } from './neighbors';
+import { makeGeometry, torus, type LatticeGeometry } from './neighbors';
 import {
   resolveDefenses,
   protectionMultiplier,
@@ -13,7 +13,7 @@ import {
 } from './defense';
 
 const REFF_WINDOW = 14;
-const LONG_CAP = 4096; // ticks of history retained
+const LONG_CAP = 4096;
 
 export class Engine {
   private rng!: Rng;
@@ -21,6 +21,7 @@ export class Engine {
   private strains!: StrainPool;
   private defenses!: ResolvedDefenses;
   private config!: SimConfig;
+  private geometry!: LatticeGeometry;
 
   tick = 0;
   private newInfectionsHistory: number[] = [];
@@ -34,6 +35,7 @@ export class Engine {
 
   reset(config: SimConfig): void {
     this.config = config;
+    this.geometry = makeGeometry(config.geometry);
     this.rng = new Rng(config.seed);
     this.pop = allocate(config.size);
     this.strains = new StrainPool(config.strain);
@@ -61,34 +63,25 @@ export class Engine {
    * next tick without any buffer mutation.
    *
    * Callers MUST send this only for changes that don't affect the engine's
-   * structural shape — grid size, seed, and strain genes still require a full
-   * rebuild (because they alter R₀, the neighbor cache shape, or the RNG
-   * trajectory). Use `reset()` for those.
+   * structural shape — grid size, seed, strain genes, and geometry still require
+   * a full rebuild. Use `reset()` for those.
    */
   patchConfig(newCfg: SimConfig): void {
     const old = this.config;
-    // 1. Defense uptake stochastic resampling.
     for (let k = 0; k < newCfg.defenses.length && k < old.defenses.length; k++) {
-      const oldP = old.defenses[k].uptake;
-      const newP = newCfg.defenses[k].uptake;
-      // If either defense was/is disabled, treat its effective uptake as 0
-      // for resampling purposes — the buffer flag is preserved either way.
-      const oldEff = old.defenses[k].enabled === false ? 0 : oldP;
-      const newEff = newCfg.defenses[k].enabled === false ? 0 : newP;
+      const oldEff = old.defenses[k].enabled === false ? 0 : old.defenses[k].uptake;
+      const newEff = newCfg.defenses[k].enabled === false ? 0 : newCfg.defenses[k].uptake;
       if (oldEff !== newEff) this.resampleDefenseFlag(k, oldEff, newEff);
     }
-    // 2. Lockdown compliance.
     const oldComp = old.lockdown.enabled ? old.lockdown.compliance : 0;
     const newComp = newCfg.lockdown.enabled ? newCfg.lockdown.compliance : 0;
     if (oldComp !== newComp) {
       this.resampleByteFlag(this.pop.lockdownCompliant, oldComp, newComp);
     }
-    // 3. Quarantine toggle-off → instantly clear all active quarantines.
     if (old.quarantine.enabled && !newCfg.quarantine.enabled) {
       this.pop.quarantined.fill(0);
       this.pop.quarantineExpiry.fill(0);
     }
-    // 4. Re-resolve the defense table (picks up enabled flags + multipliers).
     this.defenses = resolveDefenses(newCfg.defenses);
     this.config = newCfg;
   }
@@ -126,6 +119,142 @@ export class Engine {
   }
 
   step(): SimStats {
+    if (this.geometry.isMeanField()) return this.stepMeanField();
+    return this.stepSpatial();
+  }
+
+  private stepMeanField(): SimStats {
+    const pop = this.pop;
+    const { state, next, age, infectedAge, defenses, strainId, quarantined, quarantineExpiry, n } = pop;
+    const D = this.defenses;
+    const rng = this.rng;
+    const strains = this.strains;
+    const mutate = this.config.mutate;
+    const birthRate = this.config.birthRate;
+    const lockdown = this.config.lockdown;
+    const lockdownOn = lockdown.enabled === true;
+    const lockdownTransMul = lockdownOn ? 1 - lockdown.transmissionReduction : 1;
+    const quarantine = this.config.quarantine;
+    const quarantineOn = quarantine.enabled === true;
+    const qSrcMul = quarantineOn ? 1 - quarantine.sourceControl : 1;
+    const qProtMul = quarantineOn ? 1 - quarantine.protection : 1;
+
+    next.set(state);
+
+    // Count infectious for global mixing force-of-infection.
+    let iCount = 0;
+    for (let i = 0; i < n; i++) {
+      if (state[i] === CellState.Infectious) iCount++;
+    }
+
+    let newInfections = 0;
+    let newInfectious = 0;
+
+    // Mean-field transmission: each susceptible is attacked by the aggregate
+    // infectious pool. Effective contact count k mirrors the square range-1
+    // neighbourhood so R0 is comparable across geometry modes.
+    if (iCount > 0) {
+      // Use the dominant strain (strain 0) for the rate parameters.
+      const dominantStrain = strains.get(0);
+      // k=2: mean-field sits below triangular (3) in the R0 hierarchy.
+      const k = 2;
+      const baseAttack = dominantStrain.attackRate;
+
+      for (let j = 0; j < n; j++) {
+        if (state[j] !== CellState.Susceptible) continue;
+        let protMul = protectionMultiplier(D, defenses[j]);
+        if (quarantineOn && quarantined[j]) protMul *= qProtMul;
+        // Effective per-tick exposure: 1 − (1−p)^(I × k / N)
+        // where p = baseAttack × srcMul_avg × protMul
+        // srcMul_avg ≈ 1 (global average; quarantine/lockdown applied globally below)
+        let srcMul = 1 * lockdownTransMul * qSrcMul;
+        if (lockdownOn && rng.bernoulli(lockdown.mobilityReduction)) srcMul = 0;
+        const p = baseAttack * srcMul * protMul;
+        if (p <= 0) continue;
+        // Exposure probability: 1 − (1−p)^(iCount * k / n)  — exact for small p
+        const pExposed = 1 - Math.pow(1 - p, (iCount * k) / n);
+        if (pExposed <= 0) continue;
+        if (rng.bernoulli(pExposed)) {
+          if (next[j] === CellState.Susceptible) {
+            next[j] = CellState.Exposed;
+            infectedAge[j] = 0;
+            strainId[j] = mutate ? strains.spawnChild(0, this.tick, rng) : 0;
+            newInfections++;
+          }
+        }
+      }
+    }
+
+    // Quarantine detection — same as spatial.
+    if (quarantineOn && quarantine.detectionRate > 0 && quarantine.duration > 0) {
+      const detRate = quarantine.detectionRate;
+      const expiry = this.tick + quarantine.duration;
+      for (let i = 0; i < n; i++) {
+        if (state[i] !== CellState.Infectious || quarantined[i]) continue;
+        if (!rng.bernoulli(detRate)) continue;
+        quarantined[i] = 1;
+        quarantineExpiry[i] = expiry;
+      }
+    }
+
+    // Life-cycle pass — identical to spatial.
+    for (let i = 0; i < n; i++) {
+      if (quarantined[i] && this.tick >= quarantineExpiry[i]) {
+        quarantined[i] = 0;
+        quarantineExpiry[i] = 0;
+      }
+      const s = state[i];
+      if (s === CellState.Dead) {
+        if (birthRate > 0 && rng.bernoulli(birthRate)) {
+          next[i] = CellState.Susceptible;
+          age[i] = 0;
+          infectedAge[i] = 0;
+          strainId[i] = 0;
+          let flags = 0;
+          if (rng.bernoulli(D.uptake[0])) flags |= 1;
+          if (rng.bernoulli(D.uptake[1])) flags |= 2;
+          defenses[i] = flags;
+        }
+        continue;
+      }
+      age[i]++;
+      if (s === CellState.Exposed) {
+        infectedAge[i]++;
+        const strain = strains.get(strainId[i]);
+        if (infectedAge[i] >= strain.incubation) {
+          next[i] = CellState.Infectious;
+          newInfectious++;
+        }
+      } else if (s === CellState.Infectious) {
+        infectedAge[i]++;
+        const strain = strains.get(strainId[i]);
+        if (infectedAge[i] >= strain.incubation + strain.infectious) {
+          const ifr = strain.ifr * mortalityMultiplier(D, defenses[i]);
+          if (rng.bernoulli(ifr)) {
+            next[i] = CellState.Dead;
+          } else {
+            next[i] = CellState.Recovered;
+            infectedAge[i] = 0;
+          }
+        }
+      } else if (s === CellState.Recovered) {
+        const strain = strains.get(strainId[i]);
+        const dailyWane = strain.immunityDays > 0 ? 1 / strain.immunityDays : 1;
+        if (rng.bernoulli(dailyWane)) {
+          next[i] = CellState.Susceptible;
+          strainId[i] = 0;
+        }
+      }
+    }
+
+    pop.state = next;
+    pop.next = state;
+    this.tick++;
+
+    return this.computeStats(newInfections, newInfectious);
+  }
+
+  private stepSpatial(): SimStats {
     const pop = this.pop;
     const { state, next, age, infectedAge, defenses, strainId, lockdownCompliant, quarantined, quarantineExpiry, size, n } = pop;
     const D = this.defenses;
@@ -141,36 +270,31 @@ export class Engine {
     const quarantineOn = quarantine.enabled === true;
     const qSrcMul = quarantineOn ? 1 - quarantine.sourceControl : 1;
     const qProtMul = quarantineOn ? 1 - quarantine.protection : 1;
+    const geo = this.geometry;
 
-    // 1) Snapshot current state into next-buffer; we'll mutate `next` then swap.
     next.set(state);
 
     let newInfections = 0;
     let newInfectious = 0;
 
-    // 2) Transmission pass: every infectious cell attacks neighbors.
-    //    We use the parent strain's range/attack from the *current* strainId.
+    // 2) Transmission pass.
     for (let i = 0; i < n; i++) {
       if (state[i] !== CellState.Infectious) continue;
       const attackerStrain = strains.get(strainId[i]);
       const range = attackerStrain.range;
       const baseAttack = attackerStrain.attackRate;
       let srcMul = sourceControlMultiplier(D, defenses[i]);
-      // Quarantine attenuates outgoing transmission.
       if (quarantineOn && quarantined[i]) srcMul *= qSrcMul;
-      // Lockdown reduces transmission globally.
       srcMul *= lockdownTransMul;
       if (baseAttack * srcMul <= 0) continue;
 
       const x = i % size;
       const y = (i / size) | 0;
-      const table = getOffsets(range);
-      const offsets = table.offsets;
+      const offsets = geo.getOffsets(range, x, y);
       const m2 = offsets.length;
       const srcUnderLockdown = lockdownOn && lockdownCompliant[i] === 1;
 
       for (let k = 0; k < m2; k += 2) {
-        // Probabilistic neighbor culling for compliant cells under lockdown.
         if (srcUnderLockdown && lockdownSkipP > 0 && rng.bernoulli(lockdownSkipP)) continue;
         const nx = torus(x + offsets[k], size);
         const ny = torus(y + offsets[k + 1], size);
@@ -181,7 +305,6 @@ export class Engine {
         const p = baseAttack * srcMul * protMul;
         if (p <= 0) continue;
         if (rng.bernoulli(p)) {
-          // Use `next` to record exposures; `state` stays clean for ordering.
           if (next[j] === CellState.Susceptible) {
             next[j] = CellState.Exposed;
             infectedAge[j] = 0;
@@ -193,16 +316,10 @@ export class Engine {
       }
     }
 
-    // 2b) Quarantine detection pass: each pre-existing infectious cell may be
-    //     detected and quarantined along with its close contacts. Runs against
-    //     the snapshot `state` so detection probability is independent of
-    //     ordering. Uses `next[j]` only to test whether a detected cell hasn't
-    //     itself been transitioned this tick.
+    // 2b) Quarantine detection pass.
     if (quarantineOn && quarantine.detectionRate > 0 && quarantine.duration > 0) {
       const detRate = quarantine.detectionRate;
-      const contactsTable = getOffsets(Math.max(1, quarantine.contactsRange | 0));
-      const offsets = contactsTable.offsets;
-      const m2 = offsets.length;
+      const contactsRange = Math.max(1, quarantine.contactsRange | 0);
       const expiry = this.tick + quarantine.duration;
       for (let i = 0; i < n; i++) {
         if (state[i] !== CellState.Infectious || quarantined[i]) continue;
@@ -211,33 +328,32 @@ export class Engine {
         quarantineExpiry[i] = expiry;
         const x = i % size;
         const y = (i / size) | 0;
+        const offsets = geo.getOffsets(contactsRange, x, y);
+        const m2 = offsets.length;
         for (let k = 0; k < m2; k += 2) {
           const nx = torus(x + offsets[k], size);
           const ny = torus(y + offsets[k + 1], size);
           const j = ny * size + nx;
           if (j === i) continue;
           quarantined[j] = 1;
-          // Extend existing expiry if shorter.
           if (quarantineExpiry[j] < expiry) quarantineExpiry[j] = expiry;
         }
       }
     }
 
-    // 3) Per-cell life-cycle pass: SEIR transitions + births. Uses prev `state`.
+    // 3) Life-cycle pass.
     for (let i = 0; i < n; i++) {
-      // Quarantine expiry — O(1) per cell.
       if (quarantined[i] && this.tick >= quarantineExpiry[i]) {
         quarantined[i] = 0;
         quarantineExpiry[i] = 0;
       }
       const s = state[i];
       if (s === CellState.Dead) {
-        if (birthRate > 0 && rng.bernoulli(birthRate * neighborAliveFraction(state, i, size))) {
+        if (birthRate > 0 && rng.bernoulli(birthRate * neighborAliveFraction(state, i, size, geo))) {
           next[i] = CellState.Susceptible;
           age[i] = 0;
           infectedAge[i] = 0;
           strainId[i] = 0;
-          // Inherit a defense roll for the new arrival.
           let flags = 0;
           if (rng.bernoulli(D.uptake[0])) flags |= 1;
           if (rng.bernoulli(D.uptake[1])) flags |= 2;
@@ -259,19 +375,15 @@ export class Engine {
         infectedAge[i]++;
         const strain = strains.get(strainId[i]);
         if (infectedAge[i] >= strain.incubation + strain.infectious) {
-          // Recovery / death roll.
           const ifr = strain.ifr * mortalityMultiplier(D, defenses[i]);
           if (rng.bernoulli(ifr)) {
             next[i] = CellState.Dead;
           } else {
             next[i] = CellState.Recovered;
             infectedAge[i] = 0;
-            // Strain reference retained for lineage stats; cell is no longer a host.
           }
         }
       } else if (s === CellState.Recovered) {
-        // Per-day wane probability = 1 / immunityDays — yields exponentially
-        // distributed immune durations with mean equal to immunityDays.
         const strain = strains.get(strainId[i]);
         const dailyWane = strain.immunityDays > 0 ? 1 / strain.immunityDays : 1;
         if (rng.bernoulli(dailyWane)) {
@@ -284,48 +396,27 @@ export class Engine {
     // 4) Swap.
     pop.state = next;
     pop.next = state;
-
     this.tick++;
 
-    // Optional external-import reseed. OFF by default — the point of the sim
-    //    is to test whether measures can end an outbreak, and a uniform reseed
-    //    silently extends every run. When opted-in (reseedOnExtinction === true)
-    //    AND immunity is not lifelong AND E+I=0, we attempt to re-introduce
-    //    one infectious cell, mirroring out-of-network exposure in a SEIRS
-    //    model. Originally on-by-default for endemic dynamics on small grids
-    //    — flipped off so that 100%-effective interventions visibly succeed.
-    //
-    //    The import attempt is subject to the same defenses an ordinary
-    //    transmission would face — every active intervention gates the import
-    //    so that fully-tuned interventions actually halt the outbreak instead
-    //    of being silently overridden by a uniform reseed:
-    //      • mask + vaccine protection of the target cell (via protectionMultiplier)
-    //      • lockdown transmission reduction (global)
-    //      • quarantine source control (modeled as border-enforcement against
-    //        the incoming infected case — there's no in-sim source to control,
-    //        so we apply it as a global gate when quarantine is active)
-    //      • quarantine protection if the target is currently quarantined
+    // Optional extinction reseed (off by default).
     if (this.config.reseedOnExtinction === true) {
       const seedStrain = this.strains.get(0);
       if (seedStrain.immunityDays < 36500 && this.tick > 30) {
         const cur = pop.state;
         let extant = 0;
         for (let k = 0; k < cur.length; k++) {
-          if (cur[k] === CellState.Exposed || cur[k] === CellState.Infectious) {
-            extant++;
-            if (extant > 0) break;
-          }
+          if (cur[k] === CellState.Exposed || cur[k] === CellState.Infectious) { extant++; break; }
         }
         if (extant === 0) {
           let attempts = 0;
           while (attempts < 16) {
-            const idx = rng.intRange(cur.length);
+            const idx = this.rng.intRange(cur.length);
             if (cur[idx] === CellState.Susceptible) {
               let protMul = protectionMultiplier(D, this.pop.defenses[idx]);
               if (quarantineOn && quarantined[idx]) protMul *= qProtMul;
               let importP = protMul * lockdownTransMul;
               if (quarantineOn) importP *= qSrcMul;
-              if (importP > 0 && rng.bernoulli(importP)) {
+              if (importP > 0 && this.rng.bernoulli(importP)) {
                 cur[idx] = CellState.Infectious;
                 this.pop.infectedAge[idx] = seedStrain.incubation;
                 this.pop.strainId[idx] = 0;
@@ -338,13 +429,14 @@ export class Engine {
       }
     }
 
-    // 5) Stats.
-    let s = 0;
-    let e = 0;
-    let inf = 0;
-    let r = 0;
-    let d = 0;
+    return this.computeStats(newInfections, newInfectious);
+  }
+
+  private computeStats(newInfections: number, newInfectious: number): SimStats {
+    const pop = this.pop;
+    const { n } = pop;
     const cur = pop.state;
+    let s = 0, e = 0, inf = 0, r = 0, d = 0;
     for (let i = 0; i < n; i++) {
       switch (cur[i]) {
         case CellState.Susceptible: s++; break;
@@ -374,10 +466,7 @@ export class Engine {
   }
 
   private computeReff(): number {
-    // Approximation: ratio of new infections to new infectious individuals over a
-    // sliding window. When few people become infectious in the window, fall back to 0.
-    let inf = 0;
-    let became = 0;
+    let inf = 0, became = 0;
     for (let i = 0; i < this.newInfectiousHistory.length; i++) {
       inf += this.newInfectionsHistory[i] ?? 0;
       became += this.newInfectiousHistory[i] ?? 0;
@@ -386,32 +475,30 @@ export class Engine {
     return inf / became;
   }
 
-  /**
-   * Analytical R₀ expectation for an all-susceptible neighborhood.
-   * Per-day infection is Bernoulli(attackRate); a neighbor exposed for `days`
-   * independent days is infected with P = 1 − (1 − attackRate)^days.
-   * E[R₀] = (distinct reachable neighbors) × P. Closed-form, deterministic, no
-   * seed dependency — R₀ is a property of the disease, not the run.
-   */
   private estimateR0(config: SimConfig): number | null {
     if (config.size < 8) return null;
     const strain = config.strain;
     const days = strain.infectious;
     if (days <= 0) return 0;
     const p = Math.max(0, Math.min(1, strain.attackRate));
+    const pInfected = 1 - Math.pow(1 - p, days);
+
+    if (config.geometry === 'meanfield') {
+      return 2 * pInfected; // k=2 matches stepMeanField
+    }
+
     const size = Math.min(config.size, 80);
     const cx = size >> 1;
     const cy = size >> 1;
-    const center = cy * size + cx;
-    const offsets = getOffsets(strain.range).offsets;
+    const geo = makeGeometry(config.geometry);
+    const offsets = geo.getOffsets(strain.range, cx, cy);
     const reachable = new Set<number>();
     for (let k = 0; k < offsets.length; k += 2) {
       const nx = torus(cx + offsets[k], size);
       const ny = torus(cy + offsets[k + 1], size);
       const j = ny * size + nx;
-      if (j !== center) reachable.add(j);
+      if (j !== cy * size + cx) reachable.add(j);
     }
-    const pInfected = 1 - Math.pow(1 - p, days);
     return reachable.size * pInfected;
   }
 
@@ -425,22 +512,20 @@ export class Engine {
   }
 }
 
-function neighborAliveFraction(state: Uint8Array, i: number, size: number): number {
+function neighborAliveFraction(state: Uint8Array, i: number, size: number, geo: LatticeGeometry): number {
   const x = i % size;
   const y = (i / size) | 0;
+  const offsets = geo.getOffsets(1, x, y);
+  const m2 = offsets.length;
+  if (m2 === 0) return 0.5; // mean-field: use flat rate, caller multiplies by birthRate
   let alive = 0;
-  let total = 0;
-  for (let dy = -1; dy <= 1; dy++) {
-    for (let dx = -1; dx <= 1; dx++) {
-      if (dx === 0 && dy === 0) continue;
-      const nx = torus(x + dx, size);
-      const ny = torus(y + dy, size);
-      const j = ny * size + nx;
-      if (state[j] !== CellState.Dead) alive++;
-      total++;
-    }
+  for (let k = 0; k < m2; k += 2) {
+    const nx = torus(x + offsets[k], size);
+    const ny = torus(y + offsets[k + 1], size);
+    const j = ny * size + nx;
+    if (state[j] !== CellState.Dead) alive++;
   }
-  return alive / total;
+  return alive / (m2 / 2);
 }
 
 function emptyLong(): LongStats {
@@ -456,12 +541,7 @@ function pushLong(long: LongStats, stats: SimStats): void {
   long.d.push(stats.d);
   long.reff.push(stats.reff);
   if (long.tick.length > LONG_CAP) {
-    long.tick.shift();
-    long.s.shift();
-    long.e.shift();
-    long.i.shift();
-    long.r.shift();
-    long.d.shift();
-    long.reff.shift();
+    long.tick.shift(); long.s.shift(); long.e.shift();
+    long.i.shift(); long.r.shift(); long.d.shift(); long.reff.shift();
   }
 }

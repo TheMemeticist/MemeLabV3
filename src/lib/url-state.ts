@@ -3,13 +3,15 @@
 // share the result.
 //
 // Format:
-//   #/sim?seed=12648430&size=96&attack=0.10&inc=2&inf=4&ifr=0.03&range=2
+//   #/sim?seed=12648430&size=96&geo=square&attack=0.10&inc=2&inf=4&ifr=0.03&range=2
 //        &immDays=180&mut=0.01&seedInf=0.001&birth=0
 //        &maskRate=0.50&maskProt=0.20&maskSrc=0.81&maskMort=0
 //        &vaxRate=0.12&vaxProt=0.80&vaxSrc=0&vaxMort=0.80
 //        &theme=petri&speed=2&preset=sars2-delta&mutate=0
 
-import type { SimConfig } from '../types';
+import type { GeometryType, SimConfig } from '../types';
+
+const VALID_GEOMETRIES = new Set<string>(['square', 'triangular', 'hexagonal', 'meanfield']);
 
 export interface PermalinkOptions {
   config: SimConfig;
@@ -27,6 +29,7 @@ export function encode(opts: PermalinkOptions): string {
   params.set('preset', opts.presetId);
   params.set('seed', (c.seed >>> 0).toString());
   params.set('size', String(c.size));
+  params.set('geo', c.geometry ?? 'square');
   params.set('seedInf', round3(c.seedInfections).toString());
   params.set('birth', round3(c.birthRate).toString());
   params.set('mutate', c.mutate ? '1' : '0');
@@ -95,9 +98,15 @@ export function applyEncoded(p: URLSearchParams, base: SimConfig): {
   const v = base.defenses.find((d) => d.id === 'vaccine') ?? {
     id: 'vaccine', label: 'Vaccine', enabled: true, protection: 0.8, sourceControl: 0, mortalityReduction: 0.8, uptake: 0.12,
   };
+  const rawGeo = p.get('geo') ?? '';
+  const geometry: GeometryType = VALID_GEOMETRIES.has(rawGeo)
+    ? (rawGeo as GeometryType)
+    : (base.geometry ?? 'square');
+
   const config: SimConfig = {
     seed: int(p, 'seed', base.seed) >>> 0,
     size: clampInt(int(p, 'size', base.size), 8, 1024),
+    geometry,
     seedInfections: clamp01(num(p, 'seedInf', base.seedInfections)),
     birthRate: clamp01(num(p, 'birth', base.birthRate)),
     mutate: bool(p, 'mutate', base.mutate),

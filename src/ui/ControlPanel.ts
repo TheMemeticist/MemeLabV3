@@ -1,4 +1,4 @@
-import type { InterventionKey, SimConfig, StrainGenes } from '../types';
+import type { GeometryType, InterventionKey, SimConfig, StrainGenes } from '../types';
 import { Slider } from './Slider';
 import { PresetPicker } from './PresetPicker';
 import { findPreset, type DiseasePreset } from '../sim/presets';
@@ -16,6 +16,7 @@ export class ControlPanel {
   private events: ControlPanelEvents;
 
   // refs to slider components for programmatic updates
+  private geoSelect!: HTMLSelectElement;
   private popSlider!: Slider;
   private seedInfSlider!: Slider;
   private birthSlider!: Slider;
@@ -24,6 +25,7 @@ export class ControlPanel {
   private lockdownSliders!: { mobility: Slider; transmission: Slider; compliance: Slider };
   private quarantineSliders!: { detection: Slider; range: Slider; protection: Slider; sourceControl: Slider; duration: Slider };
   private strainSliders!: { attackRate: Slider; incubation: Slider; infectious: Slider; ifr: Slider; range: Slider; immunityDays: Slider; mutationRate: Slider };
+  private r0Slider!: Slider;
   private picker!: PresetPicker;
   private switches: Record<string, HTMLInputElement> = {};
 
@@ -62,6 +64,43 @@ export class ControlPanel {
     const vaxHost = host.querySelector('[data-section="vaccine"]') as HTMLElement;
     const lockHost = host.querySelector('[data-section="lockdown"]') as HTMLElement;
     const qHost = host.querySelector('[data-section="quarantine"]') as HTMLElement;
+
+    // Geometry selector
+    const geoWrap = document.createElement('div');
+    geoWrap.className = 'slider-row geo-row';
+    geoWrap.innerHTML = `
+      <label class="slider-label" for="geo-select">
+        Lattice geometry
+        <span class="slider-info" tabindex="0" data-tip="Mean-field: fully mixed, no spatial structure. Triangular: 3-neighbour cells. Square: 4-neighbour Manhattan diamond. Hexagonal: 6-neighbour isotropic tiles." aria-label="More info: Mean-field: fully mixed, no spatial structure. Triangular: 3-neighbour cells. Square: 4-neighbour Manhattan diamond. Hexagonal: 6-neighbour isotropic tiles.">i</span>
+      </label>
+      <select id="geo-select" class="geo-select">
+        <option value="meanfield">⊙ Mean-field</option>
+        <option value="triangular">▲ Triangular</option>
+        <option value="square">■ Square</option>
+        <option value="hexagonal">⬡ Hexagonal</option>
+      </select>
+    `;
+    popHost.appendChild(geoWrap);
+    this.geoSelect = geoWrap.querySelector('select') as HTMLSelectElement;
+    this.geoSelect.value = this.cfg.geometry ?? 'square';
+    this.geoSelect.addEventListener('change', () => {
+      const prev = this.cfg.geometry ?? 'square';
+      const next = this.geoSelect.value as GeometryType;
+      if (prev !== 'meanfield' && next === 'meanfield') {
+        // lattice → mean-field: convert current attackRate to R0 using MF_K
+        const r0 = r0FromAttackRate(this.cfg.strain.attackRate, this.cfg.strain.infectious, MF_K);
+        this.r0Slider.setValue(Math.round(r0 * 10) / 10, true);
+      } else if (prev === 'meanfield' && next !== 'meanfield') {
+        // mean-field → lattice: convert R0 back to attackRate using spatial k
+        const r0 = this.r0Slider.value();
+        const ar = attackRateFromR0(r0, this.cfg.strain.infectious, squareContactCount(this.cfg.strain.range));
+        this.cfg.strain.attackRate = ar;
+        this.strainSliders.attackRate.setValue(Math.round(ar * 100), true);
+      }
+      this.cfg.geometry = next;
+      this.applyGeometryVisibility(next);
+      this.dirty();
+    });
 
     // Population
     this.popSlider = new Slider({
@@ -276,7 +315,17 @@ export class ControlPanel {
         id: 'infectious', label: 'Infectious period', min: 1, max: 60, step: 1, unit: 'days',
         value: s.infectious,
         hint: 'Days the host can transmit.',
-        onChange: (v) => { this.cfg.strain.infectious = v | 0; this.dirty(); },
+        onChange: (v) => {
+          this.cfg.strain.infectious = v | 0;
+          if ((this.cfg.geometry ?? 'square') === 'meanfield') {
+            // Keep R0 fixed; recompute attackRate for the new infectious period
+            const r0 = this.r0Slider.value();
+            const ar = attackRateFromR0(r0, this.cfg.strain.infectious, MF_K);
+            this.cfg.strain.attackRate = ar;
+            this.strainSliders.attackRate.setValue(Math.round(ar * 100), true);
+          }
+          this.dirty();
+        },
       }),
       ifr: new Slider({
         id: 'ifr', label: 'Kill rate (IFR)', min: 0, max: 100, step: 1, unit: '%',
@@ -314,6 +363,27 @@ export class ControlPanel {
       // the current preset and reflect that in the picker label.
       this.strainSliders[k].onValueChange(() => this.recheckCustom());
     }
+
+    // R0 slider — only shown in mean-field mode; replaces attack rate + range sliders.
+    const initR0 = r0FromAttackRate(s.attackRate, s.infectious, geometryK(this.cfg.geometry ?? 'square', s.range));
+    this.r0Slider = new Slider({
+      id: 'r0',
+      label: 'Basic reproduction number (R₀)',
+      min: 0, max: 20, step: 0.1,
+      value: Math.round(initR0 * 10) / 10,
+      hint: 'Expected secondary infections from one case in a fully susceptible population. Automatically translates to a per-contact attack rate for the engine.',
+      format: (v) => v.toFixed(1),
+      onChange: (r0) => {
+        const ar = attackRateFromR0(r0, this.cfg.strain.infectious, MF_K);
+        this.cfg.strain.attackRate = ar;
+        this.strainSliders.attackRate.setValue(Math.round(ar * 100), true);
+        this.dirty();
+      },
+    });
+    // Insert before attackRate so it occupies the same visual slot.
+    strainHost.insertBefore(this.r0Slider.el, this.strainSliders.attackRate.el);
+    // Apply initial visibility based on the starting geometry.
+    this.applyGeometryVisibility(this.cfg.geometry ?? 'square');
 
     // Collapsible toggle for the Disease panel.
     host.querySelectorAll<HTMLButtonElement>('.panel-head[data-toggle]').forEach((btn) => {
@@ -450,11 +520,16 @@ export class ControlPanel {
     this.strainSliders.range.setValue(g.range, true);
     this.strainSliders.immunityDays.setValue(immunityDaysToPos(Math.max(90, g.immunityDays)), true);
     this.strainSliders.mutationRate.setValue(Math.round(g.mutationRate * 100), true);
+    if ((this.cfg.geometry ?? 'square') === 'meanfield') {
+      const r0 = r0FromAttackRate(g.attackRate, g.infectious, MF_K);
+      this.r0Slider.setValue(Math.round(r0 * 10) / 10, true);
+    }
   }
 
   hydrate(cfg: SimConfig, presetId: string): void {
     this.cfg = cfg;
     this.presetId = presetId;
+    this.geoSelect.value = cfg.geometry ?? 'square';
     this.popSlider.setValue(cfg.size, true);
     this.refreshPopBadge(cfg.size);
     this.seedInfSlider.setValue(Math.round(cfg.seedInfections * 100), true);
@@ -500,6 +575,18 @@ export class ControlPanel {
     this.applyStrain(cfg.strain);
     this.picker.setCurrent(presetId);
     this.recheckCustom();
+    this.applyGeometryVisibility(cfg.geometry ?? 'square');
+    if ((cfg.geometry ?? 'square') === 'meanfield') {
+      const r0 = r0FromAttackRate(cfg.strain.attackRate, cfg.strain.infectious, MF_K);
+      this.r0Slider.setValue(Math.round(r0 * 10) / 10, true);
+    }
+  }
+
+  private applyGeometryVisibility(geo: GeometryType): void {
+    const isMF = geo === 'meanfield';
+    this.r0Slider.el.style.display = isMF ? '' : 'none';
+    this.strainSliders.attackRate.el.style.display = isMF ? 'none' : '';
+    this.strainSliders.range.el.style.display = isMF ? 'none' : '';
   }
 
   /** Notify the host App that config changed. App decides whether to rebuild
@@ -557,4 +644,41 @@ function immunityDaysToPos(days: number): number {
   if (days <= IMMUNITY_MIN_DAYS) return 0;
   if (days >= IMMUNITY_MAX_DAYS) return IMMUNITY_POS_RANGE;
   return Math.round(IMMUNITY_POS_RANGE * Math.log(days / IMMUNITY_MIN_DAYS) / IMMUNITY_LOG_RATIO);
+}
+
+// ─── Mean-field R0 ↔ attackRate conversions ──────────────────────────────────
+// k hierarchy: mean-field (2) < triangular (3) < square (4) < hexagonal (6)
+// Mean-field uses k=2 so its R0 sits below triangular for the same attack rate.
+// The engine's stepMeanField uses the same k=2 constant.
+
+const MF_K = 2;
+
+function squareContactCount(range: number): number {
+  const r = Math.max(1, range | 0);
+  let count = 0;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      if (Math.abs(dx) + Math.abs(dy) <= r) count++;
+    }
+  }
+  return count;
+}
+
+function geometryK(geometry: string, range: number): number {
+  return geometry === 'meanfield' ? MF_K : squareContactCount(range);
+}
+
+function r0FromAttackRate(attackRate: number, infectious: number, k: number): number {
+  const ar = Math.max(0, Math.min(1, attackRate));
+  const D = Math.max(1, infectious);
+  return k * (1 - Math.pow(1 - ar, D));
+}
+
+function attackRateFromR0(r0: number, infectious: number, k: number): number {
+  if (k <= 0) return 0;
+  const D = Math.max(1, infectious);
+  const pInfected = Math.min(1, r0 / k);
+  if (pInfected <= 0) return 0;
+  return Math.max(0, 1 - Math.pow(1 - pInfected, 1 / D));
 }

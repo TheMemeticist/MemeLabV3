@@ -283,6 +283,7 @@ export class App {
         seed: 0xC0FFEE,
         // Smallest grid by default (8×8 = 64 cells). User can scale up.
         size: 8,
+        geometry: 'square',
         seedInfections: 0,
         birthRate: 0,
         mutate: false,
@@ -319,7 +320,7 @@ export class App {
 
   private onFrame(msg: FrameMessage): void {
     this.lastFrame = msg;
-    this.petri.paint(msg.state, msg.defenses, msg.quarantined, msg.size);
+    this.petri.paint(msg.state, msg.defenses, msg.quarantined, msg.size, this.controls.config().geometry ?? 'square');
     this.chart.update(msg.longStats);
     this.stats.update(msg.stats, msg.size * msg.size);
     this.stats.setRNaught(msg.rNaught);
@@ -423,6 +424,7 @@ export class App {
     if (!prev) return true;
     if (prev.size !== next.size) return true;
     if (prev.seed !== next.seed) return true;
+    if ((prev.geometry ?? 'square') !== (next.geometry ?? 'square')) return true;
     // Strain genes alter R₀ + neighbor cache + seeding behaviour — full rebuild.
     const a = prev.strain, b = next.strain;
     return a.attackRate !== b.attackRate
@@ -479,6 +481,8 @@ export class App {
     this.chart.setMarkers(this.interventionEvents);
     this.hideEndedBanner();
     this.prevConfig = structuredClone(cfg);
+    // Clear any permalink params so the URL reflects a clean default state.
+    history.replaceState(null, '', location.pathname);
     this.send({ cmd: 'reset', config: cfg });
     // Reset auto-starts the simulation — the user almost always wants to see
     // the new run play out immediately.
@@ -507,7 +511,7 @@ export class App {
     this.refreshThemeLabel();
     this.petri.refreshPalette();
     if (this.lastFrame) {
-      this.petri.paint(this.lastFrame.state, this.lastFrame.defenses, this.lastFrame.quarantined, this.lastFrame.size);
+      this.petri.paint(this.lastFrame.state, this.lastFrame.defenses, this.lastFrame.quarantined, this.lastFrame.size, this.controls.config().geometry ?? 'square');
     }
     this.persist();
   }

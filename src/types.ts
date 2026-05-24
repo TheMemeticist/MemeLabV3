@@ -72,9 +72,12 @@ export interface QuarantineSpec {
   duration: number;
 }
 
+export type GeometryType = 'square' | 'triangular' | 'hexagonal' | 'meanfield';
+
 export interface SimConfig {
   seed: number; // 32-bit unsigned PRNG seed
   size: number; // grid edge length; population = size * size
+  geometry?: GeometryType; // lattice topology; defaults to 'square'
   seedInfections: number; // 0..1 fraction starting as Exposed
   birthRate: number; // 0..1 per-tick respawn chance for dead cells with healthy neighbors
   mutate: boolean;
