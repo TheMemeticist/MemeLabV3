@@ -9,7 +9,13 @@ let playing = false;
 let tps = 30;
 let scheduled = false;
 let lastFrame = 0;
+let lastPost = 0;
 let lastStats: import('../types').SimStats | null = null;
+
+// The sim steps at full `tps` for determinism, but visual frames are only
+// useful up to display refresh. Cap posted frames at ~60/s so high speeds
+// don't flood the UI thread with repaints it can't keep up with.
+const POST_INTERVAL = 1000 / 60;
 
 function ensure(config?: SimConfig): Engine {
   if (engine) return engine;
@@ -67,7 +73,10 @@ function loop(): void {
     lastFrame += interval;
     steps++;
   }
-  if (steps > 0) postFrame();
+  if (steps > 0 && now - lastPost >= POST_INTERVAL) {
+    postFrame();
+    lastPost = now;
+  }
   if (!scheduled) {
     scheduled = true;
     setTimeout(loop, Math.max(4, interval / 4));
@@ -114,6 +123,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
       tps = m.tps;
       playing = true;
       lastFrame = performance.now();
+      lastPost = 0; // post the first frame of this run immediately
       if (!scheduled) {
         scheduled = true;
         setTimeout(loop, 0);
@@ -122,6 +132,9 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
     }
     case 'pause': {
       playing = false;
+      // Flush the exact stopped state — the throttled loop may have skipped
+      // posting the last few steps.
+      if (engine) postFrame();
       break;
     }
     case 'step': {

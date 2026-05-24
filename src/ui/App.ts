@@ -35,6 +35,8 @@ export class App {
   private about = new AboutModal();
   private toastEl!: HTMLElement;
   private lastFrame: FrameMessage | null = null;
+  private renderScheduled = false;
+  private persistTimer = 0;
   private interventionEvents: InterventionEvent[] = [];
   private prevConfig: SimConfig | null = null;
   private epidemicStarted = false;
@@ -319,7 +321,22 @@ export class App {
   }
 
   private onFrame(msg: FrameMessage): void {
+    // Keep only the most recent frame and render it on the next animation
+    // frame. The worker can post faster than we can paint (hex/tri repaints are
+    // expensive); coalescing here drops stale frames so a fast run never floods
+    // the main thread and starves input (pause, dropdowns) of CPU time.
     this.lastFrame = msg;
+    if (!this.renderScheduled) {
+      this.renderScheduled = true;
+      requestAnimationFrame(() => {
+        this.renderScheduled = false;
+        if (this.lastFrame) this.renderFrame(this.lastFrame);
+      });
+    }
+    this.schedulePersist();
+  }
+
+  private renderFrame(msg: FrameMessage): void {
     this.petri.paint(msg.state, msg.defenses, msg.quarantined, msg.size, this.controls.config().geometry ?? 'square');
     this.chart.update(msg.longStats);
     this.stats.update(msg.stats, msg.size * msg.size);
@@ -329,9 +346,17 @@ export class App {
     this.metaSet('strains', `Strains: ${msg.stats.strains}`);
 
     this.checkEpidemicEnded(msg);
+  }
 
-    // Persist last config snapshot.
-    this.persist();
+  // Config/preset/speed/theme are all user-set and don't change during a run,
+  // so the snapshot is identical frame-to-frame. Throttle to avoid a synchronous
+  // JSON.stringify + localStorage write on every frame.
+  private schedulePersist(): void {
+    if (this.persistTimer) return;
+    this.persistTimer = window.setTimeout(() => {
+      this.persistTimer = 0;
+      this.persist();
+    }, 1000);
   }
 
   private checkEpidemicEnded(msg: FrameMessage): void {

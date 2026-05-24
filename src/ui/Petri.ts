@@ -28,7 +28,13 @@ export class Petri {
   private geometry: GeometryType = 'square';
   private mode: 'pixel' | 'sprite' = 'pixel';
   private imageData: ImageData | null = null;
-  private fallbackImg: ImageData | null = null;
+  // Pixel→cell lookup for hex/tri pixel mode: geoLut[pixelIndex] = cell index.
+  // Built once per size/geometry change so per-frame paint is a flat putImageData
+  // whose cost is constant in cell count.
+  private geoLut: Int32Array | null = null;
+  private cellR: Uint8Array | null = null;
+  private cellG: Uint8Array | null = null;
+  private cellB: Uint8Array | null = null;
   private palette: ColorPalette = makeDefaultPalette();
   private atlas: SpriteAtlas | null = null;
   private spriteReady = false;
@@ -96,20 +102,31 @@ export class Petri {
       this.canvas.width = size * tile;
       this.canvas.height = size * tile;
       this.imageData = null;
+      this.geoLut = null;
     } else {
       // Cap hex/tri canvas at 1200px to prevent memory issues at large grid sizes
       // (uncapped: size=512 → 3072px² ≈ 37 MB; size=1024 → 6144px² ≈ 150 MB).
       const canvasPx = geometry === 'square' ? size : Math.max(Math.min(size * 6, 1200), 400);
       this.canvas.width = canvasPx;
       this.canvas.height = canvasPx;
-      this.imageData = geometry === 'square'
-        ? (() => {
-            const img = this.ctx.createImageData(canvasPx, canvasPx);
-            const d = img.data;
-            for (let i = 3; i < d.length; i += 4) d[i] = 255;
-            return img;
-          })()
-        : null;
+      if (geometry === 'square') {
+        this.geoLut = null;
+        const img = this.ctx.createImageData(canvasPx, canvasPx);
+        const d = img.data;
+        for (let i = 3; i < d.length; i += 4) d[i] = 255;
+        this.imageData = img;
+      } else {
+        // Hex/tri: render via a precomputed pixel→cell lookup table. Drawing
+        // tens of thousands of vector polygons per frame is the bottleneck;
+        // a flat putImageData off the LUT is ~50× faster and O(canvas pixels).
+        const img = this.ctx.createImageData(canvasPx, canvasPx);
+        const d = img.data;
+        for (let i = 3; i < d.length; i += 4) d[i] = 255;
+        this.imageData = img;
+        this.geoLut = geometry === 'hexagonal'
+          ? buildHexLut(size, canvasPx, canvasPx)
+          : buildTriLut(size, canvasPx, canvasPx);
+      }
     }
     this.mode = wantMode;
     this.canvas.style.imageRendering = (wantMode === 'pixel' && geometry === 'square') ? 'pixelated' : 'auto';
@@ -126,10 +143,8 @@ export class Petri {
 
     if (this.mode === 'sprite') {
       this.paintSprites(state, defenses, size);
-    } else if (geometry === 'hexagonal') {
-      this.paintHex(state, defenses, size);
-    } else if (geometry === 'triangular') {
-      this.paintTri(state, defenses, size);
+    } else if (geometry === 'hexagonal' || geometry === 'triangular') {
+      this.paintViaLut(state, defenses, size);
     } else {
       this.paintPixels(state, defenses, size);
     }
@@ -164,73 +179,37 @@ export class Petri {
     this.ctx.putImageData(img, 0, 0);
   }
 
-  // ── Hexagonal renderer (pointy-top hexagons, offset-r rows) ─────────────
+  // ── Hex / triangular renderer (precomputed pixel→cell lookup) ────────────
+  // Per frame: map each cell to its color once (O(cells)), then walk the LUT
+  // writing pixel colors and blit once (O(canvas pixels)). No per-cell vector
+  // fills — the whole frame is one putImageData regardless of grid size.
 
-  private paintHex(state: Uint8Array, defenses: Uint8Array, size: number): void {
-    const W = this.canvas.width, H = this.canvas.height;
-    // When cells are < 3px wide the hex shape is invisible; use fast pixel fallback.
-    if (W / size < 3) { this.paintPixelsFallback(state, defenses, size); return; }
-
-    const ctx = this.ctx;
+  private paintViaLut(state: Uint8Array, defenses: Uint8Array, size: number): void {
+    const lut = this.geoLut;
+    const img = this.imageData;
+    if (!lut || !img) return;
     const p = this.palette;
-    const sxr = W / (SQRT3 * (size + 0.5));
-    const syr = 2 * H / (3 * size + 1);
-    const colSpacing = SQRT3 * sxr;
-    const rowSpacing = 1.5 * syr;
-    const offX = colSpacing / 2;
-    const offY = syr;
-    // Inflate hex radii by 0.5 px at large sizes to seal sub-pixel anti-aliasing
-    // gaps — no extra canvas calls needed vs the previous stroke approach.
-    const inf = size > 70 ? 0.5 : 0;
+    const n = size * size;
 
-    ctx.fillStyle = `rgb(${p.bg.r},${p.bg.g},${p.bg.b})`;
-    ctx.fillRect(0, 0, W, H);
-
-    for (let y = -1; y <= size; y++) {
-      const dataY = ((y % size) + size) % size;
-      for (let x = -1; x <= size; x++) {
-        const dataX = ((x % size) + size) % size;
-        const i = dataY * size + dataX;
-        const cx = offX + x * colSpacing + (y & 1) * (colSpacing * 0.5);
-        const cy = offY + y * rowSpacing;
-        const c = this.cellColor(state[i], defenses[i], p);
-        ctx.fillStyle = `rgb(${c.r},${c.g},${c.b})`;
-        hexPath(ctx, cx, cy, sxr + inf, syr + inf);
-        ctx.fill();
-      }
+    if (!this.cellR || this.cellR.length !== n) {
+      this.cellR = new Uint8Array(n);
+      this.cellG = new Uint8Array(n);
+      this.cellB = new Uint8Array(n);
     }
-  }
-
-  // ── Triangular renderer (alternating up/down triangles) ───────────────────
-
-  private paintTri(state: Uint8Array, defenses: Uint8Array, size: number): void {
-    const W = this.canvas.width, H = this.canvas.height;
-    if (W / size < 3) { this.paintPixelsFallback(state, defenses, size); return; }
-
-    const ctx = this.ctx;
-    const p = this.palette;
-    const tileW = W / size;
-    const tileH = tileW * SQRT3 / 2;
-    const gridH = size * tileH;
-    const offY = (H - gridH) / 2;
-    const extraRows = Math.ceil(offY / tileH) + 1;
-    const inf = size > 70 ? 0.5 : 0;
-
-    ctx.fillStyle = `rgb(${p.bg.r},${p.bg.g},${p.bg.b})`;
-    ctx.fillRect(0, 0, W, H);
-
-    for (let y = -extraRows; y < size + extraRows; y++) {
-      const dataY = ((y % size) + size) % size;
-      for (let x = -1; x <= size; x++) {
-        const dataX = ((x % size) + size) % size;
-        const i = dataY * size + dataX;
-        const isUp = (x + y) % 2 === 0;
-        const c = this.cellColor(state[i], defenses[i], p);
-        ctx.fillStyle = `rgb(${c.r},${c.g},${c.b})`;
-        triPath(ctx, x * tileW, offY + y * tileH, tileW, tileH, isUp, inf);
-        ctx.fill();
-      }
+    const cr = this.cellR, cg = this.cellG!, cb = this.cellB!;
+    for (let i = 0; i < n; i++) {
+      const c = this.cellColor(state[i], defenses[i], p);
+      cr[i] = c.r; cg[i] = c.g; cb[i] = c.b;
     }
+
+    const d = img.data;
+    const px = lut.length;
+    for (let i = 0; i < px; i++) {
+      const cell = lut[i];
+      const o = i * 4;
+      d[o] = cr[cell]; d[o + 1] = cg[cell]; d[o + 2] = cb[cell];
+    }
+    this.ctx.putImageData(img, 0, 0);
   }
 
   // ── Mean-field renderer (vertical compartment bar, bottom→top) ───────────
@@ -277,37 +256,6 @@ export class Petri {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('Mean-field', W / 2, H / 2);
-  }
-
-  // ── Pixel fallback (very large hex/tri grids where cells < 3 px) ─────────
-
-  private paintPixelsFallback(state: Uint8Array, defenses: Uint8Array, size: number): void {
-    const W = this.canvas.width, H = this.canvas.height;
-    const p = this.palette;
-    if (!this.fallbackImg || this.fallbackImg.width !== W || this.fallbackImg.height !== H) {
-      this.fallbackImg = this.ctx.createImageData(W, H);
-      const d = this.fallbackImg.data;
-      for (let i = 3; i < d.length; i += 4) d[i] = 255;
-    }
-    const d = this.fallbackImg.data;
-    const scaleX = W / size, scaleY = H / size;
-    for (let cy = 0; cy < size; cy++) {
-      const py0 = Math.floor(cy * scaleY);
-      const py1 = Math.min(H, Math.floor((cy + 1) * scaleY));
-      for (let cx = 0; cx < size; cx++) {
-        const i = cy * size + cx;
-        const c = this.cellColor(state[i], defenses[i], p);
-        const px0 = Math.floor(cx * scaleX);
-        const px1 = Math.min(W, Math.floor((cx + 1) * scaleX));
-        for (let py = py0; py < py1; py++) {
-          let o = (py * W + px0) * 4;
-          for (let px = px0; px < px1; px++, o += 4) {
-            d[o] = c.r; d[o + 1] = c.g; d[o + 2] = c.b;
-          }
-        }
-      }
-    }
-    this.ctx.putImageData(this.fallbackImg, 0, 0);
   }
 
   // ── Sprite renderer (small grids) ────────────────────────────────────────
@@ -547,18 +495,102 @@ export class Petri {
 
 const SQRT3 = Math.sqrt(3);
 
+// Unit hexagon vertex offsets (pointy-top), precomputed once so the per-cell
+// paint loop never calls trig.
+const HEX_COS: number[] = [];
+const HEX_SIN: number[] = [];
+for (let a = 0; a < 6; a++) {
+  const angle = Math.PI / 2 + (Math.PI / 3) * a;
+  HEX_COS.push(Math.cos(angle));
+  HEX_SIN.push(Math.sin(angle));
+}
+
 // Pointy-top hexagon with independent horizontal (sxr) and vertical (syr) radii.
 // Using separate radii lets the hex grid fill both canvas dimensions simultaneously
 // rather than being constrained by whichever axis is tighter.
 function hexPath(ctx: CanvasRenderingContext2D, cx: number, cy: number, sxr: number, syr: number): void {
   ctx.beginPath();
   for (let a = 0; a < 6; a++) {
-    const angle = Math.PI / 2 + (Math.PI / 3) * a;
-    const px = cx + sxr * Math.cos(angle);
-    const py = cy - syr * Math.sin(angle);
+    const px = cx + sxr * HEX_COS[a];
+    const py = cy - syr * HEX_SIN[a];
     a === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
   }
   ctx.closePath();
+}
+
+// Builds the hexagonal pixel→cell LUT. A hex lattice's Voronoi cells (nearest
+// center) are exactly its hexagons, so each pixel is assigned to its nearest hex
+// center over a 3×3 candidate window. Distances are scaled by the cell's aspect
+// ratio so the metric is isotropic. One-time cost per size/geometry change.
+function buildHexLut(size: number, W: number, H: number): Int32Array {
+  const sxr = W / (SQRT3 * (size + 0.5));
+  const syr = 2 * H / (3 * size + 1);
+  const colSpacing = SQRT3 * sxr;
+  const rowSpacing = 1.5 * syr;
+  const offX = colSpacing / 2;
+  const offY = syr;
+  const aspect = sxr / syr;
+  const lut = new Int32Array(W * H);
+  for (let py = 0; py < H; py++) {
+    const ry = Math.round((py - offY) / rowSpacing);
+    for (let px = 0; px < W; px++) {
+      let best = 0, bd = Infinity;
+      for (let yy = ry - 1; yy <= ry + 1; yy++) {
+        const cy = offY + yy * rowSpacing;
+        const cx0 = offX + (yy & 1) * (colSpacing * 0.5);
+        const cxIdx = Math.round((px - cx0) / colSpacing);
+        for (let xx = cxIdx - 1; xx <= cxIdx + 1; xx++) {
+          const cx = cx0 + xx * colSpacing;
+          const dx = px - cx;
+          const dy = (py - cy) * aspect;
+          const dd = dx * dx + dy * dy;
+          if (dd < bd) {
+            bd = dd;
+            const wx = ((xx % size) + size) % size;
+            const wy = ((yy % size) + size) % size;
+            best = wy * size + wx;
+          }
+        }
+      }
+      lut[py * W + px] = best;
+    }
+  }
+  return lut;
+}
+
+// Builds the triangular pixel→cell LUT analytically. The renderer draws each
+// cell as a 2-tile-wide triangle (apex up for even (x+y), down for odd), left to
+// right, so where triangles overlap the larger column wins. For a pixel we find
+// the largest column whose triangle covers it. A row spans tileH vertically;
+// rows outside the centered grid wrap toroidally (matches the renderer's bleed).
+// No canvas readback ⇒ no anti-aliasing corruption, crisp at any resolution.
+function buildTriLut(size: number, W: number, H: number): Int32Array {
+  const tileW = W / size;
+  const tileH = tileW * SQRT3 / 2;
+  const offY = (H - size * tileH) / 2;
+  const lut = new Int32Array(W * H);
+  for (let py = 0; py < H; py++) {
+    const yReal = (py - offY) / tileH;
+    const y = Math.floor(yReal);
+    const v = yReal - y; // 0 at row top, 1 at row bottom
+    const dataY = ((y % size) + size) % size;
+    const rowBase = dataY * size;
+    for (let px = 0; px < W; px++) {
+      const u = px / tileW;
+      let bestX = Math.round(u - 0.5);
+      const x0 = Math.floor(u - 0.5) - 1;
+      for (let x = x0; x <= x0 + 3; x++) {
+        const isUp = ((((x + y) % 2) + 2) % 2) === 0;
+        // Up triangle: apex at top, widens downward → half-width = v.
+        // Down triangle: base at top, narrows downward → half-width = 1 - v.
+        const half = isUp ? v : 1 - v;
+        if (Math.abs(u - (x + 0.5)) <= half) bestX = x;
+      }
+      const dataX = ((bestX % size) + size) % size;
+      lut[py * W + px] = rowBase + dataX;
+    }
+  }
+  return lut;
 }
 
 // Triangles are drawn 2× wider than their tile so adjacent same-row cells share

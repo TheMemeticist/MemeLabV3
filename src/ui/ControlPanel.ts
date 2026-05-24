@@ -2,6 +2,7 @@ import type { GeometryType, InterventionKey, SimConfig, StrainGenes } from '../t
 import { Slider } from './Slider';
 import { PresetPicker } from './PresetPicker';
 import { findPreset, type DiseasePreset } from '../sim/presets';
+import { makeGeometry } from '../sim/neighbors';
 
 export interface ControlPanelEvents {
   onConfigChange: (cfg: SimConfig) => void;
@@ -86,14 +87,21 @@ export class ControlPanel {
     this.geoSelect.addEventListener('change', () => {
       const prev = this.cfg.geometry ?? 'square';
       const next = this.geoSelect.value as GeometryType;
+      const D = this.cfg.strain.infectious;
+      const range = this.cfg.strain.range;
+      // Lattices expose the per-contact attack rate; R₀ then emerges from that rate
+      // and the lattice's neighbour count, so switching between lattices keeps the
+      // attack rate fixed and lets R₀ scale naturally. Only the mean-field boundary
+      // needs translation, because mean-field exposes R₀ directly via its own slider.
       if (prev !== 'meanfield' && next === 'meanfield') {
-        // lattice → mean-field: convert current attackRate to R0 using MF_K
-        const r0 = r0FromAttackRate(this.cfg.strain.attackRate, this.cfg.strain.infectious, MF_K);
+        // lattice → mean-field: show the equivalent mean-field R₀ for this attack rate.
+        const r0 = r0FromAttackRate(this.cfg.strain.attackRate, D, MF_K);
         this.r0Slider.setValue(Math.round(r0 * 10) / 10, true);
       } else if (prev === 'meanfield' && next !== 'meanfield') {
-        // mean-field → lattice: convert R0 back to attackRate using spatial k
+        // mean-field → lattice: realise the R₀ the user dialled in on the target
+        // lattice, using that lattice's own neighbour count.
         const r0 = this.r0Slider.value();
-        const ar = attackRateFromR0(r0, this.cfg.strain.infectious, squareContactCount(this.cfg.strain.range));
+        const ar = attackRateFromR0(r0, D, geometryContactCount(next, range));
         this.cfg.strain.attackRate = ar;
         this.strainSliders.attackRate.setValue(Math.round(ar * 100), true);
       }
@@ -365,7 +373,7 @@ export class ControlPanel {
     }
 
     // R0 slider — only shown in mean-field mode; replaces attack rate + range sliders.
-    const initR0 = r0FromAttackRate(s.attackRate, s.infectious, geometryK(this.cfg.geometry ?? 'square', s.range));
+    const initR0 = r0FromAttackRate(s.attackRate, s.infectious, geometryContactCount(this.cfg.geometry ?? 'square', s.range));
     this.r0Slider = new Slider({
       id: 'r0',
       label: 'Basic reproduction number (R₀)',
@@ -653,20 +661,14 @@ function immunityDaysToPos(days: number): number {
 
 const MF_K = 2;
 
-function squareContactCount(range: number): number {
-  const r = Math.max(1, range | 0);
-  let count = 0;
-  for (let dy = -r; dy <= r; dy++) {
-    for (let dx = -r; dx <= r; dx++) {
-      if (dx === 0 && dy === 0) continue;
-      if (Math.abs(dx) + Math.abs(dy) <= r) count++;
-    }
-  }
-  return count;
-}
-
-function geometryK(geometry: string, range: number): number {
-  return geometry === 'meanfield' ? MF_K : squareContactCount(range);
+// Effective per-cell contact count for a geometry at a given range. Mean-field
+// uses the literature-grounded k=2 (spatial clustering halves square's k=4);
+// lattices report their actual neighbor count from the shared geometry tables,
+// so R₀↔attackRate conversions match what the engine actually simulates
+// (range 1: triangular 3, square 4, hexagonal 6).
+function geometryContactCount(geometry: GeometryType, range: number): number {
+  if (geometry === 'meanfield') return MF_K;
+  return makeGeometry(geometry).getOffsets(Math.max(1, range | 0), 0, 0).length / 2;
 }
 
 function r0FromAttackRate(attackRate: number, infectious: number, k: number): number {
