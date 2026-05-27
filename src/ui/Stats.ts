@@ -4,6 +4,9 @@ export class Stats {
   private el: HTMLElement;
   private items: Record<string, HTMLElement> = {};
   private rNaughtVal: HTMLElement;
+  private costTile: HTMLElement | null = null;
+  private lastCostUsd = 0;
+  private costCalmTimer = 0;
   private lastReff: number | null = null;
   private lastTick = 0;
 
@@ -16,6 +19,7 @@ export class Stats {
       <div class="stat" data-key="d"><span class="stat-label">Dead</span><span class="stat-value">0%</span></div>
       <div class="stat" data-key="reff"><span class="stat-label">R<sub>eff</sub></span><span class="stat-value">—</span></div>
       <div class="stat" data-key="r0"><span class="stat-label">R<sub>0</sub></span><span class="stat-value">—</span></div>
+      <div class="stat" data-key="cost"><span class="stat-label">Cost</span><span class="stat-value">—</span></div>
     `;
     this.el = host;
     host.querySelectorAll<HTMLElement>('.stat').forEach((s) => {
@@ -23,10 +27,36 @@ export class Stats {
       this.items[k] = s.querySelector('.stat-value') as HTMLElement;
     });
     this.rNaughtVal = this.items['r0'];
+    this.costTile = this.items['cost'].closest('.stat');
   }
 
   setRNaught(value: number | null): void {
     this.rNaughtVal.textContent = value === null ? '—' : value.toFixed(1);
+  }
+
+  /**
+   * Update the cost readout. `usdValue` (currency-independent) drives the
+   * escalating danger styling: the box reddens, glows, and trembles harder as
+   * the cumulative burden grows, and only animates while it's actively rising.
+   */
+  setCost(text: string, usdValue: number): void {
+    // Frame it as a loss with a leading minus (but not "−$0" at the start).
+    this.items['cost'].textContent = usdValue > 0 ? `−${text}` : text;
+    const tile = this.costTile;
+    if (!tile) return;
+
+    // Intensity from magnitude on a log scale: ~$100k → 0, ~$1T → 1.
+    tile.style.setProperty('--cost-intensity', costIntensity(usdValue).toFixed(3));
+
+    const rising = usdValue > this.lastCostUsd + 1e-6;
+    this.lastCostUsd = usdValue;
+    if (rising) {
+      tile.classList.add('is-rising');
+      // Drop the active animation shortly after the burden stops climbing
+      // (e.g. when the epidemic ends) — the static red glow remains.
+      clearTimeout(this.costCalmTimer);
+      this.costCalmTimer = window.setTimeout(() => tile.classList.remove('is-rising'), 700);
+    }
   }
 
   update(stats: SimStats, n: number): void {
@@ -62,6 +92,16 @@ export class Stats {
   hostElement(): HTMLElement {
     return this.el;
   }
+}
+
+// Maps cumulative burden (USD) to a 0..1 alarm level on a log scale, so the
+// readout escalates across the whole range from a small outbreak to a global one.
+function costIntensity(usd: number): number {
+  if (usd <= 0) return 0;
+  const lo = 5; // log10($100k)
+  const hi = 12; // log10($1T)
+  const t = (Math.log10(usd) - lo) / (hi - lo);
+  return t < 0 ? 0 : t > 1 ? 1 : t;
 }
 
 function pct(v: number, n: number): string {

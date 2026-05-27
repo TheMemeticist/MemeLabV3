@@ -15,6 +15,7 @@ interface ColorPalette {
   bg: ColorTriplet;
   ringMask: ColorTriplet;
   ringVax: ColorTriplet;
+  quarantine: ColorTriplet;
 }
 
 const SPRITE_THRESHOLD = 60;
@@ -82,6 +83,7 @@ export class Petri {
       bg: read('--petri-bg', def.bg),
       ringMask: read('--cell-ring-mask', def.ringMask),
       ringVax: read('--cell-ring-vax', def.ringVax),
+      quarantine: read('--cell-quarantine', def.quarantine),
     };
     this.renderLegend();
   }
@@ -166,23 +168,27 @@ export class Petri {
     }
 
     if (this.mode === 'sprite') {
-      this.paintSprites(state, defenses, size);
+      this.paintSprites(state, defenses, quarantined, size);
+      // Dashed amber borders read well at sprite size for the regular lattices.
+      // Voronoi polygons wrap toroidally (their vertices split across opposite
+      // edges), so stroking them stretches lines across the canvas — Voronoi
+      // marks quarantine with a halo inside paintSprites instead.
+      if (quarantined && geometry !== 'voronoi') this.drawQuarantineBorders(quarantined, size, geometry);
     } else if (geometry === 'hexagonal' || geometry === 'triangular' || geometry === 'voronoi') {
-      this.paintViaLut(state, defenses, size);
+      this.paintViaLut(state, defenses, quarantined, size);
     } else {
-      this.paintPixels(state, defenses, size);
+      this.paintPixels(state, defenses, quarantined, size);
     }
-
-    if (quarantined) this.drawQuarantineBorders(quarantined, size, geometry);
   }
 
   // ── Square pixel renderer ─────────────────────────────────────────────────
 
-  private paintPixels(state: Uint8Array, defenses: Uint8Array, size: number): void {
+  private paintPixels(state: Uint8Array, defenses: Uint8Array, quarantined: Uint8Array | null, size: number): void {
     if (!this.imageData) this.resize(size, 'square');
     const img = this.imageData!;
     const d = img.data;
     const p = this.palette;
+    const q = p.quarantine;
     const n = size * size;
     for (let i = 0; i < n; i++) {
       const f = defenses[i];
@@ -198,7 +204,15 @@ export class Petri {
         default: c = p.bg; break;
       }
       const o = i * 4;
-      d[o] = c.r; d[o + 1] = c.g; d[o + 2] = c.b;
+      // Quarantined cells are tinted toward the quarantine color — robust at any
+      // cell size and free of the toroidal-polygon problems vector borders hit.
+      if (quarantined && quarantined[i]) {
+        d[o] = (c.r * 0.4 + q.r * 0.6) | 0;
+        d[o + 1] = (c.g * 0.4 + q.g * 0.6) | 0;
+        d[o + 2] = (c.b * 0.4 + q.b * 0.6) | 0;
+      } else {
+        d[o] = c.r; d[o + 1] = c.g; d[o + 2] = c.b;
+      }
     }
     this.ctx.putImageData(img, 0, 0);
   }
@@ -208,11 +222,12 @@ export class Petri {
   // writing pixel colors and blit once (O(canvas pixels)). No per-cell vector
   // fills — the whole frame is one putImageData regardless of grid size.
 
-  private paintViaLut(state: Uint8Array, defenses: Uint8Array, size: number): void {
+  private paintViaLut(state: Uint8Array, defenses: Uint8Array, quarantined: Uint8Array | null, size: number): void {
     const lut = this.geoLut;
     const img = this.imageData;
     if (!lut || !img) return;
     const p = this.palette;
+    const q = p.quarantine;
     const n = size * size;
 
     if (!this.cellR || this.cellR.length !== n) {
@@ -223,7 +238,14 @@ export class Petri {
     const cr = this.cellR, cg = this.cellG!, cb = this.cellB!;
     for (let i = 0; i < n; i++) {
       const c = this.cellColor(state[i], defenses[i], p);
-      cr[i] = c.r; cg[i] = c.g; cb[i] = c.b;
+      // Quarantine tint — wrap-safe replacement for vector borders (hex/tri/voronoi).
+      if (quarantined && quarantined[i]) {
+        cr[i] = (c.r * 0.4 + q.r * 0.6) | 0;
+        cg[i] = (c.g * 0.4 + q.g * 0.6) | 0;
+        cb[i] = (c.b * 0.4 + q.b * 0.6) | 0;
+      } else {
+        cr[i] = c.r; cg[i] = c.g; cb[i] = c.b;
+      }
     }
 
     const d = img.data;
@@ -284,7 +306,7 @@ export class Petri {
 
   // ── Sprite renderer (small grids) ────────────────────────────────────────
 
-  private paintSprites(state: Uint8Array, defenses: Uint8Array, size: number): void {
+  private paintSprites(state: Uint8Array, defenses: Uint8Array, quarantined: Uint8Array | null, size: number): void {
     const ctx = this.ctx;
     const W = this.canvas.width, H = this.canvas.height;
     const p = this.palette;
@@ -372,11 +394,21 @@ export class Petri {
     if (this.geometry === 'voronoi' && this.voronoiTopo) {
       const topo = this.voronoiTopo;
       const sprSize = Math.max(16, Math.round(900 / size));
+      const q = p.quarantine;
+      // Quarantine halo at the centroid — wrap-safe, unlike stroking the cell's
+      // toroidal polygon (which stretches across the canvas at the torus seam).
+      const halo = (cx: number, cy: number) => {
+        ctx.fillStyle = `rgba(${q.r},${q.g},${q.b},0.5)`;
+        ctx.beginPath();
+        ctx.arc(cx, cy, sprSize * 0.62, 0, Math.PI * 2);
+        ctx.fill();
+      };
       if (!this.spriteReady || !this.atlas) {
         // Fallback until the atlas loads: colored circles at each centroid.
         const r = sprSize * 0.4;
         for (let i = 0; i < topo.n; i++) {
           const cx = topo.cx[i] * W, cy = topo.cy[i] * H;
+          if (quarantined && quarantined[i]) halo(cx, cy);
           const c = this.cellColor(state[i], defenses[i], p);
           ctx.fillStyle = `rgb(${c.r},${c.g},${c.b})`;
           ctx.beginPath();
@@ -387,6 +419,7 @@ export class Petri {
       }
       for (let i = 0; i < topo.n; i++) {
         const cx = topo.cx[i] * W, cy = topo.cy[i] * H;
+        if (quarantined && quarantined[i]) halo(cx, cy);
         this.atlas.draw(ctx, state[i], defenses[i], cx - sprSize / 2, cy - sprSize / 2, sprSize, sprSize);
       }
       return;
@@ -453,20 +486,6 @@ export class Petri {
           } else if (geometry === 'triangular') {
             const isUp = (x + y) % 2 === 0;
             triPath(ctx, x * triTileW, triOffY + y * triTileH, triTileW, triTileH, isUp);
-          } else if (geometry === 'voronoi' && this.voronoiTopo) {
-            const topo = this.voronoiTopo;
-            const ci = y * size + x;
-            if (!topo.polyOffsets || !topo.polyVerts) continue;
-            const vStart = topo.polyOffsets[ci];
-            const vEnd = topo.polyOffsets[ci + 1];
-            if (vEnd <= vStart) continue;
-            ctx.beginPath();
-            for (let v = vStart; v < vEnd; v++) {
-              const vx = topo.polyVerts[v * 2] * W;
-              const vy = topo.polyVerts[v * 2 + 1] * H;
-              v === vStart ? ctx.moveTo(vx, vy) : ctx.lineTo(vx, vy);
-            }
-            ctx.closePath();
           } else {
             ctx.rect(x * tile + 0.5, y * tile + 0.5, tile - 1, tile - 1);
           }
@@ -529,6 +548,7 @@ export class Petri {
       swatch('--cell-i', 'Infectious'),
       swatch('--cell-r', 'Recovered'),
       swatch('--cell-d', 'Dead'),
+      swatch('--cell-quarantine', 'Quarantined'),
     ].join('');
   }
 
@@ -745,6 +765,7 @@ function makeDefaultPalette(): ColorPalette {
     bg: { r: 246, g: 239, b: 225 },
     ringMask: { r: 38, g: 169, b: 198 },
     ringVax: { r: 156, g: 89, b: 209 },
+    quarantine: { r: 196, g: 126, b: 18 },
   };
 }
 

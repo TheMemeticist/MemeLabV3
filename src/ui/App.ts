@@ -1,14 +1,16 @@
-import type { FrameMessage, InterventionEvent, InterventionKey, SimConfig, TopologyMessage, WorkerCommand } from '../types';
-import { findPreset, DEFAULT_PRESET_ID } from '../sim/presets';
+import type { CostConfig, FrameMessage, InterventionEvent, InterventionKey, SimConfig, TopologyMessage, WorkerCommand } from '../types';
+import { findPreset, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
 import { Petri } from './Petri';
-import { Chart, type ChartView } from './Chart';
+import { Chart, type ChartView, type CostChartData } from './Chart';
 import { Stats } from './Stats';
 import { ControlPanel } from './ControlPanel';
 import { Onboarding } from './Onboarding';
 import { AboutModal } from './AboutModal';
+import { CostModal } from './CostModal';
 import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
-import { encode as encodeUrl, decode as decodeUrl, applyEncoded } from '../lib/url-state';
+import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
+import { computeLedger, costConfigFromProfile, findCurrency, formatMoney } from '../lib/cost';
 import { downloadText, downloadDataUrl, timestamp } from '../lib/export';
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
@@ -33,6 +35,8 @@ export class App {
   private exportBtn!: HTMLButtonElement;
   private aboutBtn!: HTMLButtonElement;
   private about = new AboutModal();
+  private costModal!: CostModal;
+  private costConfig!: CostConfig;
   private toastEl!: HTMLElement;
   private lastFrame: FrameMessage | null = null;
   private renderScheduled = false;
@@ -56,7 +60,7 @@ export class App {
     // Hydrate config: URL > localStorage > default
     const defaults = this.defaultConfig();
     const fromUrl = location.hash ? decodeUrl(location.hash) : null;
-    const fromLs = read<{ config: SimConfig; presetId: string; speed: number; theme: 'petri' | 'lab'; customName?: string | null } | null>('lastConfig', null);
+    const fromLs = read<{ config: SimConfig; presetId: string; speed: number; theme: 'petri' | 'lab'; customName?: string | null; costConfig?: CostConfig } | null>('lastConfig', null);
 
     let initialConfig = defaults.config;
     let initialPresetId = defaults.presetId;
@@ -76,6 +80,17 @@ export class App {
       if (fromLs.theme === 'lab' || fromLs.theme === 'petri') this.theme = fromLs.theme;
       initialCustomName = fromLs.customName ?? null;
     }
+
+    // Cost config: URL > localStorage > the active preset's bundled profile.
+    const presetCost = costConfigFromProfile(findPreset(initialPresetId).cost);
+    if (fromUrl) {
+      this.costConfig = decodeCostConfig(fromUrl, presetCost);
+    } else if (fromLs?.costConfig) {
+      this.costConfig = fromLs.costConfig;
+    } else {
+      this.costConfig = presetCost;
+    }
+    this.costModal.setConfig(this.costConfig);
 
     this.applyTheme();
     this.controls.hydrate(initialConfig, initialPresetId);
@@ -184,6 +199,9 @@ export class App {
           <button class="btn ghost" data-act="about" data-tip="What is this? Model overview, history, backing research.">
             <span class="btn-icon">?</span>What is this?
           </button>
+          <button class="btn ghost" data-act="cost" data-tip="Edit the economic cost model — region, currency, severity, unit costs, hospital capacity.">
+            <span class="btn-icon">💲</span>Cost model
+          </button>
           <button class="btn" data-act="permalink" data-tip="Copy permalink — encodes the full state in the URL so anyone can replay this exact run.">
             <span class="btn-icon">🔗</span>Permalink
           </button>
@@ -219,6 +237,7 @@ export class App {
             <div class="chart-tabs" role="tablist" aria-label="Chart view">
               <button class="chart-tab" role="tab" data-view="compartments" aria-selected="true">Compartments</button>
               <button class="chart-tab" role="tab" data-view="reff" aria-selected="false">R<sub>eff</sub></button>
+              <button class="chart-tab" role="tab" data-view="costs" aria-selected="false">Costs</button>
             </div>
             <div class="chart-area" data-section="chart"></div>
           </div>
@@ -256,7 +275,7 @@ export class App {
 
     this.controls = new ControlPanel(this.defaultConfig().config, DEFAULT_PRESET_ID, {
       onConfigChange: () => this.onConfigChange(),
-      onPresetChange: () => this.onConfigChange(),
+      onPresetChange: (p) => { this.loadPresetCost(p); this.onConfigChange(); },
       onCustomNameChange: () => this.persist(),
       onInterventionToggle: (key, on) => this.recordInterventionToggle(key, on),
     });
@@ -282,6 +301,17 @@ export class App {
     this.exportBtn.addEventListener('click', () => this.exportRun());
     this.themeBtn.addEventListener('click', () => this.toggleTheme());
     this.aboutBtn.addEventListener('click', () => this.about.open());
+
+    // Cost model — seeded from the default preset; start() overrides after hydration.
+    this.costConfig = costConfigFromProfile(findPreset(DEFAULT_PRESET_ID).cost);
+    this.costModal = new CostModal(this.costConfig, { onChange: () => this.onCostChange() });
+    (this.root.querySelector('[data-act="cost"]') as HTMLButtonElement)
+      .addEventListener('click', () => {
+        this.costModal.open();
+        // Populate the modal's live burden readout immediately — the sim may be
+        // paused/ended, so we can't rely on the next frame to push it.
+        if (this.lastFrame) this.updateCost(this.lastFrame);
+      });
     (this.root.querySelector('[data-act="reset-defaults"]') as HTMLButtonElement)
       .addEventListener('click', () => { localStorage.clear(); location.reload(); });
 
@@ -349,6 +379,7 @@ export class App {
 
   private renderFrame(msg: FrameMessage): void {
     this.petri.paint(msg.state, msg.defenses, msg.quarantined, msg.size, this.controls.config().geometry ?? 'square');
+    this.updateCost(msg);
     this.chart.update(msg.longStats);
     this.stats.update(msg.stats, msg.size * msg.size);
     this.stats.setRNaught(msg.rNaught);
@@ -357,6 +388,46 @@ export class App {
     this.metaSet('strains', `Strains: ${msg.stats.strains}`);
 
     this.checkEpidemicEnded(msg);
+  }
+
+  // Cost is a pure derived layer: re-price the whole run from recorded counts ×
+  // the current profile, then push to the tile, the chart, and the open modal.
+  private updateCost(msg: FrameMessage): void {
+    const n = msg.size * msg.size;
+    const { ledger, series } = computeLedger(msg.longStats, this.costConfig.profile, n, msg.retiredCost);
+    const cur = findCurrency(this.costConfig.currencyCode);
+    const rate = this.costConfig.currencyRate;
+    // Pass the USD total (currency-independent) so the danger animation scales
+    // by real magnitude, not by the display currency's exchange rate.
+    this.stats.setCost(formatMoney(ledger.grandTotal, cur, rate), ledger.grandTotal);
+    const data: CostChartData = {
+      tick: series.tick,
+      columns: [
+        series.medical.map((v) => v * rate),
+        series.deaths.map((v) => v * rate),
+        series.quarantine.map((v) => v * rate),
+        series.mask.map((v) => v * rate),
+        series.vaccine.map((v) => v * rate),
+        series.lockdown.map((v) => v * rate),
+        series.surge.map((v) => v * rate),
+        series.total.map((v) => v * rate),
+      ],
+    };
+    this.chart.setCostData(data);
+    if (this.costModal.isOpen()) this.costModal.setLedger(ledger);
+  }
+
+  // A cost-param edit changes nothing in the sim — just re-price the last frame
+  // immediately (retroactive across the whole history) and persist.
+  private onCostChange(): void {
+    if (this.lastFrame) this.updateCost(this.lastFrame);
+    this.persist();
+  }
+
+  private loadPresetCost(preset: DiseasePreset): void {
+    this.costConfig = costConfigFromProfile(preset.cost);
+    this.costModal.setConfig(this.costConfig);
+    if (this.lastFrame) this.updateCost(this.lastFrame);
   }
 
   // Config/preset/speed/theme are all user-set and don't change during a run,
@@ -623,6 +694,9 @@ export class App {
     if (!decoded) return;
     const applied = applyEncoded(decoded, this.controls.config());
     this.controls.hydrate(applied.config, applied.presetId ?? this.controls.currentPresetId());
+    const presetCost = costConfigFromProfile(findPreset(applied.presetId ?? this.controls.currentPresetId()).cost);
+    this.costConfig = decodeCostConfig(decoded, presetCost);
+    this.costModal.setConfig(this.costConfig);
     const nameParam = decoded.get('name');
     this.controls.setCustomName(nameParam ? decodeURIComponent(nameParam) : null);
     if (applied.theme === 'lab' || applied.theme === 'petri') {
@@ -650,6 +724,7 @@ export class App {
       speed: this.speedIdx,
       presetId: this.controls.currentPresetId(),
       customName: this.controls.getCustomName(),
+      costConfig: this.costConfig,
     });
     navigator.clipboard.writeText(url).then(
       () => this.toast('Permalink copied. State encoded in URL.'),
@@ -698,6 +773,7 @@ export class App {
       speed: this.speedIdx,
       theme: this.theme,
       customName: this.controls.getCustomName(),
+      costConfig: this.costConfig,
     });
   }
 }

@@ -126,6 +126,8 @@ export interface SimStats {
   r: number;
   d: number;
   newInfections: number;
+  /** New I→D deaths this tick (not net of births). Drives the cost layer. */
+  newDeaths: number;
   reff: number;
   strains: number;
 }
@@ -147,6 +149,8 @@ export interface FrameMessage {
   size: number;
   stats: SimStats;
   longStats: LongStats;
+  /** Cost-count sums for ticks aged out of the LongStats window (cumulative). */
+  retiredCost: RetiredCostTotals;
   rNaught: number | null;
 }
 
@@ -158,6 +162,113 @@ export interface LongStats {
   r: number[];
   d: number[];
   reff: number[];
+  // Raw per-tick counts consumed by the (UI-thread) cost layer. Cost is a pure
+  // function of these series × the cost profile, so editing unit costs or
+  // currency re-prices the entire history without re-simulating.
+  dnew: number[]; // new I→D deaths this tick
+  masked: number[]; // living cells masking (only while mask intervention enabled)
+  vaccinated: number[]; // living cells vaccinated (only while vaccine enabled)
+  quarantined: number[]; // living cells currently isolated
+  lockdownStringency: number[]; // mobilityReduction × compliance while enabled, else 0
+}
+
+// ─── Economic cost model ──────────────────────────────────────────────────────
+// The cost layer is a pure derived overlay computed on the UI thread from the
+// per-tick counts in LongStats. It never enters the engine, the worker, or the
+// PRNG, so it has zero effect on the simulation or its determinism.
+
+export interface PathogenCostProfile {
+  // Severity — splits infectious cells across care arms.
+  hospitalizationRate: number; // [0..1] fraction of I needing inpatient care
+  icuRate: number; // [0..1] of hospitalized, fraction needing ICU
+  symptomaticFraction: number; // [0..1] fraction of I with noticeable symptoms
+  workCapacityLoss: number; // [0..1] 1 = fully bedridden
+
+  // Economic context.
+  gdpPerCapitaAnnual: number; // USD/year — drives productivity loss
+  laborParticipationRate: number; // [0..1]
+
+  // Medical unit costs (USD/day).
+  medCostMild: number; // outpatient / home care per symptomatic day
+  medCostHospWard: number; // general hospital bed-day
+  medCostICU: number; // ICU bed-day
+
+  // Mortality.
+  vsl: number; // Value of a Statistical Life (one-time per death)
+
+  // Intervention unit costs.
+  maskCostPerDayPerPerson: number;
+  vaccineDosePrice: number;
+  vaccineDosesRequired: number;
+  vaccineDeliveryExtra: number; // USD/dose delivery overhead
+  quarantineDailyCommunity: number; // USD/person/day
+  quarantineDailyHospital: number; // USD/person/day
+  quarantineIsHospital: boolean;
+  lockdownGdpFractionPerUnit: number; // fraction of daily GDP lost per unit stringency
+  immunityDays: number; // amortization window for vaccine dose cost (from strain)
+
+  // Healthcare capacity (cost-side surge overlay — does NOT alter simulated deaths).
+  hospitalBedsPerCapita: number; // [0..1] beds as a fraction of population
+  surgeCostMultiplier: number; // multiplier on care cost for overflow cases
+  surgeMortalityCostPerOverflowCase: number; // modeled excess-mortality $ per overflow case-day
+}
+
+/** Cumulative + daily cost snapshot, all in USD (currency applied at display). */
+export interface CostLedger {
+  dailyMedical: number;
+  dailyDeaths: number;
+  dailyQuarantine: number;
+  dailyMask: number;
+  dailyVaccine: number;
+  dailyLockdown: number;
+  dailySurge: number;
+  dailyTotal: number;
+
+  totalMedical: number;
+  totalDeaths: number;
+  totalQuarantine: number;
+  totalMask: number;
+  totalVaccine: number;
+  totalLockdown: number;
+  totalSurge: number;
+  grandTotal: number;
+}
+
+/**
+ * Running sums of the cost-relevant per-tick counts that have been dropped from
+ * the capped `LongStats` window. Lets the (UI-thread) cost layer price the full
+ * run even past `LONG_CAP` days, without storing unbounded history. All linear
+ * cost categories reprice exactly from these sums on a profile/currency change;
+ * the nonlinear surge term is approximated from the average over retired ticks.
+ */
+export interface RetiredCostTotals {
+  ticks: number;
+  i: number;
+  dnew: number;
+  masked: number;
+  vaccinated: number;
+  quarantined: number;
+  lockdownStringency: number;
+}
+
+export interface RegionPreset {
+  id: string;
+  label: string;
+  gdpPerCapitaAnnual: number;
+  vsl: number;
+}
+
+export interface CurrencySpec {
+  code: string;
+  symbol: string;
+  rateVsUsd: number; // multiply a USD figure by this to display in the currency
+}
+
+export interface CostConfig {
+  profile: PathogenCostProfile;
+  regionId: string;
+  currencyCode: string;
+  currencyRate: number; // editable; defaults to the currency's rateVsUsd
 }
 
 export type WorkerCommand =

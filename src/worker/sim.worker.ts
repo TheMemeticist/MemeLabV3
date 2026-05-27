@@ -40,7 +40,7 @@ function postFrame(): void {
   }
   const stats = lastStats
     ? lastStats
-    : { tick: 0, s: size * size, e: 0, i: 0, r: 0, d: 0, newInfections: 0, reff: 0, strains: 1 };
+    : { tick: 0, s: size * size, e: 0, i: 0, r: 0, d: 0, newInfections: 0, newDeaths: 0, reff: 0, strains: 1 };
 
   const msg: FrameMessage = {
     type: 'frame',
@@ -51,6 +51,7 @@ function postFrame(): void {
     size,
     stats,
     longStats: cloneLong(engine.longStats),
+    retiredCost: { ...engine.retiredCost },
     rNaught: engine.rNaught,
   };
   const transfer: Transferable[] = [stateCopy.buffer, defCopy.buffer];

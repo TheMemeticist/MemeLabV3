@@ -9,7 +9,8 @@
 //        &vaxRate=0.12&vaxProt=0.80&vaxSrc=0&vaxMort=0.80
 //        &theme=petri&speed=2&preset=sars2-delta&mutate=0
 
-import type { GeometryType, VoronoiMode, SimConfig } from '../types';
+import type { CostConfig, GeometryType, VoronoiMode, SimConfig } from '../types';
+import { findCurrency } from './cost';
 
 const VALID_GEOMETRIES = new Set<string>(['square', 'triangular', 'hexagonal', 'meanfield', 'voronoi']);
 const VALID_VORONOI_MODES = new Set<string>(['uniform', 'jittered', 'relaxed', 'settlements']);
@@ -20,6 +21,7 @@ export interface PermalinkOptions {
   speed: number;
   presetId: string;
   customName?: string | null;
+  costConfig?: CostConfig;
 }
 
 export function encode(opts: PermalinkOptions): string {
@@ -78,7 +80,74 @@ export function encode(opts: PermalinkOptions): string {
   params.set('theme', opts.theme);
   params.set('speed', String(opts.speed));
   if (opts.customName) params.set('name', opts.customName);
+  // Cost model — readable, inline-editable like the rest of the permalink.
+  if (opts.costConfig) {
+    const cc = opts.costConfig;
+    const p2 = cc.profile;
+    params.set('cRegion', cc.regionId);
+    params.set('cCur', cc.currencyCode);
+    params.set('cRate', round3(cc.currencyRate).toString());
+    params.set('cHosp', round3(p2.hospitalizationRate).toString());
+    params.set('cIcu', round3(p2.icuRate).toString());
+    params.set('cSymp', round3(p2.symptomaticFraction).toString());
+    params.set('cWork', round3(p2.workCapacityLoss).toString());
+    params.set('cGdp', String(Math.round(p2.gdpPerCapitaAnnual)));
+    params.set('cLabor', round3(p2.laborParticipationRate).toString());
+    params.set('cMild', String(Math.round(p2.medCostMild)));
+    params.set('cWard', String(Math.round(p2.medCostHospWard)));
+    params.set('cIcuC', String(Math.round(p2.medCostICU)));
+    params.set('cVsl', String(Math.round(p2.vsl)));
+    params.set('cMask', round3(p2.maskCostPerDayPerPerson).toString());
+    params.set('cVaxP', String(Math.round(p2.vaccineDosePrice)));
+    params.set('cVaxN', String(Math.round(p2.vaccineDosesRequired)));
+    params.set('cVaxD', String(Math.round(p2.vaccineDeliveryExtra)));
+    params.set('cQc', String(Math.round(p2.quarantineDailyCommunity)));
+    params.set('cQh', String(Math.round(p2.quarantineDailyHospital)));
+    params.set('cQhosp', p2.quarantineIsHospital ? '1' : '0');
+    params.set('cLock', round3(p2.lockdownGdpFractionPerUnit).toString());
+    params.set('cImm', String(Math.round(p2.immunityDays)));
+    // Beds-per-capita can be ~1e-3; round3 would collapse 0.0008 → 0.001, so keep full precision.
+    params.set('cBeds', String(p2.hospitalBedsPerCapita));
+    params.set('cSurgeM', round3(p2.surgeCostMultiplier).toString());
+    params.set('cSurgeD', String(Math.round(p2.surgeMortalityCostPerOverflowCase)));
+  }
   return '#/sim?' + params.toString();
+}
+
+/** Decode cost params, falling back to `base` (typically the active preset's
+ *  cost) so permalinks without cost params still load a sensible profile. */
+export function decodeCostConfig(p: URLSearchParams, base: CostConfig): CostConfig {
+  const b = base.profile;
+  const currencyCode = p.get('cCur') ?? base.currencyCode;
+  return {
+    regionId: p.get('cRegion') ?? base.regionId,
+    currencyCode,
+    currencyRate: num(p, 'cRate', p.has('cCur') ? findCurrency(currencyCode).rateVsUsd : base.currencyRate),
+    profile: {
+      hospitalizationRate: clamp01(num(p, 'cHosp', b.hospitalizationRate)),
+      icuRate: clamp01(num(p, 'cIcu', b.icuRate)),
+      symptomaticFraction: clamp01(num(p, 'cSymp', b.symptomaticFraction)),
+      workCapacityLoss: clamp01(num(p, 'cWork', b.workCapacityLoss)),
+      gdpPerCapitaAnnual: Math.max(0, num(p, 'cGdp', b.gdpPerCapitaAnnual)),
+      laborParticipationRate: clamp01(num(p, 'cLabor', b.laborParticipationRate)),
+      medCostMild: Math.max(0, num(p, 'cMild', b.medCostMild)),
+      medCostHospWard: Math.max(0, num(p, 'cWard', b.medCostHospWard)),
+      medCostICU: Math.max(0, num(p, 'cIcuC', b.medCostICU)),
+      vsl: Math.max(0, num(p, 'cVsl', b.vsl)),
+      maskCostPerDayPerPerson: Math.max(0, num(p, 'cMask', b.maskCostPerDayPerPerson)),
+      vaccineDosePrice: Math.max(0, num(p, 'cVaxP', b.vaccineDosePrice)),
+      vaccineDosesRequired: Math.max(0, int(p, 'cVaxN', b.vaccineDosesRequired)),
+      vaccineDeliveryExtra: Math.max(0, num(p, 'cVaxD', b.vaccineDeliveryExtra)),
+      quarantineDailyCommunity: Math.max(0, num(p, 'cQc', b.quarantineDailyCommunity)),
+      quarantineDailyHospital: Math.max(0, num(p, 'cQh', b.quarantineDailyHospital)),
+      quarantineIsHospital: bool(p, 'cQhosp', b.quarantineIsHospital),
+      lockdownGdpFractionPerUnit: Math.max(0, num(p, 'cLock', b.lockdownGdpFractionPerUnit)),
+      immunityDays: Math.max(1, int(p, 'cImm', b.immunityDays)),
+      hospitalBedsPerCapita: Math.max(0, num(p, 'cBeds', b.hospitalBedsPerCapita)),
+      surgeCostMultiplier: Math.max(1, num(p, 'cSurgeM', b.surgeCostMultiplier)),
+      surgeMortalityCostPerOverflowCase: Math.max(0, num(p, 'cSurgeD', b.surgeMortalityCostPerOverflowCase)),
+    },
+  };
 }
 
 export function decode(hash: string): URLSearchParams | null {

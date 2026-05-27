@@ -16,7 +16,26 @@ const MARKER_LABELS: Record<string, string> = {
   quarantine: 'Quarantine',
 };
 
-export type ChartView = 'compartments' | 'reff';
+export type ChartView = 'compartments' | 'reff' | 'costs';
+
+// Cumulative cost categories (USD, currency-converted by the caller). Order
+// matches the data columns built in setCostSeries.
+const COST_LABELS = ['Medical', 'Deaths', 'Quarantine', 'Mask', 'Vaccine', 'Lockdown', 'Surge', 'Total'];
+const COST_COLORS = [
+  'rgb(249, 115, 22)', // medical — orange
+  'rgb(239, 68, 68)', // deaths — red
+  'rgb(225, 178, 25)', // quarantine — amber
+  'rgb(34, 197, 94)', // mask — green
+  'rgb(59, 130, 246)', // vaccine — blue
+  'rgb(148, 163, 184)', // lockdown — slate
+  'rgb(168, 85, 247)', // surge — purple
+];
+
+export interface CostChartData {
+  tick: number[];
+  // Column-aligned with COST_LABELS (Total last).
+  columns: number[][];
+}
 
 export class Chart {
   private host: HTMLElement;
@@ -31,6 +50,7 @@ export class Chart {
   private leaveHandler: (() => void) | null = null;
   private view: ChartView = 'compartments';
   private lastLong: LongStats | null = null;
+  private costData: CostChartData | null = null;
 
   constructor(host: HTMLElement) {
     this.host = host;
@@ -78,6 +98,17 @@ export class Chart {
     return this.view;
   }
 
+  // App computes the (currency-converted) cumulative cost series and hands it in.
+  // When the cost view is active, the next update() repaints from this data.
+  setCostData(data: CostChartData): void {
+    this.costData = data;
+    // Repaint live only if the cost view is already mounted; otherwise the next
+    // update()/setView() builds it. buildData ignores `long` in the cost view.
+    if (this.view === 'costs' && this.plot && this.lastLong && data.tick.length > 0) {
+      this.plot.setData(this.buildData(this.lastLong));
+    }
+  }
+
   private relayout(): void {
     if (!this.plot) return;
     const w = this.host.clientWidth;
@@ -98,7 +129,10 @@ export class Chart {
 
   update(long: LongStats): void {
     this.lastLong = long;
-    if (long.tick.length === 0) {
+    const empty = this.view === 'costs'
+      ? !this.costData || this.costData.tick.length === 0
+      : long.tick.length === 0;
+    if (empty) {
       // Tear down any existing plot before wiping the DOM, otherwise the next
       // non-empty update would call setData() on a detached uPlot instance.
       if (this.plot) {
@@ -123,10 +157,25 @@ export class Chart {
       this.host.innerHTML = '';
       const css = getComputedStyle(document.documentElement);
       const accent = (k: string) => css.getPropertyValue(k).trim() || '#888';
-      const series = this.view === 'reff'
+      const series: uPlot.Series[] = this.view === 'reff'
         ? [
             { label: 'Day' },
             { label: 'R_eff', stroke: rgbCss('--accent') || '#3b82f6', width: 1.8 },
+          ]
+        : this.view === 'costs'
+        ? [
+            { label: 'Day' },
+            // Total is emphasized; the big drivers (Medical, Deaths) show by
+            // default, the rest are toggleable via the legend to avoid clutter.
+            ...COST_LABELS.map((label, k) => {
+              const isTotal = k === COST_LABELS.length - 1;
+              return {
+                label,
+                stroke: isTotal ? (rgbCss('--accent') || '#888') : COST_COLORS[k],
+                width: isTotal ? 2.2 : 1.4,
+                show: isTotal || label === 'Medical' || label === 'Deaths',
+              } as uPlot.Series;
+            }),
           ]
         : [
             { label: 'Day' },
@@ -188,6 +237,13 @@ export class Chart {
   }
 
   private buildData(long: LongStats): uPlot.AlignedData {
+    if (this.view === 'costs') {
+      const c = this.costData ?? { tick: [], columns: [] };
+      return [
+        Float64Array.from(c.tick),
+        ...c.columns.map((col) => Float64Array.from(col)),
+      ] as uPlot.AlignedData;
+    }
     if (this.view === 'reff') {
       return [
         Float64Array.from(long.tick),

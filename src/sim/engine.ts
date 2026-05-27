@@ -1,5 +1,5 @@
 import { CellState } from '../types';
-import type { LongStats, SimConfig, SimStats, VoronoiTopology } from '../types';
+import type { LongStats, RetiredCostTotals, SimConfig, SimStats, VoronoiTopology } from '../types';
 import { Rng } from './rng';
 import { StrainPool } from './strain';
 import { allocate, seed, type PopulationBuffers } from './population';
@@ -29,6 +29,7 @@ export class Engine {
   private newInfectionsHistory: number[] = [];
   private newInfectiousHistory: number[] = [];
   longStats: LongStats = emptyLong();
+  retiredCost: RetiredCostTotals = emptyRetired();
   rNaught: number | null = null;
 
   constructor(config: SimConfig, prebuiltTopo?: VoronoiTopology | null) {
@@ -69,6 +70,7 @@ export class Engine {
     this.newInfectionsHistory = [];
     this.newInfectiousHistory = [];
     this.longStats = emptyLong();
+    this.retiredCost = emptyRetired();
     this.rNaught = this.estimateR0(config);
   }
 
@@ -167,6 +169,7 @@ export class Engine {
 
     let newInfections = 0;
     let newInfectious = 0;
+    let newDeaths = 0;
 
     // Mean-field transmission: each susceptible is attacked by the aggregate
     // infectious pool. Effective contact count k mirrors the square range-1
@@ -250,6 +253,7 @@ export class Engine {
           const ifr = strain.ifr * mortalityMultiplier(D, defenses[i]);
           if (rng.bernoulli(ifr)) {
             next[i] = CellState.Dead;
+            newDeaths++;
           } else {
             next[i] = CellState.Recovered;
             infectedAge[i] = 0;
@@ -269,7 +273,7 @@ export class Engine {
     pop.next = state;
     this.tick++;
 
-    return this.computeStats(newInfections, newInfectious);
+    return this.computeStats(newInfections, newInfectious, newDeaths);
   }
 
   private stepSpatial(): SimStats {
@@ -296,6 +300,7 @@ export class Engine {
 
     let newInfections = 0;
     let newInfectious = 0;
+    let newDeaths = 0;
 
     // 2) Transmission pass.
     for (let i = 0; i < n; i++) {
@@ -424,6 +429,7 @@ export class Engine {
           const ifr = strain.ifr * mortalityMultiplier(D, defenses[i]);
           if (rng.bernoulli(ifr)) {
             next[i] = CellState.Dead;
+            newDeaths++;
           } else {
             next[i] = CellState.Recovered;
             infectedAge[i] = 0;
@@ -475,23 +481,41 @@ export class Engine {
       }
     }
 
-    return this.computeStats(newInfections, newInfectious);
+    return this.computeStats(newInfections, newInfectious, newDeaths);
   }
 
-  private computeStats(newInfections: number, newInfectious: number): SimStats {
+  private computeStats(newInfections: number, newInfectious: number, newDeaths: number): SimStats {
     const pop = this.pop;
     const { n } = pop;
     const cur = pop.state;
+    const defenses = pop.defenses;
+    const quarantined = pop.quarantined;
     let s = 0, e = 0, inf = 0, r = 0, d = 0;
+    // Cost-layer counts: defenses/quarantine among living cells only (the dead
+    // don't wear masks or occupy isolation beds). Mask/vaccine flags persist in
+    // the buffer when their intervention is toggled off, so gate by enabled —
+    // a disabled defense incurs no cost even though the per-cell flag remains.
+    const maskEnabled = this.config.defenses[0]?.enabled === true;
+    const vaxEnabled = this.config.defenses[1]?.enabled === true;
+    let masked = 0, vaccinated = 0, quar = 0;
     for (let i = 0; i < n; i++) {
-      switch (cur[i]) {
+      const cell = cur[i];
+      switch (cell) {
         case CellState.Susceptible: s++; break;
         case CellState.Exposed: e++; break;
         case CellState.Infectious: inf++; break;
         case CellState.Recovered: r++; break;
         case CellState.Dead: d++; break;
       }
+      if (cell !== CellState.Dead) {
+        const def = defenses[i];
+        if (maskEnabled && (def & 1)) masked++;
+        if (vaxEnabled && (def & 2)) vaccinated++;
+        if (quarantined[i]) quar++;
+      }
     }
+    const ld = this.config.lockdown;
+    const lockdownStringency = ld.enabled === true ? ld.mobilityReduction * ld.compliance : 0;
 
     this.newInfectionsHistory.push(newInfections);
     this.newInfectiousHistory.push(newInfectious);
@@ -503,11 +527,12 @@ export class Engine {
       tick: this.tick,
       s, e, i: inf, r, d,
       newInfections,
+      newDeaths,
       reff,
       strains: this.strains.count(),
     };
 
-    pushLong(this.longStats, stats);
+    pushLong(this.longStats, stats, { masked, vaccinated, quarantined: quar, lockdownStringency }, this.retiredCost);
     return stats;
   }
 
@@ -607,10 +632,24 @@ function neighborAliveFraction(state: Uint8Array, i: number, size: number, geo: 
 }
 
 function emptyLong(): LongStats {
-  return { tick: [], s: [], e: [], i: [], r: [], d: [], reff: [] };
+  return {
+    tick: [], s: [], e: [], i: [], r: [], d: [], reff: [],
+    dnew: [], masked: [], vaccinated: [], quarantined: [], lockdownStringency: [],
+  };
 }
 
-function pushLong(long: LongStats, stats: SimStats): void {
+interface CostCounts {
+  masked: number;
+  vaccinated: number;
+  quarantined: number;
+  lockdownStringency: number;
+}
+
+function emptyRetired(): RetiredCostTotals {
+  return { ticks: 0, i: 0, dnew: 0, masked: 0, vaccinated: 0, quarantined: 0, lockdownStringency: 0 };
+}
+
+function pushLong(long: LongStats, stats: SimStats, costs: CostCounts, retired: RetiredCostTotals): void {
   long.tick.push(stats.tick);
   long.s.push(stats.s);
   long.e.push(stats.e);
@@ -618,8 +657,25 @@ function pushLong(long: LongStats, stats: SimStats): void {
   long.r.push(stats.r);
   long.d.push(stats.d);
   long.reff.push(stats.reff);
+  long.dnew.push(stats.newDeaths);
+  long.masked.push(costs.masked);
+  long.vaccinated.push(costs.vaccinated);
+  long.quarantined.push(costs.quarantined);
+  long.lockdownStringency.push(costs.lockdownStringency);
   if (long.tick.length > LONG_CAP) {
+    // The oldest tick is aging out of the window. Fold its cost-relevant counts
+    // into the retired aggregate first, so the cost layer keeps a true cumulative
+    // total (cost is monotonic) even though the chart/window slides forward.
+    retired.ticks++;
+    retired.i += long.i[0];
+    retired.dnew += long.dnew[0];
+    retired.masked += long.masked[0];
+    retired.vaccinated += long.vaccinated[0];
+    retired.quarantined += long.quarantined[0];
+    retired.lockdownStringency += long.lockdownStringency[0];
     long.tick.shift(); long.s.shift(); long.e.shift();
     long.i.shift(); long.r.shift(); long.d.shift(); long.reff.shift();
+    long.dnew.shift(); long.masked.shift(); long.vaccinated.shift();
+    long.quarantined.shift(); long.lockdownStringency.shift();
   }
 }

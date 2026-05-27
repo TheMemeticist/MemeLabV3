@@ -44,6 +44,9 @@
   --chart-dead: rgb(40, 35, 30);  /* dead series line — dark on light bg */
   --cell-ring-mask: 38 169 198;
   --cell-ring-vax: 156 89 209;
+  --cell-quarantine: 196 126 18;  /* quarantined — burnt amber tint */
+  --cost-warn: rgb(202, 110, 12);   /* cost meter — low burden (amber) */
+  --cost-danger: rgb(192, 28, 22);  /* cost meter — high burden (deep red) */
   --grid-color: rgba(60, 38, 8, 0.10);
 
   /* Toolbar */
@@ -95,6 +98,9 @@
   --chart-dead: rgb(175, 180, 192); /* dead series line — light gray on dark bg */
   --cell-ring-mask: 92 222 236;
   --cell-ring-vax: 195 145 255;
+  --cell-quarantine: 240 165 45;  /* quarantined — bright amber tint */
+  --cost-warn: rgb(245, 165, 55);   /* cost meter — low burden (amber) */
+  --cost-danger: rgb(255, 80, 70);  /* cost meter — high burden (bright red) */
   --grid-color: rgba(120, 200, 235, 0.10);
 
   --tb-bg: #131a22;
