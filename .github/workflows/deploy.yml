@@ -10,9 +10,13 @@ permissions:
   pages: write
   id-token: write
 
+# Serialize Pages deployments. Do NOT cancel an in-progress run: the
+# deploy-pages step creates a deployment on the Pages backend, and canceling
+# mid-deploy orphans it ("in progress" forever), which then blocks the next run.
+# Queue instead of cancel.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
