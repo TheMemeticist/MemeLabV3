@@ -1,9 +1,10 @@
 import { CellState } from '../types';
-import type { LongStats, SimConfig, SimStats } from '../types';
+import type { LongStats, SimConfig, SimStats, VoronoiTopology } from '../types';
 import { Rng } from './rng';
 import { StrainPool } from './strain';
 import { allocate, seed, type PopulationBuffers } from './population';
-import { makeGeometry, torus, type LatticeGeometry } from './neighbors';
+import { makeGeometry, torus, VoronoiLattice, type LatticeGeometry } from './neighbors';
+import { buildVoronoi } from './voronoi';
 import {
   resolveDefenses,
   protectionMultiplier,
@@ -22,6 +23,7 @@ export class Engine {
   private defenses!: ResolvedDefenses;
   private config!: SimConfig;
   private geometry!: LatticeGeometry;
+  voronoiTopo: VoronoiTopology | null = null;
 
   tick = 0;
   private newInfectionsHistory: number[] = [];
@@ -29,13 +31,29 @@ export class Engine {
   longStats: LongStats = emptyLong();
   rNaught: number | null = null;
 
-  constructor(config: SimConfig) {
-    this.reset(config);
+  constructor(config: SimConfig, prebuiltTopo?: VoronoiTopology | null) {
+    this.reset(config, prebuiltTopo);
   }
 
-  reset(config: SimConfig): void {
+  reset(config: SimConfig, prebuiltTopo?: VoronoiTopology | null): void {
     this.config = config;
-    this.geometry = makeGeometry(config.geometry);
+    if ((config.geometry ?? 'square') === 'voronoi') {
+      if (prebuiltTopo) {
+        this.voronoiTopo = prebuiltTopo;
+      } else {
+        const topoRng = new Rng(config.seed ^ 0x564f524f);
+        this.voronoiTopo = buildVoronoi(
+          config.size * config.size,
+          config.voronoiConfig,
+          topoRng,
+          false,
+        );
+      }
+      this.geometry = new VoronoiLattice(this.voronoiTopo!);
+    } else {
+      this.voronoiTopo = null;
+      this.geometry = makeGeometry(config.geometry);
+    }
     this.rng = new Rng(config.seed);
     this.pop = allocate(config.size);
     this.strains = new StrainPool(config.strain);
@@ -271,6 +289,8 @@ export class Engine {
     const qSrcMul = quarantineOn ? 1 - quarantine.sourceControl : 1;
     const qProtMul = quarantineOn ? 1 - quarantine.protection : 1;
     const geo = this.geometry;
+    const isVoronoi = geo.isVoronoi?.() ?? false;
+    const voronoiGeo = isVoronoi ? (geo as VoronoiLattice) : null;
 
     next.set(state);
 
@@ -287,25 +307,41 @@ export class Engine {
       if (quarantineOn && quarantined[i]) srcMul *= qSrcMul;
       srcMul *= lockdownTransMul;
       if (baseAttack * srcMul <= 0) continue;
-
-      const x = i % size;
-      const y = (i / size) | 0;
-      const offsets = geo.getOffsets(range, x, y);
-      const m2 = offsets.length;
       const srcUnderLockdown = lockdownOn && lockdownCompliant[i] === 1;
 
-      for (let k = 0; k < m2; k += 2) {
-        if (srcUnderLockdown && lockdownSkipP > 0 && rng.bernoulli(lockdownSkipP)) continue;
-        const nx = torus(x + offsets[k], size);
-        const ny = torus(y + offsets[k + 1], size);
-        const j = ny * size + nx;
-        if (state[j] !== CellState.Susceptible) continue;
-        let protMul = protectionMultiplier(D, defenses[j]);
-        if (quarantineOn && quarantined[j]) protMul *= qProtMul;
-        const p = baseAttack * srcMul * protMul;
-        if (p <= 0) continue;
-        if (rng.bernoulli(p)) {
-          if (next[j] === CellState.Susceptible) {
+      if (voronoiGeo) {
+        const nbrs = voronoiGeo.getNeighborIndices!(i, range);
+        for (let k = 0; k < nbrs.length; k++) {
+          if (srcUnderLockdown && lockdownSkipP > 0 && rng.bernoulli(lockdownSkipP)) continue;
+          const j = nbrs[k];
+          if (state[j] !== CellState.Susceptible) continue;
+          let protMul = protectionMultiplier(D, defenses[j]);
+          if (quarantineOn && quarantined[j]) protMul *= qProtMul;
+          const p = baseAttack * srcMul * protMul;
+          if (p <= 0) continue;
+          if (rng.bernoulli(p) && next[j] === CellState.Susceptible) {
+            next[j] = CellState.Exposed;
+            infectedAge[j] = 0;
+            strainId[j] = mutate ? strains.spawnChild(strainId[i], this.tick, rng) : strainId[i];
+            newInfections++;
+          }
+        }
+      } else {
+        const x = i % size;
+        const y = (i / size) | 0;
+        const offsets = geo.getOffsets(range, x, y);
+        const m2 = offsets.length;
+        for (let k = 0; k < m2; k += 2) {
+          if (srcUnderLockdown && lockdownSkipP > 0 && rng.bernoulli(lockdownSkipP)) continue;
+          const nx = torus(x + offsets[k], size);
+          const ny = torus(y + offsets[k + 1], size);
+          const j = ny * size + nx;
+          if (state[j] !== CellState.Susceptible) continue;
+          let protMul = protectionMultiplier(D, defenses[j]);
+          if (quarantineOn && quarantined[j]) protMul *= qProtMul;
+          const p = baseAttack * srcMul * protMul;
+          if (p <= 0) continue;
+          if (rng.bernoulli(p) && next[j] === CellState.Susceptible) {
             next[j] = CellState.Exposed;
             infectedAge[j] = 0;
             const childStrain = mutate ? strains.spawnChild(strainId[i], this.tick, rng) : strainId[i];
@@ -326,17 +362,27 @@ export class Engine {
         if (!rng.bernoulli(detRate)) continue;
         quarantined[i] = 1;
         quarantineExpiry[i] = expiry;
-        const x = i % size;
-        const y = (i / size) | 0;
-        const offsets = geo.getOffsets(contactsRange, x, y);
-        const m2 = offsets.length;
-        for (let k = 0; k < m2; k += 2) {
-          const nx = torus(x + offsets[k], size);
-          const ny = torus(y + offsets[k + 1], size);
-          const j = ny * size + nx;
-          if (j === i) continue;
-          quarantined[j] = 1;
-          if (quarantineExpiry[j] < expiry) quarantineExpiry[j] = expiry;
+        if (voronoiGeo) {
+          const nbrs = voronoiGeo.getNeighborIndices!(i, contactsRange);
+          for (let k = 0; k < nbrs.length; k++) {
+            const j = nbrs[k];
+            if (j === i) continue;
+            quarantined[j] = 1;
+            if (quarantineExpiry[j] < expiry) quarantineExpiry[j] = expiry;
+          }
+        } else {
+          const x = i % size;
+          const y = (i / size) | 0;
+          const offsets = geo.getOffsets(contactsRange, x, y);
+          const m2 = offsets.length;
+          for (let k = 0; k < m2; k += 2) {
+            const nx = torus(x + offsets[k], size);
+            const ny = torus(y + offsets[k + 1], size);
+            const j = ny * size + nx;
+            if (j === i) continue;
+            quarantined[j] = 1;
+            if (quarantineExpiry[j] < expiry) quarantineExpiry[j] = expiry;
+          }
         }
       }
     }
@@ -487,6 +533,29 @@ export class Engine {
       return 2 * pInfected; // k=2 matches stepMeanField
     }
 
+    if (config.geometry === 'voronoi' && this.voronoiTopo) {
+      // Average reachable-neighbour count, not a single cell's degree: Voronoi
+      // degrees vary cell-to-cell, so one sample is noisy. For range 1 the mean
+      // degree is exact from the CSR (total directed edges / cells); for larger
+      // ranges we sample cells and BFS-expand so R0 scales with strain.range,
+      // mirroring how the lattice geometries grow their neighbourhood.
+      const n = config.size * config.size;
+      let avgDegree: number;
+      if (strain.range <= 1) {
+        avgDegree = this.voronoiTopo.adjList.length / n;
+      } else {
+        const geo = this.geometry;
+        const stride = Math.max(1, Math.floor(n / 512));
+        let total = 0, samples = 0;
+        for (let i = 0; i < n; i += stride) {
+          total += geo.getNeighborIndices!(i, strain.range).length;
+          samples++;
+        }
+        avgDegree = samples > 0 ? total / samples : 6;
+      }
+      return avgDegree * pInfected;
+    }
+
     const size = Math.min(config.size, 80);
     const cx = size >> 1;
     const cy = size >> 1;
@@ -513,6 +582,15 @@ export class Engine {
 }
 
 function neighborAliveFraction(state: Uint8Array, i: number, size: number, geo: LatticeGeometry): number {
+  if (geo.isVoronoi?.()) {
+    const nbrs = geo.getNeighborIndices!(i, 1);
+    if (nbrs.length === 0) return 0.5;
+    let alive = 0;
+    for (let k = 0; k < nbrs.length; k++) {
+      if (state[nbrs[k]] !== CellState.Dead) alive++;
+    }
+    return alive / nbrs.length;
+  }
   const x = i % size;
   const y = (i / size) | 0;
   const offsets = geo.getOffsets(1, x, y);

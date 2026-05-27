@@ -29,6 +29,9 @@ export class ControlPanel {
   private r0Slider!: Slider;
   private picker!: PresetPicker;
   private switches: Record<string, HTMLInputElement> = {};
+  private voronoiWrap!: HTMLDivElement;
+  private voronoiModeSelect!: HTMLSelectElement;
+  private voronoiIrrSlider!: Slider;
 
   constructor(cfg: SimConfig, presetId: string, events: ControlPanelEvents) {
     this.cfg = cfg;
@@ -79,6 +82,7 @@ export class ControlPanel {
         <option value="triangular">▲ Triangular</option>
         <option value="square">■ Square</option>
         <option value="hexagonal">⬡ Hexagonal</option>
+        <option value="voronoi">⬡ Voronoi</option>
       </select>
     `;
     popHost.appendChild(geoWrap);
@@ -109,6 +113,58 @@ export class ControlPanel {
       this.applyGeometryVisibility(next);
       this.dirty();
     });
+
+    // Voronoi settings sub-panel (shown only when geometry = voronoi).
+    const voronoiWrap = document.createElement('div');
+    voronoiWrap.className = 'voronoi-settings';
+    voronoiWrap.style.display = 'none';
+    voronoiWrap.innerHTML = `
+      <div class="slider-row geo-row">
+        <label class="slider-label" for="voronoi-mode">
+          Voronoi mode
+          <span class="slider-info" tabindex="0"
+            data-tip="Random: fully irregular. Jittered grid: hex lattice + noise. Lloyd-relaxed: near-uniform cells. Settlements: dense cities + sparse countryside with density-driven contacts — city hotspots and rural fade-outs."
+            aria-label="More info about Voronoi mode">i</span>
+        </label>
+        <select id="voronoi-mode" class="geo-select">
+          <option value="jittered">Jittered grid</option>
+          <option value="uniform">Random</option>
+          <option value="relaxed">Lloyd-relaxed</option>
+          <option value="settlements">Settlements (urban/rural)</option>
+        </select>
+      </div>
+    `;
+    popHost.appendChild(voronoiWrap);
+    this.voronoiWrap = voronoiWrap;
+
+    const voronoiModeSelect = voronoiWrap.querySelector('select') as HTMLSelectElement;
+    voronoiModeSelect.value = this.cfg.voronoiConfig?.mode ?? 'jittered';
+    voronoiModeSelect.addEventListener('change', () => {
+      this.cfg.voronoiConfig = {
+        mode: voronoiModeSelect.value as import('../types').VoronoiMode,
+        irregularity: this.voronoiIrrSlider?.value() ?? 0.5,
+      };
+      this.syncVoronoiIrrLabel();
+      this.dirty();
+    });
+    this.voronoiModeSelect = voronoiModeSelect;
+
+    // Irregularity slider (0=grid-like, 100=organic).
+    const voronoiIrrSlider = new Slider({
+      id: 'voronoi-irr', label: 'Irregularity', min: 0, max: 100, step: 1, unit: '%',
+      value: Math.round((this.cfg.voronoiConfig?.irregularity ?? 0.5) * 100),
+      hint: '0% = grid-like layout, 100% = organic/random. Rebuilds topology on change.',
+      onChange: (v) => {
+        this.cfg.voronoiConfig = {
+          mode: (this.voronoiModeSelect?.value ?? 'jittered') as import('../types').VoronoiMode,
+          irregularity: v / 100,
+        };
+        this.dirty();
+      },
+    });
+    voronoiWrap.appendChild(voronoiIrrSlider.el);
+    this.voronoiIrrSlider = voronoiIrrSlider;
+    this.syncVoronoiIrrLabel();
 
     // Population
     this.popSlider = new Slider({
@@ -584,6 +640,14 @@ export class ControlPanel {
     this.picker.setCurrent(presetId);
     this.recheckCustom();
     this.applyGeometryVisibility(cfg.geometry ?? 'square');
+    // Sync voronoi sub-panel controls.
+    if (this.voronoiModeSelect) {
+      this.voronoiModeSelect.value = cfg.voronoiConfig?.mode ?? 'jittered';
+    }
+    if (this.voronoiIrrSlider) {
+      this.voronoiIrrSlider.setValue(Math.round((cfg.voronoiConfig?.irregularity ?? 0.5) * 100), true);
+    }
+    this.syncVoronoiIrrLabel();
     if ((cfg.geometry ?? 'square') === 'meanfield') {
       const r0 = r0FromAttackRate(cfg.strain.attackRate, cfg.strain.infectious, MF_K);
       this.r0Slider.setValue(Math.round(r0 * 10) / 10, true);
@@ -595,6 +659,22 @@ export class ControlPanel {
     this.r0Slider.el.style.display = isMF ? '' : 'none';
     this.strainSliders.attackRate.el.style.display = isMF ? 'none' : '';
     this.strainSliders.range.el.style.display = isMF ? 'none' : '';
+    if (this.voronoiWrap) {
+      this.voronoiWrap.style.display = geo === 'voronoi' ? '' : 'none';
+    }
+  }
+
+  // The Irregularity slider doubles as the "Urbanization" control in Settlements
+  // mode (low = many small towns, high = a few dense megacities).
+  private syncVoronoiIrrLabel(): void {
+    if (!this.voronoiIrrSlider) return;
+    const isSettlements = (this.voronoiModeSelect?.value ?? '') === 'settlements';
+    this.voronoiIrrSlider.setLabel(
+      isSettlements ? 'Urbanization' : 'Irregularity',
+      isSettlements
+        ? '0% = many small, evenly-spread towns. 100% = a few dense megacities with empty countryside. Rebuilds topology on change.'
+        : '0% = grid-like layout, 100% = organic/random. Rebuilds topology on change.',
+    );
   }
 
   /** Notify the host App that config changed. App decides whether to rebuild

@@ -9,9 +9,10 @@
 //        &vaxRate=0.12&vaxProt=0.80&vaxSrc=0&vaxMort=0.80
 //        &theme=petri&speed=2&preset=sars2-delta&mutate=0
 
-import type { GeometryType, SimConfig } from '../types';
+import type { GeometryType, VoronoiMode, SimConfig } from '../types';
 
-const VALID_GEOMETRIES = new Set<string>(['square', 'triangular', 'hexagonal', 'meanfield']);
+const VALID_GEOMETRIES = new Set<string>(['square', 'triangular', 'hexagonal', 'meanfield', 'voronoi']);
+const VALID_VORONOI_MODES = new Set<string>(['uniform', 'jittered', 'relaxed', 'settlements']);
 
 export interface PermalinkOptions {
   config: SimConfig;
@@ -69,6 +70,11 @@ export function encode(opts: PermalinkOptions): string {
   params.set('qSrc', round3(c.quarantine.sourceControl).toString());
   params.set('qDur', String(c.quarantine.duration));
   // UI
+  // Voronoi config
+  if ((c.geometry ?? 'square') === 'voronoi') {
+    params.set('vMode', c.voronoiConfig?.mode ?? 'jittered');
+    params.set('vIrr', round3(c.voronoiConfig?.irregularity ?? 0.5).toString());
+  }
   params.set('theme', opts.theme);
   params.set('speed', String(opts.speed));
   if (opts.customName) params.set('name', opts.customName);
@@ -103,10 +109,19 @@ export function applyEncoded(p: URLSearchParams, base: SimConfig): {
     ? (rawGeo as GeometryType)
     : (base.geometry ?? 'square');
 
+  const rawVMode = p.get('vMode') ?? '';
+  const voronoiMode: VoronoiMode = VALID_VORONOI_MODES.has(rawVMode)
+    ? (rawVMode as VoronoiMode)
+    : (base.voronoiConfig?.mode ?? 'jittered');
+
   const config: SimConfig = {
     seed: int(p, 'seed', base.seed) >>> 0,
     size: clampInt(int(p, 'size', base.size), 8, 1024),
     geometry,
+    voronoiConfig: {
+      mode: voronoiMode,
+      irregularity: clamp01(num(p, 'vIrr', base.voronoiConfig?.irregularity ?? 0.5)),
+    },
     seedInfections: clamp01(num(p, 'seedInf', base.seedInfections)),
     birthRate: clamp01(num(p, 'birth', base.birthRate)),
     mutate: bool(p, 'mutate', base.mutate),

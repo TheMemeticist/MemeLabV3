@@ -1,5 +1,5 @@
 import { CellState } from '../types';
-import type { GeometryType } from '../types';
+import type { GeometryType, VoronoiTopology } from '../types';
 import { SpriteAtlas } from './SpriteAtlas';
 
 interface ColorTriplet { r: number; g: number; b: number }
@@ -18,6 +18,9 @@ interface ColorPalette {
 }
 
 const SPRITE_THRESHOLD = 60;
+// Voronoi sprites sit at irregular centroids and read well only on small grids,
+// so they use a tighter threshold; above it Voronoi renders as solid polygons.
+const VORONOI_SPRITE_THRESHOLD = 24;
 
 export class Petri {
   private canvas: HTMLCanvasElement;
@@ -38,6 +41,7 @@ export class Petri {
   private palette: ColorPalette = makeDefaultPalette();
   private atlas: SpriteAtlas | null = null;
   private spriteReady = false;
+  private voronoiTopo: VoronoiTopology | null = null;
 
   constructor(host: HTMLElement) {
     host.classList.add('petri-host');
@@ -82,13 +86,27 @@ export class Petri {
     this.renderLegend();
   }
 
+  /** Call whenever the engine rebuilds with geometry=voronoi. Pass null to clear. */
+  setVoronoiTopology(topo: VoronoiTopology | null): void {
+    this.voronoiTopo = topo;
+    // Invalidate LUT so resize() rebuilds it with the new topology.
+    this.geoLut = null;
+    if (topo !== null && this.geometry === 'voronoi') {
+      this.resize(this.size, 'voronoi');
+    }
+  }
+
   resize(size: number, geometry: GeometryType): void {
-    if (size === this.size && geometry === this.geometry) return;
+    if (size === this.size && geometry === this.geometry && !(geometry === 'voronoi' && this.geoLut === null)) return;
     this.size = size;
     this.geometry = geometry;
 
-    // Same size threshold applies to all geometries; meanfield has no cells to render as sprites.
-    const wantMode: 'pixel' | 'sprite' = (geometry !== 'meanfield' && size <= SPRITE_THRESHOLD) ? 'sprite' : 'pixel';
+    // Sprite (emoji) mode for small grids; solid-color pixel/LUT mode above the
+    // threshold. Voronoi uses a tighter sprite threshold (its sprites sit at
+    // irregular centroids). Mean-field has no per-cell sprites.
+    const spriteThreshold = geometry === 'voronoi' ? VORONOI_SPRITE_THRESHOLD : SPRITE_THRESHOLD;
+    const wantMode: 'pixel' | 'sprite' =
+      (geometry !== 'meanfield' && size <= spriteThreshold) ? 'sprite' : 'pixel';
 
     if (wantMode === 'sprite') {
       const tile = clampInt(Math.round(900 / size), 24, 80);
@@ -104,7 +122,7 @@ export class Petri {
       this.imageData = null;
       this.geoLut = null;
     } else {
-      // Cap hex/tri canvas at 1200px to prevent memory issues at large grid sizes
+      // Cap non-square canvas at 1200px to prevent memory issues at large grid sizes
       // (uncapped: size=512 → 3072px² ≈ 37 MB; size=1024 → 6144px² ≈ 150 MB).
       const canvasPx = geometry === 'square' ? size : Math.max(Math.min(size * 6, 1200), 400);
       this.canvas.width = canvasPx;
@@ -116,16 +134,22 @@ export class Petri {
         for (let i = 3; i < d.length; i += 4) d[i] = 255;
         this.imageData = img;
       } else {
-        // Hex/tri: render via a precomputed pixel→cell lookup table. Drawing
+        // Hex/tri/voronoi: render via a precomputed pixel→cell lookup table. Drawing
         // tens of thousands of vector polygons per frame is the bottleneck;
         // a flat putImageData off the LUT is ~50× faster and O(canvas pixels).
         const img = this.ctx.createImageData(canvasPx, canvasPx);
         const d = img.data;
         for (let i = 3; i < d.length; i += 4) d[i] = 255;
         this.imageData = img;
-        this.geoLut = geometry === 'hexagonal'
-          ? buildHexLut(size, canvasPx, canvasPx)
-          : buildTriLut(size, canvasPx, canvasPx);
+        if (geometry === 'hexagonal') {
+          this.geoLut = buildHexLut(size, canvasPx, canvasPx);
+        } else if (geometry === 'triangular') {
+          this.geoLut = buildTriLut(size, canvasPx, canvasPx);
+        } else if (geometry === 'voronoi' && this.voronoiTopo) {
+          this.geoLut = buildVoronoiLut(this.voronoiTopo, canvasPx, canvasPx);
+        } else {
+          this.geoLut = null;
+        }
       }
     }
     this.mode = wantMode;
@@ -143,7 +167,7 @@ export class Petri {
 
     if (this.mode === 'sprite') {
       this.paintSprites(state, defenses, size);
-    } else if (geometry === 'hexagonal' || geometry === 'triangular') {
+    } else if (geometry === 'hexagonal' || geometry === 'triangular' || geometry === 'voronoi') {
       this.paintViaLut(state, defenses, size);
     } else {
       this.paintPixels(state, defenses, size);
@@ -344,6 +368,30 @@ export class Petri {
       return;
     }
 
+    // ── Voronoi sprite mode (small grids) ─────────────────────────────────────
+    if (this.geometry === 'voronoi' && this.voronoiTopo) {
+      const topo = this.voronoiTopo;
+      const sprSize = Math.max(16, Math.round(900 / size));
+      if (!this.spriteReady || !this.atlas) {
+        // Fallback until the atlas loads: colored circles at each centroid.
+        const r = sprSize * 0.4;
+        for (let i = 0; i < topo.n; i++) {
+          const cx = topo.cx[i] * W, cy = topo.cy[i] * H;
+          const c = this.cellColor(state[i], defenses[i], p);
+          ctx.fillStyle = `rgb(${c.r},${c.g},${c.b})`;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        return;
+      }
+      for (let i = 0; i < topo.n; i++) {
+        const cx = topo.cx[i] * W, cy = topo.cy[i] * H;
+        this.atlas.draw(ctx, state[i], defenses[i], cx - sprSize / 2, cy - sprSize / 2, sprSize, sprSize);
+      }
+      return;
+    }
+
     // ── Square sprite mode ────────────────────────────────────────────────────
     const tile = W / size;
     if (!this.spriteReady || !this.atlas) {
@@ -405,6 +453,20 @@ export class Petri {
           } else if (geometry === 'triangular') {
             const isUp = (x + y) % 2 === 0;
             triPath(ctx, x * triTileW, triOffY + y * triTileH, triTileW, triTileH, isUp);
+          } else if (geometry === 'voronoi' && this.voronoiTopo) {
+            const topo = this.voronoiTopo;
+            const ci = y * size + x;
+            if (!topo.polyOffsets || !topo.polyVerts) continue;
+            const vStart = topo.polyOffsets[ci];
+            const vEnd = topo.polyOffsets[ci + 1];
+            if (vEnd <= vStart) continue;
+            ctx.beginPath();
+            for (let v = vStart; v < vEnd; v++) {
+              const vx = topo.polyVerts[v * 2] * W;
+              const vy = topo.polyVerts[v * 2 + 1] * H;
+              v === vStart ? ctx.moveTo(vx, vy) : ctx.lineTo(vx, vy);
+            }
+            ctx.closePath();
           } else {
             ctx.rect(x * tile + 0.5, y * tile + 0.5, tile - 1, tile - 1);
           }
@@ -609,6 +671,63 @@ function triPath(ctx: CanvasRenderingContext2D, px: number, py: number, tw: numb
     ctx.lineTo(px + tw * 0.5, py + th + expand);
   }
   ctx.closePath();
+}
+
+// Builds a pixel→cell lookup table for Voronoi topology.
+// Each pixel is assigned to its nearest centroid using a spatial bucket grid so
+// only ~9 buckets (≈9 centroids) are tested. Both the bucket neighbourhood and
+// the distance metric wrap toroidally, matching the simulation's torus topology.
+// Built with flat CSR buckets and an allocation-free inner loop so the one-time
+// cost stays low even at the 1200px canvas cap (~1.4M pixels).
+function buildVoronoiLut(topo: VoronoiTopology, W: number, H: number): Int32Array {
+  const { n, cx, cy } = topo;
+  const lut = new Int32Array(W * H);
+  const gridK = Math.max(1, Math.ceil(Math.sqrt(n)));
+  const nb = gridK * gridK;
+
+  // Counting-sort centroids into flat CSR buckets: order[start[b]..start[b+1]).
+  const cellBucket = new Int32Array(n);
+  const start = new Int32Array(nb + 1);
+  for (let i = 0; i < n; i++) {
+    let bx = (cx[i] * gridK) | 0; if (bx >= gridK) bx = gridK - 1; else if (bx < 0) bx = 0;
+    let by = (cy[i] * gridK) | 0; if (by >= gridK) by = gridK - 1; else if (by < 0) by = 0;
+    const b = by * gridK + bx;
+    cellBucket[i] = b;
+    start[b + 1]++;
+  }
+  for (let b = 0; b < nb; b++) start[b + 1] += start[b];
+  const order = new Int32Array(n);
+  const cursor = Int32Array.from(start.subarray(0, nb));
+  for (let i = 0; i < n; i++) order[cursor[cellBucket[i]]++] = i;
+
+  for (let py = 0; py < H; py++) {
+    const ny = (py + 0.5) / H;
+    let by = (ny * gridK) | 0; if (by >= gridK) by = gridK - 1;
+    for (let px = 0; px < W; px++) {
+      const nx = (px + 0.5) / W;
+      let bx = (nx * gridK) | 0; if (bx >= gridK) bx = gridK - 1;
+      let best = 0, bestDist = Infinity;
+      for (let dy = -1; dy <= 1; dy++) {
+        let by2 = by + dy; if (by2 < 0) by2 += gridK; else if (by2 >= gridK) by2 -= gridK;
+        const rowBase = by2 * gridK;
+        for (let dx = -1; dx <= 1; dx++) {
+          let bx2 = bx + dx; if (bx2 < 0) bx2 += gridK; else if (bx2 >= gridK) bx2 -= gridK;
+          const b = rowBase + bx2;
+          const e = start[b + 1];
+          for (let k = start[b]; k < e; k++) {
+            const i = order[k];
+            // Toroidal wrap to the nearest image (difference is already in (-1,1)).
+            let ddx = nx - cx[i]; if (ddx > 0.5) ddx -= 1; else if (ddx < -0.5) ddx += 1;
+            let ddy = ny - cy[i]; if (ddy > 0.5) ddy -= 1; else if (ddy < -0.5) ddy += 1;
+            const d = ddx * ddx + ddy * ddy;
+            if (d < bestDist) { bestDist = d; best = i; }
+          }
+        }
+      }
+      lut[py * W + px] = best;
+    }
+  }
+  return lut;
 }
 
 // ── Palette / parse helpers ───────────────────────────────────────────────────

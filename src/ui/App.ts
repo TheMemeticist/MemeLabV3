@@ -1,4 +1,4 @@
-import type { FrameMessage, InterventionEvent, InterventionKey, SimConfig, WorkerCommand } from '../types';
+import type { FrameMessage, InterventionEvent, InterventionKey, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { findPreset, DEFAULT_PRESET_ID } from '../sim/presets';
 import { Petri } from './Petri';
 import { Chart, type ChartView } from './Chart';
@@ -86,8 +86,18 @@ export class App {
 
     // Worker
     this.worker = new Worker(new URL('../worker/sim.worker.ts', import.meta.url), { type: 'module' });
-    this.worker.onmessage = (ev: MessageEvent<FrameMessage>) => this.onFrame(ev.data);
+    this.worker.onmessage = (ev: MessageEvent<FrameMessage | TopologyMessage>) => {
+      const msg = ev.data;
+      if (msg.type === 'topology') {
+        this.petri.setVoronoiTopology(msg.topo);
+      } else {
+        this.onFrame(msg);
+      }
+    };
     this.send({ cmd: 'init', config: initialConfig });
+    if ((initialConfig.geometry ?? 'square') !== 'voronoi') {
+      this.petri.setVoronoiTopology(null);
+    }
     this.prevConfig = structuredClone(initialConfig);
 
     // Onboarding (first visit only)
@@ -286,6 +296,7 @@ export class App {
         // Smallest grid by default (8×8 = 64 cells). User can scale up.
         size: 8,
         geometry: 'square',
+        voronoiConfig: { mode: 'jittered', irregularity: 0.5 },
         seedInfections: 0,
         birthRate: 0,
         mutate: false,
@@ -431,6 +442,9 @@ export class App {
     const rebuild = this.needsRebuild(this.prevConfig, cfg);
     const cmd: 'updateConfig' | 'patchConfig' = rebuild ? 'updateConfig' : 'patchConfig';
     this.send({ cmd, config: cfg });
+    if (rebuild && (cfg.geometry ?? 'square') !== 'voronoi') {
+      this.petri.setVoronoiTopology(null);
+    }
     this.prevConfig = structuredClone(cfg);
     if (rebuild) {
       // Engine just reset — patient zero is fresh, so the ended state no longer applies.
@@ -450,6 +464,12 @@ export class App {
     if (prev.size !== next.size) return true;
     if (prev.seed !== next.seed) return true;
     if ((prev.geometry ?? 'square') !== (next.geometry ?? 'square')) return true;
+    // Voronoi topology changes require a full rebuild.
+    if (prev.geometry === 'voronoi' && next.geometry === 'voronoi') {
+      const pv = prev.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };
+      const nv = next.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };
+      if (pv.mode !== nv.mode || pv.irregularity !== nv.irregularity) return true;
+    }
     // Strain genes alter R₀ + neighbor cache + seeding behaviour — full rebuild.
     const a = prev.strain, b = next.strain;
     return a.attackRate !== b.attackRate
@@ -509,6 +529,9 @@ export class App {
     // Clear any permalink params so the URL reflects a clean default state.
     history.replaceState(null, '', location.pathname);
     this.send({ cmd: 'reset', config: cfg });
+    if ((cfg.geometry ?? 'square') !== 'voronoi') {
+      this.petri.setVoronoiTopology(null);
+    }
     // Reset auto-starts the simulation — the user almost always wants to see
     // the new run play out immediately.
     this.playing = true;
@@ -615,6 +638,9 @@ export class App {
     this.hideEndedBanner();
     this.prevConfig = structuredClone(applied.config);
     this.send({ cmd: 'reset', config: applied.config });
+    if ((applied.config.geometry ?? 'square') !== 'voronoi') {
+      this.petri.setVoronoiTopology(null);
+    }
   }
 
   private copyPermalink(): void {

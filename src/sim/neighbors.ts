@@ -1,10 +1,14 @@
-import type { GeometryType } from '../types';
+import type { GeometryType, VoronoiTopology } from '../types';
 
 export interface LatticeGeometry {
   /** Returns flat [dx,dy,...] offset pairs for neighbors of a cell at (x,y). */
   getOffsets(range: number, x: number, y: number): Int32Array;
   /** True only for mean-field; engine skips spatial loop and uses global mixing. */
   isMeanField(): boolean;
+  /** True for VoronoiLattice; engine uses getNeighborIndices instead of getOffsets+torus. */
+  isVoronoi?(): boolean;
+  /** Returns absolute cell indices for Voronoi neighbors. Only on VoronoiLattice. */
+  getNeighborIndices?(cellIdx: number, range: number): Int32Array;
 }
 
 // ─── Square (Manhattan diamond, existing behaviour) ───────────────────────────
@@ -160,9 +164,63 @@ class MeanFieldLattice implements LatticeGeometry {
   isMeanField(): boolean { return true; }
 }
 
+// ─── Voronoi (adjacency-list based, instance-specific) ───────────────────────
+
+export class VoronoiLattice implements LatticeGeometry {
+  private bfsCache = new Map<string, Int32Array>();
+
+  constructor(private topo: VoronoiTopology) {}
+
+  getOffsets(_range: number, _x: number, _y: number): Int32Array {
+    return new Int32Array(0); // unused; engine dispatches via isVoronoi()
+  }
+  isMeanField(): boolean { return false; }
+  isVoronoi(): boolean { return true; }
+
+  getNeighborIndices(cellIdx: number, range: number): Int32Array {
+    if (range <= 1) return this.directNeighbors(cellIdx);
+    const key = `${cellIdx}_${range}`;
+    const cached = this.bfsCache.get(key);
+    if (cached) return cached;
+    const result = this.bfsExpand(cellIdx, range);
+    this.bfsCache.set(key, result);
+    return result;
+  }
+
+  private directNeighbors(i: number): Int32Array {
+    const { adjOffsets, adjList } = this.topo;
+    return adjList.subarray(adjOffsets[i], adjOffsets[i + 1]);
+  }
+
+  private bfsExpand(start: number, maxRange: number): Int32Array {
+    const { adjOffsets, adjList, n } = this.topo;
+    const visited = new Uint8Array(n);
+    visited[start] = 1;
+    let frontier: number[] = [start];
+    const result: number[] = [];
+    for (let step = 0; step < maxRange; step++) {
+      const next: number[] = [];
+      for (const cur of frontier) {
+        const lo = adjOffsets[cur], hi = adjOffsets[cur + 1];
+        for (let k = lo; k < hi; k++) {
+          const nb = adjList[k];
+          if (!visited[nb]) {
+            visited[nb] = 1;
+            next.push(nb);
+            result.push(nb);
+          }
+        }
+      }
+      frontier = next;
+    }
+    return new Int32Array(result);
+  }
+}
+
 // ─── Factory ─────────────────────────────────────────────────────────────────
 
-const INSTANCES: Record<GeometryType, LatticeGeometry> = {
+// Voronoi is instance-specific (seed-dependent) and is constructed by the Engine directly.
+const INSTANCES: Omit<Record<GeometryType, LatticeGeometry>, 'voronoi'> = {
   square: new SquareLattice(),
   hexagonal: new HexLattice(),
   triangular: new TriangularLattice(),
@@ -170,7 +228,8 @@ const INSTANCES: Record<GeometryType, LatticeGeometry> = {
 };
 
 export function makeGeometry(type: GeometryType = 'square'): LatticeGeometry {
-  return INSTANCES[type] ?? INSTANCES.square;
+  const inst = INSTANCES as Partial<Record<GeometryType, LatticeGeometry>>;
+  return inst[type] ?? INSTANCES.square;
 }
 
 /** Backward-compatible export for estimateR0 and tests. */

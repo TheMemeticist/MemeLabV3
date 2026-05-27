@@ -72,12 +72,29 @@ export interface QuarantineSpec {
   duration: number;
 }
 
-export type GeometryType = 'square' | 'triangular' | 'hexagonal' | 'meanfield';
+export type GeometryType = 'square' | 'triangular' | 'hexagonal' | 'meanfield' | 'voronoi';
+export type VoronoiMode = 'uniform' | 'jittered' | 'relaxed' | 'settlements';
+export interface VoronoiConfig {
+  mode: VoronoiMode;
+  irregularity: number; // 0..1
+}
+
+export interface VoronoiTopology {
+  n: number;
+  cx: Float32Array; // centroid x [0..1], length n
+  cy: Float32Array; // centroid y [0..1], length n
+  adjOffsets: Int32Array; // CSR, length n+1
+  adjList: Int32Array; // absolute cell indices
+  // Polygon data — built only when withPolygons=true, null otherwise.
+  polyOffsets: Int32Array | null; // length n+1
+  polyVerts: Float32Array | null; // flat [x0,y0,x1,y1,...] normalized
+}
 
 export interface SimConfig {
   seed: number; // 32-bit unsigned PRNG seed
   size: number; // grid edge length; population = size * size
   geometry?: GeometryType; // lattice topology; defaults to 'square'
+  voronoiConfig?: VoronoiConfig; // only used when geometry === 'voronoi'
   seedInfections: number; // 0..1 fraction starting as Exposed
   birthRate: number; // 0..1 per-tick respawn chance for dead cells with healthy neighbors
   mutate: boolean;
@@ -111,6 +128,11 @@ export interface SimStats {
   newInfections: number;
   reff: number;
   strains: number;
+}
+
+export interface TopologyMessage {
+  type: 'topology';
+  topo: VoronoiTopology;
 }
 
 export interface FrameMessage {

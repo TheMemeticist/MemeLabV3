@@ -1,6 +1,8 @@
 /// <reference lib="webworker" />
 import { Engine } from '../sim';
-import type { FrameMessage, SimConfig, WorkerCommand } from '../types';
+import type { FrameMessage, SimConfig, TopologyMessage, WorkerCommand } from '../types';
+import { buildVoronoi } from '../sim/voronoi';
+import { Rng } from '../sim/rng';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -61,6 +63,19 @@ function cloneLong<T>(long: T): T {
   return structuredClone(long);
 }
 
+// Build topology once (with polygons for the renderer) and share it:
+// - pass to Engine so it skips its own buildVoronoi call
+// - post to main thread via structured clone (no transfer; engine keeps its refs)
+function buildAndPostTopology(config: SimConfig): import('../types').VoronoiTopology | null {
+  if ((config.geometry ?? 'square') !== 'voronoi') return null;
+  const n = config.size * config.size;
+  const topoRng = new Rng(config.seed ^ 0x564f524f);
+  const topo = buildVoronoi(n, config.voronoiConfig, topoRng, true);
+  const msg: TopologyMessage = { type: 'topology', topo };
+  self.postMessage(msg); // structured clone — engine's typed array refs stay valid
+  return topo;
+}
+
 function loop(): void {
   scheduled = false;
   if (!playing || !engine) return;
@@ -87,14 +102,16 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
   const m = ev.data;
   switch (m.cmd) {
     case 'init': {
-      engine = new Engine(m.config);
+      const topo = buildAndPostTopology(m.config);
+      engine = new Engine(m.config, topo);
       lastFrame = performance.now();
       lastStats = null;
       postFrame();
       break;
     }
     case 'reset': {
-      engine = new Engine(m.config);
+      const topo = buildAndPostTopology(m.config);
+      engine = new Engine(m.config, topo);
       lastFrame = performance.now();
       playing = false;
       lastStats = null;
@@ -104,7 +121,8 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
     case 'updateConfig': {
       // Hard update: rebuild for changes that alter sim shape (size, seed,
       // strain genes). Resets RNG trajectory + population.
-      engine = new Engine(m.config);
+      const topo = buildAndPostTopology(m.config);
+      engine = new Engine(m.config, topo);
       lastFrame = performance.now();
       lastStats = null;
       postFrame();

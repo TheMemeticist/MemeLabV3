@@ -316,6 +316,110 @@ describe('Engine', () => {
     const finalS = tail.s.at(-1) ?? 0;
     expect(finalS).toBeGreaterThan(50); // 64-cell grid; very few deaths expected
   });
+
+  it('voronoi preserves population conservation S+E+I+R+D = N', () => {
+    const cfg = baseConfig({ geometry: 'voronoi', seedInfections: 0.05 });
+    const engine = new Engine(cfg);
+    const n = cfg.size * cfg.size;
+    for (let t = 0; t < 50; t++) {
+      const stats = engine.step();
+      expect(stats.s + stats.e + stats.i + stats.r + stats.d).toBe(n);
+      expect(stats.s).toBeGreaterThanOrEqual(0);
+      expect(stats.d).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('voronoi is deterministic from a fixed seed', () => {
+    const cfg = baseConfig({ geometry: 'voronoi', seedInfections: 0.02, mutate: true });
+    const a = new Engine(cfg);
+    const b = new Engine(cfg);
+    for (let t = 0; t < 30; t++) {
+      const sa = a.step();
+      const sb = b.step();
+      expect(sa.s).toBe(sb.s);
+      expect(sa.e).toBe(sb.e);
+      expect(sa.i).toBe(sb.i);
+      expect(sa.r).toBe(sb.r);
+      expect(sa.d).toBe(sb.d);
+    }
+  });
+
+  it('full mask coverage blocks voronoi spread across a long endemic run', () => {
+    const cfg = baseConfig({
+      geometry: 'voronoi',
+      seedInfections: 0,
+      reseedOnExtinction: true,
+      strain: { attackRate: 1, incubation: 2, infectious: 8, ifr: 0.5, range: 1, immunityDays: 3650, mutationRate: 0 },
+    });
+    cfg.defenses[0].enabled = true;
+    cfg.defenses[0].uptake = 1;
+    cfg.defenses[0].protection = 1;
+    cfg.defenses[0].sourceControl = 1;
+    const engine = new Engine(cfg);
+    for (let t = 0; t < 1000; t++) engine.step();
+    const tail = engine.longStats;
+    expect(tail.d.at(-1) ?? 0).toBeLessThanOrEqual(1);
+  });
+
+  it('voronoi settlements preserves population conservation S+E+I+R+D = N', () => {
+    const cfg = baseConfig({
+      geometry: 'voronoi',
+      voronoiConfig: { mode: 'settlements', irregularity: 0.7 },
+      seedInfections: 0.05,
+    });
+    const engine = new Engine(cfg);
+    const n = cfg.size * cfg.size;
+    for (let t = 0; t < 50; t++) {
+      const stats = engine.step();
+      expect(stats.s + stats.e + stats.i + stats.r + stats.d).toBe(n);
+    }
+  });
+
+  it('voronoi settlements is deterministic from a fixed seed', () => {
+    const cfg = baseConfig({
+      geometry: 'voronoi',
+      voronoiConfig: { mode: 'settlements', irregularity: 0.6 },
+      seedInfections: 0.02,
+      mutate: true,
+    });
+    const a = new Engine(cfg);
+    const b = new Engine(cfg);
+    for (let t = 0; t < 30; t++) {
+      const sa = a.step();
+      const sb = b.step();
+      expect(sa.s).toBe(sb.s);
+      expect(sa.i).toBe(sb.i);
+      expect(sa.d).toBe(sb.d);
+    }
+  });
+
+  it('voronoi settlements produces a heterogeneous contact graph (city hubs vs rural)', () => {
+    const settle = new Engine(baseConfig({
+      geometry: 'voronoi', size: 48,
+      voronoiConfig: { mode: 'settlements', irregularity: 0.8 },
+    }));
+    const uniform = new Engine(baseConfig({
+      geometry: 'voronoi', size: 48,
+      voronoiConfig: { mode: 'jittered', irregularity: 0.5 },
+    }));
+    const stats = (e: Engine) => {
+      const topo = e.voronoiTopo!;
+      let max = 0, sum = 0, sumSq = 0;
+      for (let i = 0; i < topo.n; i++) {
+        const d = topo.adjOffsets[i + 1] - topo.adjOffsets[i];
+        if (d > max) max = d;
+        sum += d; sumSq += d * d;
+      }
+      const mean = sum / topo.n;
+      return { max, variance: sumSq / topo.n - mean * mean };
+    };
+    const s = stats(settle), u = stats(uniform);
+    // Cities create high-degree hubs the homogeneous layout never reaches, and a
+    // far wider degree spread overall.
+    expect(s.max).toBeGreaterThan(u.max);
+    expect(s.max).toBeGreaterThanOrEqual(12);
+    expect(s.variance).toBeGreaterThan(u.variance * 3);
+  });
 });
 
 function countMaskBit(defenses: Uint8Array): number {

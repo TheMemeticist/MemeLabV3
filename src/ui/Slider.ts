@@ -65,6 +65,18 @@ export class Slider {
     return parseFloat(this.input.value);
   }
 
+  /** Re-label the slider (and optionally its info tooltip) after construction. */
+  setLabel(label: string, hint?: string): void {
+    this.opts.label = label;
+    if (hint !== undefined) this.opts.hint = hint;
+    const h = this.opts.hint;
+    const labelEl = this.el.querySelector('.slider-label') as HTMLElement;
+    labelEl.innerHTML = h
+      ? `${label}<span class="slider-info" tabindex="0" data-tip="${escapeAttr(h)}" aria-label="More info: ${escapeAttr(h)}">i</span>`
+      : label;
+    this.input.setAttribute('aria-label', label);
+  }
+
   private refreshDisplay(): void {
     const v = parseFloat(this.input.value);
     this.valueEl.textContent = this.format(v);
