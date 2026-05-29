@@ -103,7 +103,14 @@ export class Engine {
       this.pop.quarantineExpiry.fill(0);
     }
     this.defenses = resolveDefenses(newCfg.defenses);
+    // Live-patch strain 0 so disease-slider edits take effect mid-run without
+    // a reset. Engine reads strain genes per-cell each tick, so updating the
+    // base entry is enough — no buffer mutation needed.
+    this.strains.updateBaseStrain(newCfg.strain);
     this.config = newCfg;
+    // attackRate / range / infectious all factor into R0; recompute so the
+    // UI's R0 readout reflects the patched values on the next frame.
+    this.rNaught = this.estimateR0(newCfg);
   }
 
   private resampleDefenseFlag(flagIdx: number, oldP: number, newP: number): void {

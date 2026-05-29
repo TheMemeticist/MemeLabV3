@@ -541,15 +541,10 @@ export class App {
       const nv = next.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };
       if (pv.mode !== nv.mode || pv.irregularity !== nv.irregularity) return true;
     }
-    // Strain genes alter R₀ + neighbor cache + seeding behaviour — full rebuild.
-    const a = prev.strain, b = next.strain;
-    return a.attackRate !== b.attackRate
-      || a.incubation !== b.incubation
-      || a.infectious !== b.infectious
-      || a.ifr !== b.ifr
-      || a.range !== b.range
-      || a.immunityDays !== b.immunityDays
-      || a.mutationRate !== b.mutationRate;
+    // Strain genes are live-patched in the engine (Engine.patchConfig calls
+    // StrainPool.updateBaseStrain), so a disease-slider drag no longer resets
+    // the run. Only size/seed/geometry require a rebuild.
+    return false;
   }
 
   private recordInterventionToggle(key: InterventionKey, on: boolean): void {

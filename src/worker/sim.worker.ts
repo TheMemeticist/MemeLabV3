@@ -64,14 +64,45 @@ function cloneLong<T>(long: T): T {
   return structuredClone(long);
 }
 
-// Build topology once (with polygons for the renderer) and share it:
+// Build topology once and share it:
 // - pass to Engine so it skips its own buildVoronoi call
 // - post to main thread via structured clone (no transfer; engine keeps its refs)
+//
+// We also cache the most recent build by a key derived from every parameter
+// that affects topology (seed + size + voronoi sub-config). Reset (R key) and
+// rebuilds that don't actually change topology (e.g. a strain-gene change that
+// somehow still slipped through) reuse the cached graph, which is the dominant
+// cost on large voronoi grids.
+let cachedTopo: import('../types').VoronoiTopology | null = null;
+let cachedTopoKey: string | null = null;
+
+function topologyKey(c: SimConfig): string {
+  const v = c.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };
+  return `${c.seed}|${c.size}|${v.mode}|${v.irregularity}`;
+}
+
 function buildAndPostTopology(config: SimConfig): import('../types').VoronoiTopology | null {
-  if ((config.geometry ?? 'square') !== 'voronoi') return null;
+  if ((config.geometry ?? 'square') !== 'voronoi') {
+    cachedTopo = null;
+    cachedTopoKey = null;
+    return null;
+  }
+  const key = topologyKey(config);
+  if (cachedTopo && cachedTopoKey === key) {
+    // Re-post so the main thread can rehydrate after a geometry toggle without
+    // paying the build cost again.
+    self.postMessage({ type: 'topology', topo: cachedTopo } satisfies TopologyMessage);
+    return cachedTopo;
+  }
   const n = config.size * config.size;
   const topoRng = new Rng(config.seed ^ 0x564f524f);
-  const topo = buildVoronoi(n, config.voronoiConfig, topoRng, true);
+  // withPolygons:false — the renderer uses a centroid LUT and color-tint
+  // quarantine, never reading polyVerts/polyOffsets for voronoi. The polygon
+  // build (per-triangle circumcenter + per-cell dedup + atan2 sort) is the
+  // biggest avoidable cost in buildVoronoi.
+  const topo = buildVoronoi(n, config.voronoiConfig, topoRng, false);
+  cachedTopo = topo;
+  cachedTopoKey = key;
   const msg: TopologyMessage = { type: 'topology', topo };
   self.postMessage(msg); // structured clone — engine's typed array refs stay valid
   return topo;

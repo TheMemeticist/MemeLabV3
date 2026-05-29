@@ -116,6 +116,80 @@ describe('Engine', () => {
     expect(fraction).toBeLessThan(0.75);
   });
 
+  it('patchConfig live-updates strain attackRate without resetting tick or population', () => {
+    const cfg = baseConfig({
+      seedInfections: 0.02,
+      strain: { attackRate: 0.4, incubation: 2, infectious: 4, ifr: 0, range: 1, immunityDays: 36500, mutationRate: 0 },
+    });
+    const engine = new Engine(cfg);
+    for (let t = 0; t < 10; t++) engine.step();
+    const tickBefore = engine.tick;
+    const sBefore = engine.longStats.s.at(-1)!;
+    const eBefore = engine.longStats.e.at(-1)!;
+    const iBefore = engine.longStats.i.at(-1)!;
+    const r0Before = engine.rNaught!;
+
+    const next = structuredClone(cfg);
+    next.strain.attackRate = 0.9;
+    engine.patchConfig(next);
+
+    // Tick + population state are preserved verbatim — patching is in-place.
+    expect(engine.tick).toBe(tickBefore);
+    const buf = engine.buffers();
+    let s = 0, e = 0, i = 0;
+    for (let k = 0; k < buf.state.length; k++) {
+      if (buf.state[k] === 0) s++;
+      else if (buf.state[k] === 1) e++;
+      else if (buf.state[k] === 2) i++;
+    }
+    expect(s).toBe(sBefore);
+    expect(e).toBe(eBefore);
+    expect(i).toBe(iBefore);
+
+    // R0 is recomputed — higher attackRate → higher R0.
+    expect(engine.rNaught!).toBeGreaterThan(r0Before);
+
+    // Continuing to step uses the new attackRate: spread should be faster than
+    // the same engine would have produced under the old rate. Smoke-check: at
+    // least one new infection occurs in the next few ticks.
+    let newInfTotal = 0;
+    for (let t = 0; t < 5; t++) newInfTotal += engine.step().newInfections;
+    expect(newInfTotal).toBeGreaterThan(0);
+  });
+
+  it('patchConfig updating strain range expands the active neighborhood on the next step', () => {
+    // Single patient zero at grid centre, range=1, low attack → quarantine the
+    // initial spread to immediate neighbours. Then patch range to 4 and verify
+    // an outer ring becomes reachable in subsequent steps.
+    const cfg = baseConfig({
+      seedInfections: 0,
+      strain: { attackRate: 1, incubation: 1, infectious: 20, ifr: 0, range: 1, immunityDays: 36500, mutationRate: 0 },
+    });
+    const engine = new Engine(cfg);
+    // Tick once so patient zero (seeded as Exposed) becomes Infectious.
+    engine.step();
+    // Now patch range up. Subsequent transmission scans the wider neighbourhood.
+    const next = structuredClone(cfg);
+    next.strain.range = 4;
+    engine.patchConfig(next);
+    for (let t = 0; t < 3; t++) engine.step();
+
+    // With range=4 active for 3 ticks, cells well outside the original range=1
+    // neighborhood must have been reached.
+    const buf = engine.buffers();
+    const size = cfg.size;
+    const cx = size >> 1, cy = size >> 1;
+    let touchedFarRing = 0;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const dx = Math.min(Math.abs(x - cx), size - Math.abs(x - cx));
+        const dy = Math.min(Math.abs(y - cy), size - Math.abs(y - cy));
+        if (dx + dy >= 3 && buf.state[y * size + x] !== 0) touchedFarRing++;
+      }
+    }
+    expect(touchedFarRing).toBeGreaterThan(0);
+  });
+
   it('patchConfig revoking defense decreases flagged-cell count proportionally', () => {
     const cfg = baseConfig();
     cfg.defenses[0].uptake = 0.8;

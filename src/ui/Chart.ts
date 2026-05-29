@@ -120,11 +120,25 @@ export class Chart {
   }
 
   private canvasHeight(): number {
-    // The host grows to fit canvas + legend (legend may wrap on narrow
-    // widths), so the canvas gets a fixed target height based on viewport.
-    // This keeps the x-axis labels readable and stops the legend from
-    // overflowing the host bottom when it wraps to two or three rows.
-    return window.matchMedia('(max-width: 700px)').matches ? 170 : 200;
+    // Mobile / single-column layout: host has no row constraint, so use a
+    // fixed pixel height. The host grows naturally to fit canvas + legend.
+    if (window.matchMedia('(max-width: 1080px)').matches) {
+      return window.matchMedia('(max-width: 700px)').matches ? 160 : 180;
+    }
+    // Desktop new layout: the chart-host is placed in a fixed-height grid
+    // cell. Size the canvas to fill the host minus its padding and the
+    // legend that renders below. Clamp so a tiny container can't kill the
+    // axis labels.
+    const hostH = this.host.clientHeight;
+    if (hostH <= 0) return 140;
+    const cs = getComputedStyle(this.host);
+    const padTop = parseFloat(cs.paddingTop) || 0;
+    const padBot = parseFloat(cs.paddingBottom) || 0;
+    const legend = this.host.querySelector<HTMLElement>('.u-legend');
+    // 8px is the margin-top + dashed border-top spacing on the legend block.
+    const legendH = legend ? legend.offsetHeight + 8 : 36;
+    const avail = hostH - padTop - padBot - legendH;
+    return Math.max(110, Math.min(360, avail));
   }
 
   update(long: LongStats): void {

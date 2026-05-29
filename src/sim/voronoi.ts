@@ -20,32 +20,44 @@ export function buildVoronoi(
   let pts = generatePoints(n, mode, irregularity, rng);
 
   // Step 2: Mirror the n points 8 times for toroidal topology.
-  // Original points occupy indices [0..n); mirror k occupies [(k+1)*n..(k+2)*n).
+  // Originals occupy indices [0..n); each mirror copy is appended in order.
+  // origIdx[i] = the original cell index for mirrored point i, so adjacency
+  // extraction can map back without relying on `i % n` (which assumed the old
+  // contiguous layout). This indirection is also what makes future mirror
+  // pruning safe — emit fewer mirrors and origIdx still maps each one back.
   const OFFSETS: [number, number][] = [
     [-1, -1], [0, -1], [1, -1],
     [-1,  0],          [1,  0],
     [-1,  1], [0,  1], [1,  1],
   ];
-  const mirrored: DTPoint[] = [];
-  for (const p of pts) mirrored.push(p);
+  const mirrored: DTPoint[] = new Array(n);
+  const origIdx = new Int32Array(n * 9);
+  for (let i = 0; i < n; i++) { mirrored[i] = pts[i]; origIdx[i] = i; }
+  let mIdx = n;
   for (const [dx, dy] of OFFSETS) {
-    for (const p of pts) mirrored.push({ x: p.x + dx, y: p.y + dy });
+    for (let i = 0; i < n; i++) {
+      mirrored.push({ x: pts[i].x + dx, y: pts[i].y + dy });
+      origIdx[mIdx++] = i;
+    }
   }
 
-  // Step 3: Delaunay triangulation on 9n points.
+  // Step 3: Delaunay triangulation on (n + retained mirrors).
   const tris = triangulate(mirrored);
 
   // Step 4: Extract adjacency list (CSR) from toroidal edge set. Settlements
   // additionally encode local density into the contact graph (cities → hubs).
   const { adjOffsets, adjList } = mode === 'settlements'
-    ? buildSettlementAdjacency(n, pts, tris)
-    : buildAdjacency(n, pts, tris);
+    ? buildSettlementAdjacency(n, pts, tris, origIdx)
+    : buildAdjacency(n, pts, tris, origIdx);
 
-  // Step 5: (Optional) Voronoi polygon vertices from circumcenters.
+  // Step 5: (Optional) Voronoi polygon vertices from circumcenters. The
+  // worker now passes withPolygons=false and the renderer uses centroids only,
+  // so this branch is currently dead in practice but kept for future renderers
+  // that need cell outlines.
   let polyOffsets: Int32Array | null = null;
   let polyVerts: Float32Array | null = null;
   if (withPolygons) {
-    ({ polyOffsets, polyVerts } = buildPolygons(n, pts, tris, mirrored));
+    ({ polyOffsets, polyVerts } = buildPolygons(n, pts, tris, mirrored, origIdx));
   }
 
   const cx = new Float32Array(n);
@@ -220,6 +232,7 @@ function buildAdjacency(
   n: number,
   pts: DTPoint[],
   tris: DTTriangle[],
+  origIdx: Int32Array,
 ): { adjOffsets: Int32Array; adjList: Int32Array } {
   // Collect unique neighbor pairs for the original n cells.
   const sets: Set<number>[] = Array.from({ length: n }, () => new Set<number>());
@@ -227,7 +240,7 @@ function buildAdjacency(
   for (const t of tris) {
     const edges: [number, number][] = [[t.a, t.b], [t.b, t.c], [t.c, t.a]];
     for (const [u, v] of edges) {
-      const ui = u % n, vi = v % n;
+      const ui = origIdx[u], vi = origIdx[v];
       if (ui === vi) continue; // same original cell (different mirror copies)
       // Both endpoints must map to valid original cells.
       // Check toroidal distance to filter spurious long mirror edges.
@@ -268,8 +281,9 @@ function buildSettlementAdjacency(
   n: number,
   pts: DTPoint[],
   tris: DTTriangle[],
+  origIdx: Int32Array,
 ): { adjOffsets: Int32Array; adjList: Int32Array } {
-  const base = buildAdjacency(n, pts, tris);
+  const base = buildAdjacency(n, pts, tris, origIdx);
   const r = SETTLE_RADIUS_C / Math.sqrt(n);
   const r2 = r * r;
 
@@ -359,6 +373,7 @@ function buildPolygons(
   pts: DTPoint[],
   tris: DTTriangle[],
   mirrored: DTPoint[],
+  origIdx: Int32Array,
 ): { polyOffsets: Int32Array; polyVerts: Float32Array } {
   // For each original cell, collect circumcenters of incident triangles.
   // A triangle is "incident" to original cell i if any of its vertices maps to i.
@@ -369,7 +384,7 @@ function buildPolygons(
     // Only include circumcenters that are reasonably close to [0,1] space.
     if (cc.x < -0.5 || cc.x > 1.5 || cc.y < -0.5 || cc.y > 1.5) continue;
     const { a, b, c } = t;
-    const ia = a % n, ib = b % n, ic = c % n;
+    const ia = origIdx[a], ib = origIdx[b], ic = origIdx[c];
     for (const i of new Set([ia, ib, ic])) {
       ccBuckets[i].push(cc);
     }

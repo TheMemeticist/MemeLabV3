@@ -19,6 +19,15 @@ export class StrainPool {
     return this.list[id] ?? this.list[0];
   }
 
+  /** Replace strain 0's genome in place. Used by Engine.patchConfig so a slider
+   *  drag updates the running base strain without resetting the population.
+   *  Mutant children keep their drifted genes — editing the base shouldn't
+   *  retroactively rewrite the strain tree. */
+  updateBaseStrain(genes: StrainGenes): void {
+    const cur = this.list[0];
+    this.list[0] = { id: 0, parentId: null, birthTick: cur.birthTick, ...sanitize(genes) };
+  }
+
   count(): number {
     return this.list.length;
   }
