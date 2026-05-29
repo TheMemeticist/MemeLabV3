@@ -35,7 +35,7 @@ export class Onboarding {
         <li><strong>Pick a disease</strong> — top-right panel. Click the disease name to browse presets.</li>
         <li><strong>Tune defenses</strong> — left panel. Adjust mask + vaccine uptake and effectiveness.</li>
         <li><strong>Press <kbd>Space</kbd></strong> to play, <kbd>→</kbd> to step a day, <kbd>R</kbd> to reset.</li>
-        <li><strong>Share</strong> — Permalink button copies a deterministic URL anyone can replay.</li>
+        <li><strong>Share</strong> — the Share button copies a deterministic URL (and a QR code) anyone can replay.</li>
       </ol>
       <div class="onboard-actions">
         <button class="btn btn-primary" data-cta="hanta">Run a Bundibugyo Ebola outbreak →</button>

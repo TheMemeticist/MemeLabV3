@@ -1,5 +1,5 @@
 import type { CostConfig, FrameMessage, InterventionEvent, InterventionKey, SimConfig, TopologyMessage, WorkerCommand } from '../types';
-import { findPreset, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
+import { findPreset, baseSimConfig, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
 import { Petri } from './Petri';
 import { Chart, type ChartView, type CostChartData } from './Chart';
 import { Stats } from './Stats';
@@ -7,6 +7,7 @@ import { ControlPanel } from './ControlPanel';
 import { Onboarding } from './Onboarding';
 import { AboutModal } from './AboutModal';
 import { CostModal } from './CostModal';
+import { ShareMenu } from './ShareMenu';
 import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
 import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
@@ -31,7 +32,8 @@ export class App {
   private speedBtn!: HTMLButtonElement;
   private mutateBtn!: HTMLButtonElement;
   private themeBtn!: HTMLButtonElement;
-  private permalinkBtn!: HTMLButtonElement;
+  private shareBtn!: HTMLButtonElement;
+  private shareMenu!: ShareMenu;
   private exportBtn!: HTMLButtonElement;
   private aboutBtn!: HTMLButtonElement;
   private about = new AboutModal();
@@ -75,7 +77,7 @@ export class App {
       if (applied.presetId) initialPresetId = applied.presetId;
       if (applied.speed != null) this.speedIdx = clampInt(applied.speed, 0, SPEEDS.length - 1);
       if (applied.theme === 'lab' || applied.theme === 'petri') this.theme = applied.theme;
-      const nameRaw = fromUrl.get('name');
+      const nameRaw = fromUrl.get('n');
       if (nameRaw) initialCustomName = decodeURIComponent(nameRaw);
     } else if (fromLs) {
       initialConfig = fromLs.config;
@@ -206,8 +208,8 @@ export class App {
           <button class="btn ghost" data-act="cost" data-tip="Edit the economic cost model — region, currency, severity, unit costs, hospital capacity.">
             <span class="btn-icon">💲</span>Cost model
           </button>
-          <button class="btn" data-act="permalink" data-tip="Copy permalink — encodes the full state in the URL so anyone can replay this exact run.">
-            <span class="btn-icon">🔗</span>Permalink
+          <button class="btn" data-act="share" data-tip="Share this run — copies the permalink and opens a QR code. The link encodes the full state so anyone can replay it exactly.">
+            <span class="btn-icon">🔗</span>Share
           </button>
           <button class="btn" data-act="export" data-tip="Download PNG snapshot, CSV stats, and JSON config.">
             <span class="btn-icon">⤓</span>Export
@@ -319,11 +321,15 @@ export class App {
     this.mutateBtn = this.toolbarBtns['mutate'];
 
     // Topbar buttons
-    this.permalinkBtn = this.root.querySelector('[data-act="permalink"]') as HTMLButtonElement;
+    this.shareBtn = this.root.querySelector('[data-act="share"]') as HTMLButtonElement;
     this.exportBtn = this.root.querySelector('[data-act="export"]') as HTMLButtonElement;
     this.themeBtn = this.root.querySelector('[data-act="theme"]') as HTMLButtonElement;
     this.aboutBtn = this.root.querySelector('[data-act="about"]') as HTMLButtonElement;
-    this.permalinkBtn.addEventListener('click', () => this.copyPermalink());
+    this.shareMenu = new ShareMenu(this.shareBtn, {
+      getUrl: () => this.permalinkUrl(),
+      toast: (msg) => this.toast(msg),
+    });
+    this.shareBtn.addEventListener('click', () => this.shareMenu.toggle());
     this.exportBtn.addEventListener('click', () => this.exportRun());
     this.themeBtn.addEventListener('click', () => this.toggleTheme());
     this.aboutBtn.addEventListener('click', () => this.about.open());
@@ -345,40 +351,10 @@ export class App {
   }
 
   private defaultConfig(): { config: SimConfig; presetId: string } {
-    const preset = findPreset(DEFAULT_PRESET_ID);
-    return {
-      config: {
-        seed: 0xC0FFEE,
-        // Smallest grid by default (8×8 = 64 cells). User can scale up.
-        size: 8,
-        geometry: 'square',
-        voronoiConfig: { mode: 'jittered', irregularity: 0.5 },
-        seedInfections: 0,
-        birthRate: 0,
-        mutate: false,
-        reseedOnExtinction: false,
-        strain: { ...preset.genes },
-        defenses: [
-          { id: 'mask', label: 'Mask', enabled: false, protection: 0.20, sourceControl: 0.81, mortalityReduction: 0.0, uptake: 0.5 },
-          { id: 'vaccine', label: 'Vaccine', enabled: false, protection: 0.80, sourceControl: 0.0, mortalityReduction: 0.80, uptake: 0.12 },
-        ],
-        lockdown: {
-          enabled: false,
-          mobilityReduction: 0.5,
-          transmissionReduction: 0.3,
-          compliance: 0.7,
-        },
-        quarantine: {
-          enabled: false,
-          detectionRate: 0.7,
-          contactsRange: 1,
-          protection: 0.4,
-          sourceControl: 0.4,
-          duration: 14,
-        },
-      },
-      presetId: preset.id,
-    };
+    // Smallest grid by default (8×8 = 64 cells); user can scale up. The full
+    // baseline lives in baseSimConfig() so the permalink codec can diff against
+    // the exact same defaults.
+    return { config: baseSimConfig(DEFAULT_PRESET_ID), presetId: DEFAULT_PRESET_ID };
   }
 
   // ---- worker comms ----
@@ -798,7 +774,7 @@ export class App {
     const presetCost = costConfigFromProfile(findPreset(applied.presetId ?? this.controls.currentPresetId()).cost);
     this.costConfig = decodeCostConfig(decoded, presetCost);
     this.costModal.setConfig(this.costConfig);
-    const nameParam = decoded.get('name');
+    const nameParam = decoded.get('n');
     this.controls.setCustomName(nameParam ? decodeURIComponent(nameParam) : null);
     if (applied.theme === 'lab' || applied.theme === 'petri') {
       this.theme = applied.theme;
@@ -818,7 +794,9 @@ export class App {
     }
   }
 
-  private copyPermalink(): void {
+  /** Build the permalink for the current state and reflect it in the address
+   *  bar. Called by the Share menu, which handles clipboard + QR rendering. */
+  private permalinkUrl(): string {
     const url = location.origin + location.pathname + encodeUrl({
       config: this.controls.config(),
       theme: this.theme,
@@ -827,15 +805,8 @@ export class App {
       customName: this.controls.getCustomName(),
       costConfig: this.costConfig,
     });
-    navigator.clipboard.writeText(url).then(
-      () => this.toast('Permalink copied. State encoded in URL.'),
-      () => {
-        // Fallback: show in URL bar.
-        history.replaceState(null, '', url);
-        this.toast('Permalink set in address bar.');
-      },
-    );
     history.replaceState(null, '', url);
+    return url;
   }
 
   private exportRun(): void {

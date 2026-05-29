@@ -1,4 +1,4 @@
-import type { PathogenCostProfile, StrainGenes } from '../types';
+import type { PathogenCostProfile, StrainGenes, SimConfig } from '../types';
 import { DEFAULT_COST_PROFILE } from '../lib/cost';
 
 export interface DiseasePreset {
@@ -148,4 +148,32 @@ export const DEFAULT_PRESET_ID = 'bdbv';
 
 export function findPreset(id: string): DiseasePreset {
   return PRESETS.find((p) => p.id === id) ?? PRESETS.find((p) => p.id === DEFAULT_PRESET_ID)!;
+}
+
+/** The canonical "factory default" config for a disease preset. A preset only
+ *  carries strain genes + a cost profile; every other field (grid, defenses,
+ *  lockdown, quarantine, …) is an app-level default. This is the single source
+ *  of truth for those defaults — shared by the initial load and by the
+ *  permalink codec, which diffs against it so a shared URL only needs to carry
+ *  the fields that differ from this baseline. Keep it in lockstep with the two
+ *  consumers: changing a default here changes what every permalink omits. */
+export function baseSimConfig(presetId: string): SimConfig {
+  const preset = findPreset(presetId);
+  return {
+    seed: 0xC0FFEE,
+    size: 8,
+    geometry: 'square',
+    voronoiConfig: { mode: 'jittered', irregularity: 0.5 },
+    seedInfections: 0,
+    birthRate: 0,
+    mutate: false,
+    reseedOnExtinction: false,
+    strain: { ...preset.genes },
+    defenses: [
+      { id: 'mask', label: 'Mask', enabled: false, protection: 0.20, sourceControl: 0.81, mortalityReduction: 0.0, uptake: 0.5 },
+      { id: 'vaccine', label: 'Vaccine', enabled: false, protection: 0.80, sourceControl: 0.0, mortalityReduction: 0.80, uptake: 0.12 },
+    ],
+    lockdown: { enabled: false, mobilityReduction: 0.5, transmissionReduction: 0.3, compliance: 0.7 },
+    quarantine: { enabled: false, detectionRate: 0.7, contactsRange: 1, protection: 0.4, sourceControl: 0.4, duration: 14 },
+  };
 }

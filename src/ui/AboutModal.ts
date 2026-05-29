@@ -70,7 +70,7 @@ const CONTENT = `
   <section>
     <h3>Reproducibility</h3>
     <p>
-      Every run is fully deterministic from its <code>seed</code>. The <strong>Permalink</strong> button copies a URL that encodes the seed, grid size, disease genes, defenses, theme, and speed in plain query-string form — share it and the recipient sees byte-identical state. Edit any value in the URL directly to fork a scenario.
+      Every run is fully deterministic from its <code>seed</code>. The <strong>Share</strong> button copies a URL — and shows a scannable QR code — that encodes the seed, grid size, disease genes, defenses, theme, and speed in plain query-string form. Share it and the recipient sees byte-identical state. Edit any value in the URL directly to fork a scenario.
     </p>
   </section>
 
