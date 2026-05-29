@@ -17,6 +17,9 @@ const MARKER_LABELS: Record<string, string> = {
 };
 
 export type ChartView = 'compartments' | 'reff' | 'costs';
+// Compartments view can plot current counts ("active") or cumulative arrivals
+// ("total") — e.g. total infected ever vs currently infected.
+export type CompartmentMode = 'active' | 'total';
 
 // Cumulative cost categories (USD, currency-converted by the caller). Order
 // matches the data columns built in setCostSeries.
@@ -35,6 +38,8 @@ export interface CostChartData {
   tick: number[];
   // Column-aligned with COST_LABELS (Total last).
   columns: number[][];
+  // Currency symbol for the legend value formatter (already-converted columns).
+  symbol?: string;
 }
 
 export class Chart {
@@ -49,8 +54,11 @@ export class Chart {
   private mouseHandler: ((ev: MouseEvent) => void) | null = null;
   private leaveHandler: (() => void) | null = null;
   private view: ChartView = 'compartments';
+  private mode: CompartmentMode = 'active';
   private lastLong: LongStats | null = null;
   private costData: CostChartData | null = null;
+  private costSymbol = '$';
+  private expanded = false;
 
   constructor(host: HTMLElement) {
     this.host = host;
@@ -79,18 +87,7 @@ export class Chart {
     this.view = view;
     // Tear down the existing plot — series list changes between views, and
     // uPlot doesn't support live series-list mutation. Next update() rebuilds.
-    if (this.plot) {
-      this.plot.destroy();
-      this.plot = null;
-      this.lastW = 0;
-      this.lastH = 0;
-      if (this.mouseHandler) this.host.removeEventListener('mousemove', this.mouseHandler);
-      if (this.leaveHandler) this.host.removeEventListener('mouseleave', this.leaveHandler);
-      this.mouseHandler = null;
-      this.leaveHandler = null;
-      this.markerTip?.remove();
-      this.markerTip = null;
-    }
+    this.destroyPlot();
     if (this.lastLong) this.update(this.lastLong);
   }
 
@@ -98,15 +95,95 @@ export class Chart {
     return this.view;
   }
 
+  // Switch the compartments view between current ("active") and cumulative
+  // ("total") counts. Labels/series are identical between modes — only the
+  // underlying columns differ — so just re-push data (no rebuild flash, and it
+  // preserves any series the user has toggled off via the legend).
+  setMode(mode: CompartmentMode): void {
+    if (this.mode === mode) return;
+    this.mode = mode;
+    if (this.view !== 'compartments' || !this.plot || !this.lastLong) return;
+    this.plot.setData(this.buildData(this.lastLong));
+    // Only the Infectious series is renamed between modes; update it in place
+    // (uPlot doesn't re-render legend labels on setData).
+    this.setSeriesLabel(3, this.infectiousLabel());
+  }
+
+  // "Infectious" (current count) vs "Infections" (cumulative, Total mode).
+  private infectiousLabel(): string {
+    return this.mode === 'total' ? 'Infections' : 'Infectious';
+  }
+
+  // Rename a series in place and update its legend chip text without a rebuild
+  // (keeps the injected toggle dot and the user's show/hide state intact).
+  private setSeriesLabel(seriesIdx: number, text: string): void {
+    if (!this.plot) return;
+    (this.plot.series[seriesIdx] as { label?: string }).label = text;
+    const row = this.host.querySelectorAll('.u-legend .u-series')[seriesIdx];
+    const th = row?.querySelector('th');
+    if (!th) return;
+    const textNodes = Array.from(th.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE);
+    const last = textNodes[textNodes.length - 1];
+    if (last) last.nodeValue = text;
+    else th.appendChild(document.createTextNode(text));
+  }
+
+  getMode(): CompartmentMode {
+    return this.mode;
+  }
+
+  // App moves the whole chart-wrap into/out of a fullscreen modal; we only need
+  // to know so canvasHeight() can size the canvas large, then relayout.
+  setExpanded(on: boolean): void {
+    if (this.expanded === on) return;
+    this.expanded = on;
+    // Force a resize even if the cached dims happen to match.
+    this.lastW = 0;
+    this.lastH = 0;
+    this.relayout();
+  }
+
+  // Tear down the uPlot instance + its event listeners and reset size cache.
+  // Shared by view/mode switches and the empty-state path.
+  private destroyPlot(): void {
+    if (!this.plot) return;
+    this.plot.destroy();
+    this.plot = null;
+    this.lastW = 0;
+    this.lastH = 0;
+    if (this.mouseHandler) this.host.removeEventListener('mousemove', this.mouseHandler);
+    if (this.leaveHandler) this.host.removeEventListener('mouseleave', this.leaveHandler);
+    this.mouseHandler = null;
+    this.leaveHandler = null;
+    this.markerTip?.remove();
+    this.markerTip = null;
+  }
+
   // App computes the (currency-converted) cumulative cost series and hands it in.
   // When the cost view is active, the next update() repaints from this data.
   setCostData(data: CostChartData): void {
     this.costData = data;
+    if (data.symbol) this.costSymbol = data.symbol;
     // Repaint live only if the cost view is already mounted; otherwise the next
     // update()/setView() builds it. buildData ignores `long` in the cost view.
     if (this.view === 'costs' && this.plot && this.lastLong && data.tick.length > 0) {
       this.plot.setData(this.buildData(this.lastLong));
     }
+  }
+
+  // Compact currency formatter for the cost legend (values are pre-converted to
+  // the display currency): $9,999 → "$9,999", "$12.3k", "$1.2M", "$3.4B", "$1.2T".
+  // Falls back to the latest point when idle so the legend isn't blank at rest.
+  private fmtMoneyVal(u: uPlot, raw: number | null, seriesIdx: number): string {
+    const v = idleValue(u, raw, seriesIdx);
+    if (v == null) return '--';
+    const s = this.costSymbol;
+    const a = Math.abs(v);
+    if (a >= 1e12) return s + (v / 1e12).toFixed(a >= 1e13 ? 0 : 1) + 'T';
+    if (a >= 1e9) return s + (v / 1e9).toFixed(a >= 1e10 ? 0 : 1) + 'B';
+    if (a >= 1e6) return s + (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M';
+    if (a >= 1e3) return s + (v / 1e3).toFixed(a >= 1e4 ? 0 : 1) + 'k';
+    return s + Math.round(v).toLocaleString();
   }
 
   private relayout(): void {
@@ -120,25 +197,24 @@ export class Chart {
   }
 
   private canvasHeight(): number {
+    // Expanded modal: fill most of the viewport height minus the modal title
+    // bar and the legend below the canvas.
+    if (this.expanded) {
+      const legend = this.host.querySelector<HTMLElement>('.u-legend');
+      const legendH = legend ? legend.offsetHeight + 12 : 48;
+      const avail = Math.round(window.innerHeight * 0.84) - 64 - legendH;
+      return Math.max(240, Math.min(920, avail));
+    }
     // Mobile / single-column layout: host has no row constraint, so use a
     // fixed pixel height. The host grows naturally to fit canvas + legend.
     if (window.matchMedia('(max-width: 1080px)').matches) {
       return window.matchMedia('(max-width: 700px)').matches ? 160 : 180;
     }
-    // Desktop new layout: the chart-host is placed in a fixed-height grid
-    // cell. Size the canvas to fill the host minus its padding and the
-    // legend that renders below. Clamp so a tiny container can't kill the
-    // axis labels.
-    const hostH = this.host.clientHeight;
-    if (hostH <= 0) return 140;
-    const cs = getComputedStyle(this.host);
-    const padTop = parseFloat(cs.paddingTop) || 0;
-    const padBot = parseFloat(cs.paddingBottom) || 0;
-    const legend = this.host.querySelector<HTMLElement>('.u-legend');
-    // 8px is the margin-top + dashed border-top spacing on the legend block.
-    const legendH = legend ? legend.offsetHeight + 8 : 36;
-    const avail = hostH - padTop - padBot - legendH;
-    return Math.max(110, Math.min(360, avail));
+    // Desktop overlay card: the card height is auto (it grows to fit the
+    // canvas + however many rows the legend wraps to), so a fixed canvas
+    // height is used rather than deriving from the container — deriving would
+    // be circular. The Expand button gives a larger view on demand.
+    return 188;
   }
 
   update(long: LongStats): void {
@@ -149,18 +225,7 @@ export class Chart {
     if (empty) {
       // Tear down any existing plot before wiping the DOM, otherwise the next
       // non-empty update would call setData() on a detached uPlot instance.
-      if (this.plot) {
-        this.plot.destroy();
-        this.plot = null;
-        this.lastW = 0;
-        this.lastH = 0;
-        if (this.mouseHandler) this.host.removeEventListener('mousemove', this.mouseHandler);
-        if (this.leaveHandler) this.host.removeEventListener('mouseleave', this.leaveHandler);
-        this.mouseHandler = null;
-        this.leaveHandler = null;
-        this.markerTip?.remove();
-        this.markerTip = null;
-      }
+      this.destroyPlot();
       this.host.innerHTML = '<div class="chart-empty">Waiting for first tick…</div>';
       return;
     }
@@ -174,7 +239,7 @@ export class Chart {
       const series: uPlot.Series[] = this.view === 'reff'
         ? [
             { label: 'Day' },
-            { label: 'R_eff', stroke: rgbCss('--accent') || '#3b82f6', width: 1.8 },
+            { label: 'R_eff', stroke: rgbCss('--accent') || '#3b82f6', width: 1.8, value: fmtReffVal },
           ]
         : this.view === 'costs'
         ? [
@@ -188,19 +253,23 @@ export class Chart {
                 stroke: isTotal ? (rgbCss('--accent') || '#888') : COST_COLORS[k],
                 width: isTotal ? 2.2 : 1.4,
                 show: isTotal || label === 'Medical' || label === 'Deaths',
+                value: (u: uPlot, v: number | null, si: number) => this.fmtMoneyVal(u, v, si),
               } as uPlot.Series;
             }),
           ]
         : [
             { label: 'Day' },
+            // Same labels/colors in both Active and Total mode — the toolbar
+            // toggle communicates which; only the underlying data differs
+            // (current counts vs cumulative arrivals; see buildData).
             // Default-hide Susceptible / Exposed / Recovered — S typically
             // dwarfs everything else and crushes the y-axis. The user can
             // toggle them back on via the legend.
-            { label: 'Susceptible', stroke: rgbCss('--cell-s'), width: 1.4, show: false },
-            { label: 'Exposed', stroke: rgbCss('--cell-e'), width: 1.4, show: false },
-            { label: 'Infectious', stroke: rgbCss('--cell-i'), width: 1.8 },
-            { label: 'Recovered', stroke: rgbCss('--cell-r'), width: 1.4, show: false },
-            { label: 'Dead', stroke: cssVar('--chart-dead'), width: 1.6 },
+            { label: 'Susceptible', stroke: rgbCss('--cell-s'), width: 1.4, show: false, value: fmtCountVal },
+            { label: 'Exposed', stroke: rgbCss('--cell-e'), width: 1.4, show: false, value: fmtCountVal },
+            { label: this.infectiousLabel(), stroke: rgbCss('--cell-i'), width: 1.8, value: fmtCountVal },
+            { label: 'Recovered', stroke: rgbCss('--cell-r'), width: 1.4, show: false, value: fmtCountVal },
+            { label: 'Dead', stroke: cssVar('--chart-dead'), width: 1.6, value: fmtCountVal },
           ];
       const isReff = this.view === 'reff';
       const opts: uPlot.Options = {
@@ -262,6 +331,18 @@ export class Chart {
       return [
         Float64Array.from(long.tick),
         Float64Array.from(long.reff),
+      ];
+    }
+    if (this.mode === 'total') {
+      // Susceptible stays current (no meaningful cumulative); E/I/R/D become
+      // cumulative arrivals so the lines read as totals.
+      return [
+        Float64Array.from(long.tick),
+        Float64Array.from(long.s),
+        Float64Array.from(long.ecum),
+        Float64Array.from(long.icum),
+        Float64Array.from(long.rcum),
+        Float64Array.from(long.dcum),
       ];
     }
     return [
@@ -467,6 +548,38 @@ export class Chart {
     this.markerTip?.remove();
     this.markerTip = null;
   }
+}
+
+// When the cursor isn't over the chart uPlot hands the legend a null value, so
+// fall back to the series' latest data point — the legend then shows the
+// *current* value at rest and the hovered value while tracking.
+function idleValue(u: uPlot, raw: number | null, seriesIdx: number): number | null {
+  if (raw != null && Number.isFinite(raw)) return raw;
+  const col = u.data[seriesIdx] as ReadonlyArray<number | null> | undefined;
+  if (!col) return null;
+  for (let k = col.length - 1; k >= 0; k--) {
+    const c = col[k];
+    if (c != null && Number.isFinite(c)) return c;
+  }
+  return null;
+}
+
+// Compact legend value formatter so large counts (esp. cumulative Total-mode
+// numbers) don't overflow the fixed-width legend value column: 9,999 →
+// "9,999", 12.3k, 123k, 1.2M.
+function fmtCountVal(u: uPlot, raw: number | null, seriesIdx: number): string {
+  const v = idleValue(u, raw, seriesIdx);
+  if (v == null) return '--';
+  const a = Math.abs(v);
+  if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M';
+  if (a >= 1e4) return (v / 1e3).toFixed(a >= 1e5 ? 0 : 1) + 'k';
+  return Math.round(v).toLocaleString();
+}
+
+// R_eff legend value: latest at rest, hovered while tracking.
+function fmtReffVal(u: uPlot, raw: number | null, seriesIdx: number): string {
+  const v = idleValue(u, raw, seriesIdx);
+  return v == null ? '--' : v.toFixed(2);
 }
 
 function rgbCss(varName: string): string {

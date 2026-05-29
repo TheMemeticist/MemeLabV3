@@ -28,6 +28,10 @@ function longFrom(parts: Partial<Record<keyof LongStats, number[]>>): LongStats 
     vaccinated: parts.vaccinated ?? zeros(),
     quarantined: parts.quarantined ?? zeros(),
     lockdownStringency: parts.lockdownStringency ?? zeros(),
+    ecum: parts.ecum ?? zeros(),
+    icum: parts.icum ?? zeros(),
+    rcum: parts.rcum ?? zeros(),
+    dcum: parts.dcum ?? zeros(),
   };
 }
 

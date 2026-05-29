@@ -501,3 +501,35 @@ function countMaskBit(defenses: Uint8Array): number {
   for (let i = 0; i < defenses.length; i++) if (defenses[i] & 1) n++;
   return n;
 }
+
+describe('cumulative compartment counters (Total view)', () => {
+  it('records monotonic cumulative arrivals that bound the current counts', () => {
+    // Non-zero IFR + finite immunity so deaths, recoveries, and waning all fire.
+    const cfg = baseConfig({
+      seedInfections: 0.05,
+      birthRate: 0.02,
+      strain: { attackRate: 0.6, incubation: 2, infectious: 4, ifr: 0.2, range: 1, immunityDays: 120, mutationRate: 0 },
+    });
+    const engine = new Engine(cfg);
+    for (let t = 0; t < 120; t++) engine.step();
+    const L = engine.longStats;
+    const last = L.tick.length - 1;
+
+    // Monotonic non-decreasing.
+    for (let k = 1; k <= last; k++) {
+      expect(L.ecum[k]).toBeGreaterThanOrEqual(L.ecum[k - 1]);
+      expect(L.icum[k]).toBeGreaterThanOrEqual(L.icum[k - 1]);
+      expect(L.rcum[k]).toBeGreaterThanOrEqual(L.rcum[k - 1]);
+      expect(L.dcum[k]).toBeGreaterThanOrEqual(L.dcum[k - 1]);
+    }
+    // Cumulative arrivals always bound the current occupancy of that state.
+    for (let k = 0; k <= last; k++) {
+      expect(L.ecum[k]).toBeGreaterThanOrEqual(L.e[k]);
+      expect(L.icum[k]).toBeGreaterThanOrEqual(L.i[k]);
+      expect(L.dcum[k]).toBeGreaterThanOrEqual(L.d[k]);
+    }
+    // With deaths occurring, total infected exceeds what's currently active.
+    expect(L.dcum[last]).toBeGreaterThan(0);
+    expect(L.ecum[last]).toBeGreaterThan(L.e[last] + L.i[last]);
+  });
+});

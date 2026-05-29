@@ -47,6 +47,10 @@ export class App {
   private epidemicEnded = false;
   private endedBanner: HTMLElement | null = null;
   private chartView: ChartView = 'compartments';
+  private chartExpanded = false;
+  private chartModal: HTMLElement | null = null;
+  private chartWrapHome: HTMLElement | null = null;
+  private chartEscHandler: ((e: KeyboardEvent) => void) | null = null;
 
 
   constructor(root: HTMLElement) {
@@ -233,11 +237,16 @@ export class App {
           <div class="ended-banner" data-section="ended-banner" hidden></div>
           <div class="stats-row" data-section="stats"></div>
           <div class="petri-area" data-section="petri"></div>
-          <div class="chart-wrap">
+          <div class="chart-wrap" data-section="chart-wrap">
             <div class="chart-tabs" role="tablist" aria-label="Chart view">
               <button class="chart-tab" role="tab" data-view="compartments" aria-selected="true">Compartments</button>
               <button class="chart-tab" role="tab" data-view="reff" aria-selected="false">R<sub>eff</sub></button>
               <button class="chart-tab" role="tab" data-view="costs" aria-selected="false">Costs</button>
+              <div class="chart-mode" role="group" aria-label="Count mode">
+                <button class="chart-mode-btn active" data-mode="active" title="Currently in each state">Active</button>
+                <button class="chart-mode-btn" data-mode="total" title="Cumulative totals (e.g. total ever infected)">Total</button>
+              </div>
+              <button class="chart-expand" data-act="expand-chart" type="button" title="Expand chart" aria-label="Expand chart" aria-pressed="false">⤢</button>
             </div>
             <div class="chart-area" data-section="chart"></div>
           </div>
@@ -272,6 +281,23 @@ export class App {
         this.setChartView(view);
       });
     });
+
+    // Active / Total count-mode toggle (compartments view only). Query the
+    // document, not this.root, when restyling: the buttons move out to the
+    // modal (document.body) in expanded mode, so root-scoped queries miss them.
+    this.root.querySelectorAll<HTMLButtonElement>('.chart-mode-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const mode = btn.dataset['mode'] === 'total' ? 'total' : 'active';
+        this.chart.setMode(mode);
+        document.querySelectorAll<HTMLButtonElement>('.chart-mode-btn').forEach((b) => {
+          b.classList.toggle('active', b.dataset['mode'] === mode);
+        });
+      });
+    });
+
+    // Expand-chart button → fullscreen modal.
+    const expandBtn = this.root.querySelector<HTMLButtonElement>('[data-act="expand-chart"]');
+    expandBtn?.addEventListener('click', () => this.toggleChartExpand());
 
     this.controls = new ControlPanel(this.defaultConfig().config, DEFAULT_PRESET_ID, {
       onConfigChange: () => this.onConfigChange(),
@@ -402,6 +428,7 @@ export class App {
     this.stats.setCost(formatMoney(ledger.grandTotal, cur, rate), ledger.grandTotal);
     const data: CostChartData = {
       tick: series.tick,
+      symbol: cur.symbol,
       columns: [
         series.medical.map((v) => v * rate),
         series.deaths.map((v) => v * rate),
@@ -479,6 +506,18 @@ export class App {
       <button class="btn ended-reset" type="button">Reset</button>
     `;
     this.endedBanner.hidden = false;
+    // Desktop: claim a real top row instead of overlaying. Add the class, then
+    // measure the rendered banner height (next frame, after layout) and expose
+    // it as --ended-h so the petri + overlay cards shift down by exactly that.
+    const center = this.endedBanner.parentElement;
+    if (center) {
+      center.classList.add('has-ended');
+      requestAnimationFrame(() => {
+        if (this.endedBanner && !this.endedBanner.hidden) {
+          center.style.setProperty('--ended-h', `${this.endedBanner.offsetHeight}px`);
+        }
+      });
+    }
     this.endedBanner.querySelector('.ended-reset')?.addEventListener(
       'click',
       () => this.handleReset(),
@@ -488,6 +527,11 @@ export class App {
 
   private hideEndedBanner(): void {
     if (this.endedBanner) {
+      const center = this.endedBanner.parentElement;
+      if (center) {
+        center.classList.remove('has-ended');
+        center.style.removeProperty('--ended-h');
+      }
       this.endedBanner.hidden = true;
       this.endedBanner.innerHTML = '';
     }
@@ -499,11 +543,73 @@ export class App {
     if (this.chartView === view) return;
     this.chartView = view;
     this.chart.setView(view);
-    this.root.querySelectorAll<HTMLButtonElement>('.chart-tab').forEach((b) => {
+    // Document-scoped: the tabs move into the modal when the chart is expanded.
+    document.querySelectorAll<HTMLButtonElement>('.chart-tab').forEach((b) => {
       const on = b.dataset['view'] === view;
       b.setAttribute('aria-selected', on ? 'true' : 'false');
       b.classList.toggle('active', on);
     });
+    // The Active/Total toggle only applies to the compartments view.
+    const modeGroup = document.querySelector<HTMLElement>('.chart-mode');
+    if (modeGroup) modeGroup.hidden = view !== 'compartments';
+  }
+
+  private toggleChartExpand(): void {
+    this.setChartExpanded(!this.chartExpanded);
+  }
+
+  private setChartExpanded(on: boolean): void {
+    if (on === this.chartExpanded) return;
+    // Query the document, not this.root: when expanded the chart-wrap lives in
+    // a modal appended to document.body, outside the app root subtree.
+    const wrap = document.querySelector<HTMLElement>('[data-section="chart-wrap"]');
+    if (!wrap) return;
+    this.chartExpanded = on;
+
+    if (on) {
+      this.chartWrapHome = wrap.parentElement;
+      const modal = document.createElement('div');
+      modal.className = 'chart-modal';
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      modal.setAttribute('aria-label', 'Expanded chart');
+      modal.addEventListener('click', (e) => { if (e.target === modal) this.setChartExpanded(false); });
+      const card = document.createElement('div');
+      card.className = 'chart-modal-card';
+      // Header bar with an explicit close button (plus Esc + backdrop click).
+      const bar = document.createElement('div');
+      bar.className = 'chart-modal-bar';
+      const title = document.createElement('span');
+      title.className = 'chart-modal-title';
+      title.textContent = 'Chart';
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'chart-modal-close';
+      close.setAttribute('aria-label', 'Close expanded chart');
+      close.textContent = '✕';
+      close.addEventListener('click', () => this.setChartExpanded(false));
+      bar.append(title, close);
+      card.append(bar, wrap); // move the live chart-wrap into the modal (uPlot intact)
+      modal.appendChild(card);
+      document.body.appendChild(modal);
+      this.chartModal = modal;
+      wrap.classList.add('chart-wrap--expanded');
+      this.chartEscHandler = (e: KeyboardEvent) => { if (e.key === 'Escape') this.setChartExpanded(false); };
+      window.addEventListener('keydown', this.chartEscHandler);
+      close.focus();
+    } else {
+      wrap.classList.remove('chart-wrap--expanded');
+      (this.chartWrapHome ?? this.root.querySelector('.center-panel'))?.appendChild(wrap);
+      this.chartModal?.remove();
+      this.chartModal = null;
+      if (this.chartEscHandler) window.removeEventListener('keydown', this.chartEscHandler);
+      this.chartEscHandler = null;
+    }
+    // The expand button rides inside the wrap, so it's reachable in both states.
+    const btn = wrap.querySelector<HTMLButtonElement>('[data-act="expand-chart"]');
+    btn?.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn?.setAttribute('title', on ? 'Collapse chart' : 'Expand chart');
+    this.chart.setExpanded(on);
   }
 
   // ---- handlers ----

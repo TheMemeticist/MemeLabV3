@@ -28,6 +28,13 @@ export class Engine {
   tick = 0;
   private newInfectionsHistory: number[] = [];
   private newInfectiousHistory: number[] = [];
+  // Monotonic cumulative-arrival counters (total infected / infectious /
+  // recovered / dead since reset). Pushed per-tick into longStats so the chart
+  // can show "Total" alongside "Active" (current) compartment counts.
+  private cumExposed = 0;
+  private cumInfectious = 0;
+  private cumRecovered = 0;
+  private cumDead = 0;
   longStats: LongStats = emptyLong();
   retiredCost: RetiredCostTotals = emptyRetired();
   rNaught: number | null = null;
@@ -69,6 +76,20 @@ export class Engine {
     this.tick = 0;
     this.newInfectionsHistory = [];
     this.newInfectiousHistory = [];
+    // Seed the cumulative-arrival counters from the initial population: the
+    // patient-zero / seedInfections cells are already infected, so they count
+    // toward "total infected" (otherwise the Total view would start below the
+    // current count).
+    let e0 = 0, i0 = 0;
+    const st0 = this.pop.state;
+    for (let k = 0; k < st0.length; k++) {
+      if (st0[k] === CellState.Exposed) e0++;
+      else if (st0[k] === CellState.Infectious) i0++;
+    }
+    this.cumExposed = e0 + i0;
+    this.cumInfectious = i0;
+    this.cumRecovered = 0;
+    this.cumDead = 0;
     this.longStats = emptyLong();
     this.retiredCost = emptyRetired();
     this.rNaught = this.estimateR0(config);
@@ -177,6 +198,7 @@ export class Engine {
     let newInfections = 0;
     let newInfectious = 0;
     let newDeaths = 0;
+    let newRecovered = 0;
 
     // Mean-field transmission: each susceptible is attacked by the aggregate
     // infectious pool. Effective contact count k mirrors the square range-1
@@ -264,6 +286,7 @@ export class Engine {
           } else {
             next[i] = CellState.Recovered;
             infectedAge[i] = 0;
+            newRecovered++;
           }
         }
       } else if (s === CellState.Recovered) {
@@ -280,7 +303,7 @@ export class Engine {
     pop.next = state;
     this.tick++;
 
-    return this.computeStats(newInfections, newInfectious, newDeaths);
+    return this.computeStats(newInfections, newInfectious, newDeaths, newRecovered);
   }
 
   private stepSpatial(): SimStats {
@@ -308,6 +331,7 @@ export class Engine {
     let newInfections = 0;
     let newInfectious = 0;
     let newDeaths = 0;
+    let newRecovered = 0;
 
     // 2) Transmission pass.
     for (let i = 0; i < n; i++) {
@@ -440,6 +464,7 @@ export class Engine {
           } else {
             next[i] = CellState.Recovered;
             infectedAge[i] = 0;
+            newRecovered++;
           }
         }
       } else if (s === CellState.Recovered) {
@@ -488,10 +513,10 @@ export class Engine {
       }
     }
 
-    return this.computeStats(newInfections, newInfectious, newDeaths);
+    return this.computeStats(newInfections, newInfectious, newDeaths, newRecovered);
   }
 
-  private computeStats(newInfections: number, newInfectious: number, newDeaths: number): SimStats {
+  private computeStats(newInfections: number, newInfectious: number, newDeaths: number, newRecovered: number): SimStats {
     const pop = this.pop;
     const { n } = pop;
     const cur = pop.state;
@@ -539,7 +564,13 @@ export class Engine {
       strains: this.strains.count(),
     };
 
-    pushLong(this.longStats, stats, { masked, vaccinated, quarantined: quar, lockdownStringency }, this.retiredCost);
+    this.cumExposed += newInfections;
+    this.cumInfectious += newInfectious;
+    this.cumRecovered += newRecovered;
+    this.cumDead += newDeaths;
+    const cum = { e: this.cumExposed, i: this.cumInfectious, r: this.cumRecovered, d: this.cumDead };
+
+    pushLong(this.longStats, stats, { masked, vaccinated, quarantined: quar, lockdownStringency }, cum, this.retiredCost);
     return stats;
   }
 
@@ -642,6 +673,7 @@ function emptyLong(): LongStats {
   return {
     tick: [], s: [], e: [], i: [], r: [], d: [], reff: [],
     dnew: [], masked: [], vaccinated: [], quarantined: [], lockdownStringency: [],
+    ecum: [], icum: [], rcum: [], dcum: [],
   };
 }
 
@@ -652,11 +684,18 @@ interface CostCounts {
   lockdownStringency: number;
 }
 
+interface CumCounts {
+  e: number;
+  i: number;
+  r: number;
+  d: number;
+}
+
 function emptyRetired(): RetiredCostTotals {
   return { ticks: 0, i: 0, dnew: 0, masked: 0, vaccinated: 0, quarantined: 0, lockdownStringency: 0 };
 }
 
-function pushLong(long: LongStats, stats: SimStats, costs: CostCounts, retired: RetiredCostTotals): void {
+function pushLong(long: LongStats, stats: SimStats, costs: CostCounts, cum: CumCounts, retired: RetiredCostTotals): void {
   long.tick.push(stats.tick);
   long.s.push(stats.s);
   long.e.push(stats.e);
@@ -669,6 +708,10 @@ function pushLong(long: LongStats, stats: SimStats, costs: CostCounts, retired: 
   long.vaccinated.push(costs.vaccinated);
   long.quarantined.push(costs.quarantined);
   long.lockdownStringency.push(costs.lockdownStringency);
+  long.ecum.push(cum.e);
+  long.icum.push(cum.i);
+  long.rcum.push(cum.r);
+  long.dcum.push(cum.d);
   if (long.tick.length > LONG_CAP) {
     // The oldest tick is aging out of the window. Fold its cost-relevant counts
     // into the retired aggregate first, so the cost layer keeps a true cumulative
@@ -684,5 +727,8 @@ function pushLong(long: LongStats, stats: SimStats, costs: CostCounts, retired: 
     long.i.shift(); long.r.shift(); long.d.shift(); long.reff.shift();
     long.dnew.shift(); long.masked.shift(); long.vaccinated.shift();
     long.quarantined.shift(); long.lockdownStringency.shift();
+    // Cumulative arrays hold absolute totals, so dropping the oldest entry is
+    // harmless — the remaining values stay correct (no retired base needed).
+    long.ecum.shift(); long.icum.shift(); long.rcum.shift(); long.dcum.shift();
   }
 }

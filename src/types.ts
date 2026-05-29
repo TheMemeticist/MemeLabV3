@@ -170,6 +170,15 @@ export interface LongStats {
   vaccinated: number[]; // living cells vaccinated (only while vaccine enabled)
   quarantined: number[]; // living cells currently isolated
   lockdownStringency: number[]; // mobilityReduction × compliance while enabled, else 0
+  // Cumulative arrivals into each compartment up to that tick (monotonic,
+  // absolute totals — survive the window shift correctly since they're not
+  // running sums of the window). Power the chart's "Total" (vs "Active") view:
+  // ecum = everyone who has ever been infected (cumulative incidence),
+  // dcum = total deaths ever (≠ current Dead count, which births can lower).
+  ecum: number[]; // cumulative new exposures (total infected)
+  icum: number[]; // cumulative E→I transitions (total ever-infectious)
+  rcum: number[]; // cumulative I→R recoveries (total ever-recovered)
+  dcum: number[]; // cumulative deaths
 }
 
 // ─── Economic cost model ──────────────────────────────────────────────────────

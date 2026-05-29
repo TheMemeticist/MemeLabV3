@@ -286,13 +286,15 @@ input[type='range']::-moz-range-thumb {
   inset: 0;
 }
 .center-panel > .ended-banner {
+  /* Desktop: own full-width row pinned to the top of the center column. The
+     petri + overlay cards are shifted down by the banner's height (see the
+     .has-ended rules in the desktop media block) so this reads as a real row
+     rather than a floating overlay. */
   position: absolute;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
+  top: 0;
+  left: 0;
+  right: 0;
   z-index: 6;
-  max-width: min(640px, calc(100% - 32px));
-  width: max-content;
 }
 .center-panel .ended-banner[hidden] { display: none; }
 /* Stats + chart overlays. They start at ~85% opacity so the dish reads
@@ -321,7 +323,17 @@ input[type='range']::-moz-range-thumb {
   transform: translateY(-1px);
 }
 .center-panel > .stats-row  { left: 4px;  width: 264px; height: 232px; }
-.center-panel > .chart-wrap { right: 4px; width: 360px; height: 220px; }
+/* Auto height so the card grows to fit however many rows the legend wraps to
+   (the canvas itself is a fixed height set by Chart.ts). Capped to the column
+   so it can't run off-screen; the Expand button is the escape hatch for a
+   bigger view. */
+.center-panel > .chart-wrap {
+  right: 4px;
+  width: 360px;
+  height: auto;
+  max-height: calc(100% - 8px);
+  overflow: hidden;
+}
 
 /* ==== Stats row ==== */
 
@@ -684,6 +696,19 @@ input[type='range']::-moz-range-thumb {
   .chart-host .u-legend th { height: 18px; padding: 0 8px; font-size: 10.5px; }
   .chart-host .u-legend .u-value { font-size: 10.5px; }
   .chart-host .u-legend { border-spacing: 3px 1px; }
+  /* Compact the controls row so the tabs + Active/Total toggle + Expand button
+     fit on a single line inside the 360px overlay card (it's not expanded). */
+  .center-panel > .chart-wrap .chart-tabs { gap: 3px; margin-bottom: 4px; }
+  .center-panel > .chart-wrap .chart-tab { padding: 4px 9px; font-size: 11px; }
+  .center-panel > .chart-wrap .chart-mode-btn { padding: 4px 8px; font-size: 10px; }
+  .center-panel > .chart-wrap .chart-expand { width: 26px; height: 26px; font-size: 14px; }
+
+  /* When the epidemic-ended banner is showing, reserve its height at the top of
+     the column and push the dish + overlay cards below it (--ended-h is set by
+     App after measuring the rendered banner). The dish re-fits via its observer. */
+  .center-panel.has-ended > .petri-area { top: var(--ended-h, 0px); }
+  .center-panel.has-ended > .stats-row,
+  .center-panel.has-ended > .chart-wrap { top: calc(var(--ended-h, 0px) + 4px); }
 }
 
 /* Legend layout stability: each series chip gets a fixed-width slot and the
@@ -715,6 +740,8 @@ input[type='range']::-moz-range-thumb {
   justify-content: flex-end;
   text-align: right;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
 }
 .chart-tabs {
   display: flex;
@@ -743,6 +770,136 @@ input[type='range']::-moz-range-thumb {
   border-color: var(--accent);
 }
 .chart-tab sub { font-size: 9px; }
+
+/* Active / Total segmented toggle (compartments view). */
+.chart-mode {
+  /* align-self:center so the control hugs its buttons instead of stretching to
+     the flex row's height — otherwise the active button's fill leaves a gap at
+     the top and bottom where the container background shows through. */
+  align-self: center;
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+  background: var(--bg-panel);
+}
+.chart-mode[hidden] { display: none; }
+.chart-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 5px 11px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease;
+}
+.chart-mode-btn + .chart-mode-btn { border-left: 1px solid var(--border); }
+.chart-mode-btn:hover { background: var(--accent-soft); color: var(--text); }
+.chart-mode-btn.active { background: var(--accent); color: #fff; }
+
+/* Expand button — pushed to the right edge of the tabs row. */
+.chart-expand {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+}
+.chart-expand:hover { background: var(--accent-soft); color: var(--text); border-color: var(--accent); }
+.chart-expand[aria-pressed='true'] { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Fullscreen expanded-chart modal. */
+.chart-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: fade-in 160ms ease;
+}
+.chart-modal-card {
+  width: min(1100px, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg, var(--shadow-md));
+  padding: 12px 16px 14px;
+}
+.chart-modal-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.chart-modal-title {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.chart-modal-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+}
+.chart-modal-close:hover { background: var(--accent-soft); color: var(--text); border-color: var(--accent); }
+/* Room to breathe in the expanded view: bring back the legend hint. */
+.chart-wrap--expanded .u-legend-hint { display: block; }
+/* When expanded, the chart-wrap is a plain block inside the modal card —
+   strip the overlay-card positioning/translucency it has on the desktop grid. */
+.chart-wrap.chart-wrap--expanded {
+  position: static !important;
+  inset: auto !important;
+  width: 100% !important;
+  height: auto !important;
+  max-height: none !important;
+  opacity: 1 !important;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  padding: 0 !important;
+  overflow: visible !important;
+}
+.chart-wrap--expanded .chart-host { box-shadow: none; }
 
 /* ==== Epidemic-ended banner ==== */
 .ended-banner {
