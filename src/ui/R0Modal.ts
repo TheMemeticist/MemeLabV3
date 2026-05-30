@@ -13,6 +13,7 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { SimConfig } from '../types';
 import { FitPool } from '../lib/fit-pool';
+import { read, write } from '../lib/storage';
 import {
   CATEGORY_LABELS,
   FIT_CATEGORIES,
@@ -24,9 +25,11 @@ import type {
   FitCategory,
   FitParamDef,
   FitParamName,
+  FitProgress,
   FitResult,
   LossType,
   ObservedPoint,
+  SimCurves,
 } from '../lib/fit';
 
 interface R0ModalEvents {
@@ -109,6 +112,19 @@ const HISTORICAL_PRESETS: DemoPreset[] = [
   },
 ];
 
+// Persisted snapshot of the panel so a closed/reopened session restores exactly
+// (settings *and* the observed dataset/preset). Versioned via storage.ts.
+const STORAGE_KEY = 'r0-estimator';
+interface R0Snapshot {
+  population: number;
+  selected: FitParamName[];
+  bounds: [FitParamName, [number, number]][];
+  K: number;
+  loss: LossType;
+  observed: ObservedPoint[];
+  presetId: string;
+}
+
 export class R0Modal {
   private el: HTMLDivElement | null = null;
   private pool: FitPool | null = null;
@@ -123,9 +139,19 @@ export class R0Modal {
   );
   private K = 30;
   private loss: LossType = 'poisson';
+  private presetId = 'synthetic';
   private running = false;
   private signal = { aborted: false };
   private result: FitResult | null = null;
+
+  // Live-chart state (set by createChart, read by updateChartData) + an rAF
+  // throttle so a burst of optimizer improvements coalesces into one redraw.
+  private liveObserved: ObservedPoint[] = [];
+  private liveCats: FitCategory[] = [];
+  private liveDays = 0;
+  private livePop = 0;
+  private pendingSnapshot: FitProgress | null = null;
+  private rafId = 0;
 
   constructor(private events: R0ModalEvents) {}
 
@@ -150,18 +176,25 @@ export class R0Modal {
     overlay.addEventListener('click', (ev) => { if (ev.target === overlay) this.close(); });
     document.addEventListener('keydown', this.onKey);
 
+    // Restore the previous session if one was saved; otherwise fall back to the
+    // self-consistent, engine-generated demo on first open.
+    const saved = read<R0Snapshot | null>(STORAGE_KEY, null);
+    if (saved) this.hydrate(saved);
+
     this.bindControls();
     this.renderTable();
     this.renderParams();
     this.renderOutput();
-    // Populate with a self-consistent, engine-generated demo on first open.
-    void this.loadDemo();
+    if (!saved) void this.loadDemo();
   }
 
   close(): void {
     if (!this.el) return;
+    this.persist();
     document.removeEventListener('keydown', this.onKey);
     this.signal.aborted = true;
+    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
+    this.pendingSnapshot = null;
     this.plot?.destroy();
     this.plot = null;
     this.pool?.dispose();
@@ -170,6 +203,35 @@ export class R0Modal {
     this.el = null;
     e.classList.add('r0-out');
     setTimeout(() => e.remove(), 200);
+  }
+
+  // ── Persistence ──
+  private persist(): void {
+    write<R0Snapshot>(STORAGE_KEY, {
+      population: this.population,
+      selected: [...this.selected],
+      bounds: [...this.bounds.entries()],
+      K: this.K,
+      loss: this.loss,
+      observed: this.observed,
+      presetId: this.presetId,
+    });
+  }
+
+  private hydrate(s: R0Snapshot): void {
+    if (Number.isFinite(s.population) && s.population > 0) this.population = s.population;
+    if (Array.isArray(s.selected)) this.selected = new Set(s.selected);
+    if (Array.isArray(s.bounds)) {
+      for (const [name, b] of s.bounds) {
+        if (this.bounds.has(name) && Array.isArray(b) && b.length === 2) {
+          this.bounds.set(name, [b[0], b[1]]);
+        }
+      }
+    }
+    if (Number.isFinite(s.K)) this.K = Math.round(s.K);
+    if (s.loss === 'mse' || s.loss === 'poisson') this.loss = s.loss;
+    if (Array.isArray(s.observed)) this.observed = s.observed.map((p) => ({ ...p }));
+    if (typeof s.presetId === 'string') this.presetId = s.presetId;
   }
 
   private onKey = (ev: KeyboardEvent) => {
@@ -184,13 +246,14 @@ export class R0Modal {
     popInput.value = String(this.population);
     popInput.addEventListener('change', () => {
       const v = Number(popInput.value);
-      if (Number.isFinite(v) && v > 0) this.population = v;
+      if (Number.isFinite(v) && v > 0) { this.population = v; this.persist(); }
     });
 
     q<HTMLButtonElement>('[data-r0="add-row"]').addEventListener('click', () => {
       const lastDay = this.observed.length ? Math.max(...this.observed.map((p) => p.day)) : 0;
       this.observed.push({ day: lastDay + 1, value: 0, category: 'cumulative_infections' });
       this.renderTable();
+      this.persist();
     });
 
     // Populate the dataset picker with the historical presets and wire loading.
@@ -201,7 +264,9 @@ export class R0Modal {
       opt.textContent = p.label;
       preset.appendChild(opt);
     }
+    preset.value = this.presetId;
     preset.addEventListener('change', () => {
+      this.presetId = preset.value;
       if (preset.value === 'synthetic') { void this.loadDemo(); return; }
       const p = HISTORICAL_PRESETS.find((x) => x.id === preset.value);
       if (p) this.loadDataset(p.points, p.population);
@@ -212,6 +277,7 @@ export class R0Modal {
       this.result = null;
       this.renderTable();
       this.renderOutput();
+      this.persist();
       this.note('Cleared — add rows or pick a dataset.');
     });
 
@@ -223,6 +289,7 @@ export class R0Modal {
       this.observed = append ? [...this.observed, ...points] : points;
       ta.value = '';
       this.renderTable();
+      this.persist();
       this.note(`Loaded ${points.length} point${points.length === 1 ? '' : 's'}${skipped ? `, skipped ${skipped}` : ''}.`);
     });
 
@@ -234,12 +301,16 @@ export class R0Modal {
       this.K = Math.round(Number(kInput.value));
       kLabel.textContent = String(this.K);
     });
+    kInput.addEventListener('change', () => this.persist());
 
     this.el!.querySelectorAll<HTMLButtonElement>('[data-loss]').forEach((btn) => {
+      // Reflect the restored loss in the toggle's active state.
+      btn.classList.toggle('active', btn.dataset['loss'] === this.loss);
       btn.addEventListener('click', () => {
         this.loss = btn.dataset['loss'] as LossType;
         this.el!.querySelectorAll<HTMLButtonElement>('[data-loss]').forEach((b) =>
           b.classList.toggle('active', b === btn));
+        this.persist();
       });
     });
 
@@ -269,16 +340,20 @@ export class R0Modal {
       `;
       row.querySelector<HTMLInputElement>('[data-col="day"]')!.addEventListener('change', (e) => {
         pt.day = Number((e.target as HTMLInputElement).value);
+        this.persist();
       });
       row.querySelector<HTMLInputElement>('[data-col="value"]')!.addEventListener('change', (e) => {
         pt.value = Number((e.target as HTMLInputElement).value);
+        this.persist();
       });
       row.querySelector<HTMLSelectElement>('[data-col="category"]')!.addEventListener('change', (e) => {
         pt.category = (e.target as HTMLSelectElement).value as FitCategory;
+        this.persist();
       });
       row.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
         this.observed.splice(idx, 1);
         this.renderTable();
+        this.persist();
       });
       tbody.appendChild(row);
     });
@@ -292,15 +367,23 @@ export class R0Modal {
     host.innerHTML = '';
     for (const p of FIT_PARAMS) {
       const b = this.bounds.get(p.name)!;
+      // Percent-display params (attack rate, IFR) edit as % in the UI while their
+      // stored bounds stay fractions — toView/fromView bridge the two.
+      const pct = p.display === 'percent';
+      const toView = (v: number) => (pct ? Number((v * 100).toFixed(4)) : v);
+      const fromView = (v: number) => (pct ? v / 100 : v);
+      // Wrap each input with its (optional) % so the suffix hugs its number and
+      // the two bound cells stay aligned across percent and non-percent rows.
+      const suffix = pct ? '<span class="r0-param-suffix">%</span>' : '';
       const wrap = document.createElement('label');
       wrap.className = 'r0-param';
       wrap.innerHTML = `
         <input type="checkbox" ${this.selected.has(p.name) ? 'checked' : ''} />
         <span class="r0-param-name">${p.label}</span>
         <span class="r0-param-bounds">
-          <input class="r0-in tiny" type="number" step="any" value="${b[0]}" aria-label="${p.label} lower bound" />
-          <span>–</span>
-          <input class="r0-in tiny" type="number" step="any" value="${b[1]}" aria-label="${p.label} upper bound" />
+          <span class="r0-bound"><input class="r0-in tiny" type="number" step="any" value="${toView(b[0])}" aria-label="${p.label} lower bound" />${suffix}</span>
+          <span class="r0-sep">–</span>
+          <span class="r0-bound"><input class="r0-in tiny" type="number" step="any" value="${toView(b[1])}" aria-label="${p.label} upper bound" />${suffix}</span>
         </span>
       `;
       const cb = wrap.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
@@ -308,9 +391,10 @@ export class R0Modal {
       cb.addEventListener('change', () => {
         if (cb.checked) this.selected.add(p.name);
         else this.selected.delete(p.name);
+        this.persist();
       });
-      bounds[0].addEventListener('change', () => { b[0] = Number(bounds[0].value); });
-      bounds[1].addEventListener('change', () => { b[1] = Number(bounds[1].value); });
+      bounds[0].addEventListener('change', () => { b[0] = fromView(Number(bounds[0].value)); this.persist(); });
+      bounds[1].addEventListener('change', () => { b[1] = fromView(Number(bounds[1].value)); this.persist(); });
       host.appendChild(wrap);
     }
   }
@@ -328,10 +412,13 @@ export class R0Modal {
     const bar = this.el!.querySelector<HTMLElement>('[data-r0="progress-fill"]')!;
     bar.style.width = '0%';
 
+    const observed = this.observed.filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value));
+    this.renderLive(observed); // persistent chart + provisional metrics, updated live
+
     const base = this.fitBaseConfig();
     try {
       const result = await runFit({
-        observed: this.observed.filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value)),
+        observed,
         baseConfig: base,
         params,
         population: this.population,
@@ -340,15 +427,77 @@ export class R0Modal {
         simulate: (cfg, days, K, seed) => this.pool!.simulate(cfg, days, K, seed),
         signal: this.signal,
         onProgress: (frac) => { bar.style.width = `${Math.round(frac * 100)}%`; },
+        onImprove: (p) => this.onImprove(p),
       });
       if (this.signal.aborted) { this.note('Fit cancelled.'); }
-      else { this.result = result; this.renderOutput(); this.note('Fit complete.'); }
+      else {
+        // The fit runs on a smaller grid for speed. For voronoi, R₀ scales with
+        // the grid's node degree, so the reported R₀ would not match the value
+        // the live sim shows after Apply. Recompute it on the user's real grid.
+        this.note('Refining R₀ for your grid…');
+        this.result = await this.reconcileR0(result);
+        this.renderOutput();
+        this.note('Fit complete.');
+      }
     } catch (err) {
       this.note(`Fit failed: ${(err as Error).message}`);
     } finally {
+      if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
+      this.pendingSnapshot = null;
       this.running = false;
       this.setRunning(false);
     }
+  }
+
+  /** Recompute the headline R₀ (and CI) on the user's *actual* grid so it matches
+   *  what the live sim shows after Apply. Only voronoi is grid-size-dependent
+   *  (lattice/mean-field R₀ is size-independent), so we skip the extra sim
+   *  otherwise. R₀ = reachable-degree(grid) × infection-probability(genes); only
+   *  the grid factor changes, so scaling the CI by liveR₀/fitR₀ is exact for the
+   *  attack-rate axis and a good approximation when range is also profiled. */
+  private async reconcileR0(result: FitResult): Promise<FitResult> {
+    if (!this.pool || result.r0 == null || result.r0 === 0) return result;
+    const live = structuredClone(this.events.getConfig());
+    if ((live.geometry ?? 'square') !== 'voronoi') return result;
+    if (live.size === result.config.size) return result;
+
+    // Same intervention-free baseline the fit uses (R₀ is the basic, no-control
+    // number), but at the live grid size + topology, with the fitted genes.
+    live.strain = { ...live.strain, ...result.config.strain };
+    live.mutate = false;
+    live.defenses = live.defenses.map((d) => ({ ...d, enabled: false }));
+    live.lockdown = { ...live.lockdown, enabled: false };
+    live.quarantine = { ...live.quarantine, enabled: false };
+    try {
+      const { rNaught } = await this.pool.simulate(live, 1, 1, live.seed);
+      if (rNaught == null) return result;
+      const factor = rNaught / result.r0;
+      return {
+        ...result,
+        r0: rNaught,
+        r0CI: result.r0CI ? [result.r0CI[0] * factor, result.r0CI[1] * factor] : null,
+      };
+    } catch {
+      return result; // fall back to the fit-grid R₀ rather than failing the run
+    }
+  }
+
+  /** Throttled live redraw: coalesce a burst of optimizer improvements into one
+   *  setData per animation frame so the overlay animates smoothly. */
+  private onImprove(p: FitProgress): void {
+    this.pendingSnapshot = p;
+    if (this.rafId) return;
+    this.rafId = requestAnimationFrame(() => {
+      this.rafId = 0;
+      const s = this.pendingSnapshot;
+      this.pendingSnapshot = null;
+      if (!s) return;
+      this.updateChartData(s.curves);
+      const r0El = this.el?.querySelector<HTMLElement>('[data-r0="live-r0"]');
+      if (r0El) r0El.textContent = `R₀ = ${s.r0 == null ? '—' : s.r0.toFixed(2)}`;
+      const lossEl = this.el?.querySelector<HTMLElement>('[data-r0="live-loss"]');
+      if (lossEl) lossEl.textContent = fmtLoss(s.loss);
+    });
   }
 
   /** The config the fit perturbs: current sim genes/geometry, but with
@@ -392,9 +541,11 @@ export class R0Modal {
       }
       this.observed = pts;
       this.population = DEMO_POP;
+      this.presetId = 'synthetic';
       const popInput = this.el?.querySelector<HTMLInputElement>('[data-r0="population"]');
       if (popInput) popInput.value = String(DEMO_POP);
       this.renderTable();
+      this.persist();
       this.note('Demo outbreak loaded — press Run fit.');
     } catch {
       this.note('Could not generate demo.');
@@ -410,6 +561,7 @@ export class R0Modal {
     this.result = null;
     this.renderTable();
     this.renderOutput();
+    this.persist();
     this.note('Dataset loaded — press Run fit.');
   }
 
@@ -429,6 +581,33 @@ export class R0Modal {
   }
 
   // ── Output: stats + uPlot overlay ──
+
+  /** Provisional output shown while a fit runs: a live chart plus best-so-far R₀
+   *  and loss readouts that the rAF-throttled onImprove updates as it converges. */
+  private renderLive(observed: ObservedPoint[]): void {
+    const host = this.el!.querySelector<HTMLElement>('[data-r0="output"]')!;
+    const applyBtn = this.el!.querySelector<HTMLButtonElement>('[data-r0="apply"]')!;
+    applyBtn.disabled = true;
+    const days = Math.max(1, ...observed.map((p) => Math.round(p.day)));
+
+    host.innerHTML = `
+      <div class="r0-result-grid">
+        <div class="r0-metric r0-metric-hero">
+          <span class="r0-metric-label">Basic reproduction number</span>
+          <span class="r0-metric-value" data-r0="live-r0">R₀ = …</span>
+          <span class="r0-metric-sub">fitting…</span>
+        </div>
+        <div class="r0-metric">
+          <span class="r0-metric-label">Best fit so far</span>
+          <span class="r0-metric-value" data-r0="live-loss">…</span>
+          <span class="r0-metric-sub">loss — lower is better</span>
+        </div>
+      </div>
+      <div class="r0-chart" data-r0="chart"></div>
+    `;
+    this.createChart(observed, days, this.population);
+  }
+
   private renderOutput(): void {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="output"]')!;
     const r = this.result;
@@ -442,6 +621,8 @@ export class R0Modal {
 
     const r0 = r.r0 == null ? '—' : r.r0.toFixed(2);
     const ci = r.r0CI ? `${r.r0CI[0].toFixed(2)} – ${r.r0CI[1].toFixed(2)}` : '—';
+    const rating = gofRating(r.gof.r2);
+    const barPct = Math.max(0, Math.min(1, r.gof.r2)) * 100;
     const paramRows = r.params
       .map((p) => `<tr><td>${p.label}</td><td>${fmtParam(p.name, p.value)}</td></tr>`)
       .join('');
@@ -453,10 +634,11 @@ export class R0Modal {
           <span class="r0-metric-value">R₀ = ${r0}</span>
           <span class="r0-metric-sub">95% CI ${ci}</span>
         </div>
-        <div class="r0-metric">
+        <div class="r0-metric r0-gof ${rating.cls}">
           <span class="r0-metric-label">Goodness of fit</span>
-          <span class="r0-metric-value">R² = ${r.gof.r2.toFixed(3)}</span>
-          <span class="r0-metric-sub">RMSE ${fmtNum(r.gof.rmse)}</span>
+          <span class="r0-gof-rating"><span class="r0-gof-badge ${rating.cls}">${rating.label}</span></span>
+          <span class="r0-gof-bar"><span style="width:${barPct.toFixed(1)}%"></span></span>
+          <span class="r0-metric-sub">R² ${r.gof.r2.toFixed(3)} · RMSE ${fmtNum(r.gof.rmse)}</span>
         </div>
         <table class="r0-params-table">
           <thead><tr><th>Fitted parameter</th><th>Value</th></tr></thead>
@@ -465,27 +647,33 @@ export class R0Modal {
       </div>
       <div class="r0-chart" data-r0="chart"></div>
     `;
-    this.drawChart(r);
+    this.createChart(r.observed, r.days, r.population);
+    this.updateChartData(r.simulated);
   }
 
-  private drawChart(r: FitResult): void {
+  /** Build the uPlot overlay once (observed dots + an empty sim line per
+   *  category present in the data). `updateChartData` then streams sim curves in
+   *  via setData — far cheaper than destroy/recreate, and the basis for the live
+   *  update during a fit. */
+  private createChart(observed: ObservedPoint[], days: number, population: number): void {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="chart"]')!;
     this.plot?.destroy();
     this.plot = null;
+    this.liveObserved = observed;
+    this.liveDays = days;
+    this.livePop = population;
+    this.liveCats = FIT_CATEGORIES.filter((c) => observed.some((p) => p.category === c));
 
-    const cats = FIT_CATEGORIES.filter((c) => r.observed.some((p) => p.category === c));
-    const xs: number[] = [];
-    for (let d = 0; d <= r.days; d++) xs.push(d);
-
+    const xs = this.chartXs(days);
     const data: (number | null)[][] = [xs];
     const series: uPlot.Series[] = [{}];
-    for (const cat of cats) {
-      const sim = xs.map((d) => (r.simulated[cat][Math.min(d, r.simulated[cat].length - 1)] ?? 0) * r.population);
+    for (const cat of this.liveCats) {
+      const sim: (number | null)[] = xs.map(() => null);
       const obs: (number | null)[] = xs.map(() => null);
-      for (const pt of r.observed) {
+      for (const pt of observed) {
         if (pt.category !== cat) continue;
         const d = Math.round(pt.day);
-        if (d >= 0 && d <= r.days) obs[d] = pt.value;
+        if (d >= 0 && d <= days) obs[d] = pt.value;
       }
       data.push(sim, obs);
       series.push(
@@ -504,17 +692,46 @@ export class R0Modal {
       {
         width: w,
         height: 260,
+        // Extra left padding so the widened y-axis gutter + label clear the card edge.
+        padding: [12, 12, 0, 6],
         legend: { show: true },
         scales: { x: { time: false } },
         axes: [
-          { label: 'Day' },
-          { label: 'Count', size: 64 },
+          { label: 'Day', space: 56, values: (_u, splits) => splits.map((v) => String(Math.round(v))) },
+          // fmtNum keeps big counts compact (12k, 1.2M) so ticks stay inside the
+          // gutter instead of clipping; the wider size + gaps give the label room.
+          { label: 'Count', size: 76, gap: 8, labelGap: 8, values: (_u, splits) => splits.map((v) => fmtNum(v)) },
         ],
         series,
       },
       data as uPlot.AlignedData,
       host,
     );
+  }
+
+  /** Push fresh simulated curves into the existing plot (observed dots unchanged). */
+  private updateChartData(curves: SimCurves): void {
+    if (!this.plot) return;
+    const xs = this.chartXs(this.liveDays);
+    const data: (number | null)[][] = [xs];
+    for (const cat of this.liveCats) {
+      const arr = curves[cat] ?? [];
+      const sim = xs.map((d) => (arr[Math.min(d, arr.length - 1)] ?? 0) * this.livePop);
+      const obs: (number | null)[] = xs.map(() => null);
+      for (const pt of this.liveObserved) {
+        if (pt.category !== cat) continue;
+        const d = Math.round(pt.day);
+        if (d >= 0 && d <= this.liveDays) obs[d] = pt.value;
+      }
+      data.push(sim, obs);
+    }
+    this.plot.setData(data as uPlot.AlignedData);
+  }
+
+  private chartXs(days: number): number[] {
+    const xs: number[] = [];
+    for (let d = 0; d <= days; d++) xs.push(d);
+    return xs;
   }
 
   private note(msg: string): void {
@@ -534,6 +751,24 @@ function fmtNum(v: number): string {
   if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
   if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
   return v.toFixed(0);
+}
+
+// Compact display for the live loss readout — Poisson NLL can run large or
+// negative, so abbreviate big magnitudes and keep small ones to 2 decimals.
+function fmtLoss(v: number): string {
+  if (!Number.isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a >= 1e3) return (v < 0 ? '-' : '') + fmtNum(a);
+  return v.toFixed(2);
+}
+
+// Turns the R² goodness-of-fit number into a plain-language, color-coded rating
+// so a non-statistician can read the fit quality at a glance.
+function gofRating(r2: number): { label: string; cls: string } {
+  if (r2 >= 0.95) return { label: 'Excellent', cls: 'excellent' };
+  if (r2 >= 0.85) return { label: 'Good', cls: 'good' };
+  if (r2 >= 0.70) return { label: 'Fair', cls: 'fair' };
+  return { label: 'Poor', cls: 'poor' };
 }
 
 // Static markup; dynamic regions are filled by render*() via [data-r0] hooks.

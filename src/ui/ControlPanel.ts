@@ -107,7 +107,7 @@ export class ControlPanel {
         const r0 = this.r0Slider.value();
         const ar = attackRateFromR0(r0, D, geometryContactCount(next, range));
         this.cfg.strain.attackRate = ar;
-        this.strainSliders.attackRate.setValue(Math.round(ar * 100), true);
+        this.strainSliders.attackRate.setValue(ar * 100, true);
       }
       this.cfg.geometry = next;
       this.applyGeometryVisibility(next);
@@ -364,21 +364,26 @@ export class ControlPanel {
     const s = this.cfg.strain;
     this.strainSliders = {
       attackRate: new Slider({
-        id: 'attack-rate', label: 'Attack rate', min: 0, max: 100, step: 1, unit: '%',
-        value: Math.round(s.attackRate * 100),
+        // step 0.1 (= 0.001 attack rate) so dragging is fine-grained; click-to-type
+        // accepts arbitrary precision (a fitted 7.34% survives intact).
+        id: 'attack-rate', label: 'Attack rate', min: 0, max: 100, step: 0.1, unit: '%',
+        value: s.attackRate * 100,
         hint: 'Per-contact transmission probability.',
+        editable: true, editSuffix: '%',
         onChange: (v) => { this.cfg.strain.attackRate = v / 100; this.dirty(); },
       }),
       incubation: new Slider({
         id: 'incubation', label: 'Incubation', min: 1, max: 60, step: 1, unit: 'days',
         value: s.incubation,
         hint: 'Days from exposure to becoming infectious.',
+        editable: true, editSuffix: 'days',
         onChange: (v) => { this.cfg.strain.incubation = v | 0; this.dirty(); },
       }),
       infectious: new Slider({
         id: 'infectious', label: 'Infectious period', min: 1, max: 60, step: 1, unit: 'days',
         value: s.infectious,
         hint: 'Days the host can transmit.',
+        editable: true, editSuffix: 'days',
         onChange: (v) => {
           this.cfg.strain.infectious = v | 0;
           if ((this.cfg.geometry ?? 'square') === 'meanfield') {
@@ -386,21 +391,24 @@ export class ControlPanel {
             const r0 = this.r0Slider.value();
             const ar = attackRateFromR0(r0, this.cfg.strain.infectious, MF_K);
             this.cfg.strain.attackRate = ar;
-            this.strainSliders.attackRate.setValue(Math.round(ar * 100), true);
+            this.strainSliders.attackRate.setValue(ar * 100, true);
           }
           this.dirty();
         },
       }),
       ifr: new Slider({
-        id: 'ifr', label: 'Kill rate (IFR)', min: 0, max: 100, step: 1, unit: '%',
-        value: Math.round(s.ifr * 100),
+        // step 0.1 for sub-percent fatality rates; click-to-type for precision.
+        id: 'ifr', label: 'Kill rate (IFR)', min: 0, max: 100, step: 0.1, unit: '%',
+        value: s.ifr * 100,
         hint: 'Infection-fatality rate at recovery roll.',
+        editable: true, editSuffix: '%',
         onChange: (v) => { this.cfg.strain.ifr = v / 100; this.dirty(); },
       }),
       range: new Slider({
         id: 'range', label: 'Transmission range', min: 1, max: 6, step: 1, unit: 'tiles',
         value: s.range,
         hint: 'Manhattan radius. 1 = nearest neighbors.',
+        editable: true, editSuffix: 'tiles',
         onChange: (v) => { this.cfg.strain.range = v | 0; this.dirty(); },
       }),
       immunityDays: new Slider({
@@ -412,12 +420,20 @@ export class ControlPanel {
         value: immunityDaysToPos(Math.max(90, s.immunityDays)),
         hint: 'Mean days a recovered cell stays immune before becoming susceptible again. With a finite window plus a large enough population, infections persist endemically — the classic CDA insight.',
         format: (pos) => formatDays(immunityPosToDays(pos)),
+        // The editor works in days (its natural unit); map days ↔ dial position.
+        editable: true, editSuffix: 'days',
+        editGet: () => Math.round(immunityPosToDays(this.strainSliders.immunityDays.value())),
+        editSet: (days) => {
+          const pos = immunityDaysToPos(Math.max(0, days));
+          this.strainSliders.immunityDays.setValue(Math.max(0, Math.min(1000, pos)));
+        },
         onChange: (pos) => { this.cfg.strain.immunityDays = immunityPosToDays(pos); this.dirty(); },
       }),
       mutationRate: new Slider({
         id: 'mut', label: 'Mutation rate', min: 0, max: 50, step: 1, unit: '%',
-        value: Math.round(s.mutationRate * 100),
+        value: s.mutationRate * 100,
         hint: 'Per-replication chance per gene to drift (when natural selection is on).',
+        editable: true, editSuffix: '%',
         onChange: (v) => { this.cfg.strain.mutationRate = v / 100; this.dirty(); },
       }),
     };
@@ -437,10 +453,11 @@ export class ControlPanel {
       value: Math.round(initR0 * 10) / 10,
       hint: 'Expected secondary infections from one case in a fully susceptible population. Automatically translates to a per-contact attack rate for the engine.',
       format: (v) => v.toFixed(1),
+      editable: true,
       onChange: (r0) => {
         const ar = attackRateFromR0(r0, this.cfg.strain.infectious, MF_K);
         this.cfg.strain.attackRate = ar;
-        this.strainSliders.attackRate.setValue(Math.round(ar * 100), true);
+        this.strainSliders.attackRate.setValue(ar * 100, true);
         this.dirty();
       },
     });
@@ -577,13 +594,15 @@ export class ControlPanel {
 
   applyStrain(g: StrainGenes): void {
     this.cfg.strain = { ...g };
-    this.strainSliders.attackRate.setValue(Math.round(g.attackRate * 100), true);
+    // Pass precise percentages (not rounded) so a fitted attack rate / IFR keeps
+    // its decimals in both the slider value and the display.
+    this.strainSliders.attackRate.setValue(g.attackRate * 100, true);
     this.strainSliders.incubation.setValue(g.incubation, true);
     this.strainSliders.infectious.setValue(g.infectious, true);
-    this.strainSliders.ifr.setValue(Math.round(g.ifr * 100), true);
+    this.strainSliders.ifr.setValue(g.ifr * 100, true);
     this.strainSliders.range.setValue(g.range, true);
     this.strainSliders.immunityDays.setValue(immunityDaysToPos(Math.max(90, g.immunityDays)), true);
-    this.strainSliders.mutationRate.setValue(Math.round(g.mutationRate * 100), true);
+    this.strainSliders.mutationRate.setValue(g.mutationRate * 100, true);
     if ((this.cfg.geometry ?? 'square') === 'meanfield') {
       const r0 = r0FromAttackRate(g.attackRate, g.infectious, MF_K);
       this.r0Slider.setValue(Math.round(r0 * 10) / 10, true);

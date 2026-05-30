@@ -210,9 +210,6 @@ export class App {
           <button class="btn ghost" data-act="cost" data-tip="Edit the economic cost model — region, currency, severity, unit costs, hospital capacity.">
             <span class="btn-icon">💲</span>Cost model
           </button>
-          <button class="btn ghost" data-act="fit" data-tip="R₀ Estimator — fit an observed outbreak curve back to disease parameters and read off the implied R₀.">
-            <span class="btn-icon">📉</span>R₀ Estimator
-          </button>
           <button class="btn" data-act="share" data-tip="Share this run — copies the permalink and opens a QR code. The link encodes the full state so anyone can replay it exactly.">
             <span class="btn-icon">🔗</span>Share
           </button>
@@ -356,8 +353,8 @@ export class App {
       getConfig: () => this.controls.config(),
       onApply: (fitted) => this.applyFit(fitted),
     });
-    (this.root.querySelector('[data-act="fit"]') as HTMLButtonElement)
-      .addEventListener('click', () => this.r0Modal.open());
+    // The R₀ Estimator launches from the R₀ stat tile above the petri dish.
+    this.stats.onEstimatorClick(() => this.r0Modal.open());
 
     (this.root.querySelector('[data-act="reset-defaults"]') as HTMLButtonElement)
       .addEventListener('click', () => { localStorage.clear(); location.reload(); });

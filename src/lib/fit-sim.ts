@@ -49,6 +49,12 @@ export function runTrials(config: SimConfig, days: number, K: number, seed: numb
   const topo = topologyFor(config, seed);
   let rNaught: number | null = null;
 
+  // With reseed off (the fit baseline), once a trial reaches E+I=0 the epidemic
+  // can never recover: cumulative counts are frozen and active stays 0. Skip the
+  // remaining day-steps and fill the curves forward — a large saving on
+  // long-horizon datasets where most candidates burn out early.
+  const canReseed = config.reseedOnExtinction === true;
+
   for (let k = 0; k < K; k++) {
     const trialSeed = (seed ^ ((k * SEED_STRIDE) >>> 0)) >>> 0;
     const engine = new Engine({ ...config, seed: trialSeed }, topo);
@@ -75,6 +81,14 @@ export function runTrials(config: SimConfig, days: number, K: number, seed: numb
       sumInf[d] += cumInf;
       sumDeath[d] += cumDeath;
       sumActive[d] += stats.i;
+      if (!canReseed && stats.e + stats.i === 0) {
+        // Extinct — carry the frozen cumulative totals forward (active = 0).
+        for (let f = d + 1; f <= days; f++) {
+          sumInf[f] += cumInf;
+          sumDeath[f] += cumDeath;
+        }
+        break;
+      }
     }
   }
 

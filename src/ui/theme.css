@@ -49,6 +49,12 @@
   --cost-danger: rgb(192, 28, 22);  /* cost meter — high burden (deep red) */
   --grid-color: rgba(60, 38, 8, 0.10);
 
+  /* Goodness-of-fit rating ramp (theme-independent). */
+  --gof-excellent: rgb(22, 163, 74);  /* green */
+  --gof-good: rgb(101, 163, 13);      /* lime */
+  --gof-fair: rgb(217, 160, 18);      /* amber */
+  --gof-poor: rgb(220, 60, 50);       /* red */
+
   /* Toolbar */
   --tb-bg: #fffaf0;
   --tb-btn: #fff8e6;

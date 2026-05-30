@@ -81,6 +81,8 @@ export interface FitParamDef {
   bounds: [number, number];
   /** Integer-valued dimension (rounded when written into the config). */
   integer?: boolean;
+  /** Display the value as a percentage in the UI (bounds stay fractions internally). */
+  display?: 'percent';
   /** Checked by default in the UI (the core 2-param fit). */
   core?: boolean;
   get(g: StrainGenes): number;
@@ -92,6 +94,7 @@ export const FIT_PARAMS: FitParamDef[] = [
     name: 'attackRate',
     label: 'Attack rate',
     bounds: [0.01, 0.99],
+    display: 'percent',
     core: true,
     get: (g) => g.attackRate,
     set: (g, v) => { g.attackRate = clamp(v, 0, 1); },
@@ -124,6 +127,7 @@ export const FIT_PARAMS: FitParamDef[] = [
     // Bounds expressed as fractions: 0.01% – 99.99%.
     label: 'Fatality rate (IFR)',
     bounds: [0.0001, 0.9999],
+    display: 'percent',
     get: (g) => g.ifr,
     set: (g, v) => { g.ifr = clamp(v, 0, 1); },
   },
@@ -274,7 +278,11 @@ export interface OptimizeResult {
 
 export interface OptimizeOptions {
   params: FitParamDef[];
+  /** Objective for the coarse grid scan (may use a reduced trial count). */
   evaluate: (values: number[]) => Promise<number>;
+  /** Objective for the Nelder–Mead refine. Defaults to `evaluate` when omitted —
+   *  pass a full-fidelity variant to refine at higher accuracy than the grid. */
+  evaluateRefine?: (values: number[]) => Promise<number>;
   /** Coarse-grid resolution per dimension. */
   gridSteps?: number;
   /** Max Nelder–Mead iterations. */
@@ -285,6 +293,7 @@ export interface OptimizeOptions {
 
 export async function optimize(opts: OptimizeOptions): Promise<OptimizeResult> {
   const { params, evaluate } = opts;
+  const evaluateRefine = opts.evaluateRefine ?? evaluate;
   const gridSteps = opts.gridSteps ?? (params.length >= 3 ? 4 : 6);
   const nmIters = opts.nmIters ?? 40;
   const dims = params.length;
@@ -307,8 +316,8 @@ export async function optimize(opts: OptimizeOptions): Promise<OptimizeResult> {
   let best = grid.reduce((a, b) => (b.loss < a.loss ? b : a), grid[0]);
   if (opts.signal?.aborted) return { best, grid, evaluations: done };
 
-  // ── Nelder–Mead refine ──
-  best = await nelderMead(best, params, evaluate, nmIters, opts.signal, tick);
+  // ── Nelder–Mead refine ── (full-fidelity objective)
+  best = await nelderMead(best, params, evaluateRefine, nmIters, opts.signal, tick);
 
   return { best, grid, evaluations: done };
 }
@@ -394,13 +403,25 @@ async function nelderMead(
 // ─── Orchestrator ────────────────────────────────────────────────────────────
 
 export interface FitOptions {
-  /** Stochastic trials per candidate (10–100). */
+  /** Stochastic trials per candidate (10–100), used for the refine + CI passes. */
   K: number;
+  /** Trials per candidate for the coarse grid scan. The grid is the largest eval
+   *  count and tolerates noise, so it runs at a reduced K for speed; defaults to
+   *  ~K/3 (min 8). The refined optimum + CI sweep still run at full K. */
+  gridK?: number;
   loss: LossType;
   /** Real-world population the observed counts are drawn from. */
   population: number;
   gridSteps?: number;
   nmIters?: number;
+}
+
+/** Best-so-far snapshot streamed during a fit so the UI can animate convergence. */
+export interface FitProgress {
+  values: number[];
+  curves: SimCurves;
+  loss: number;
+  r0: number | null;
 }
 
 export interface FitRequest extends FitOptions {
@@ -411,6 +432,9 @@ export interface FitRequest extends FitOptions {
    *  plus the candidate's analytic R₀. */
   simulate: (config: SimConfig, days: number, K: number, seed: number) => Promise<SimResult>;
   onProgress?: (frac: number) => void;
+  /** Fires whenever a new global-best candidate is found, so the UI can redraw
+   *  the overlaid curves live as the optimizer converges. */
+  onImprove?: (progress: FitProgress) => void;
   signal?: { aborted: boolean };
 }
 
@@ -444,21 +468,43 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     return cfg;
   };
 
-  // One sim of a candidate, yielding both the loss and the engine's R₀. The pool
-  // memoizes by params, so the optimizer, the final best, and the CI sweep all
-  // share results for free.
-  const evalFull = async (values: number[]): Promise<{ loss: number; r0: number | null; result: SimResult }> => {
-    const result = await req.simulate(configFor(values), days, req.K, baseSeed);
+  // Coarse grid runs at a reduced trial count (it tolerates noise and dominates
+  // the eval budget); the refine + CI run at full K. The pool memoizes by params
+  // *and* K, so the two phases never collide and each phase reuses its own grid.
+  const gridK = Math.max(8, Math.min(req.K, req.gridK ?? Math.round(req.K / 3)));
+
+  // One sim of a candidate at `K` trials, yielding both the loss and the engine's
+  // R₀. The pool memoizes by params+K, so the optimizer, the final best, and the
+  // CI sweep all share results for free.
+  const evalAt = async (
+    values: number[],
+    K: number,
+  ): Promise<{ loss: number; r0: number | null; result: SimResult }> => {
+    const result = await req.simulate(configFor(values), days, K, baseSeed);
     return { loss: lossOf(req.observed, result.curves, req.population, req.loss), r0: result.rNaught, result };
   };
-  const evaluate = async (values: number[]): Promise<number> => {
+  const evalFull = (values: number[]) => evalAt(values, req.K);
+
+  // Stream the best-so-far to the UI. Tracked across both objectives so the live
+  // overlay only ever moves toward better fits.
+  let bestLoss = Number.POSITIVE_INFINITY;
+  const reportIfBetter = (loss: number, values: number[], result: SimResult, r0: number | null): void => {
+    if (!req.onImprove || !Number.isFinite(loss) || loss >= bestLoss) return;
+    bestLoss = loss;
+    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0 });
+  };
+
+  const makeEvaluate = (K: number) => async (values: number[]): Promise<number> => {
     if (req.signal?.aborted) return Number.POSITIVE_INFINITY;
-    return (await evalFull(values)).loss;
+    const { loss, r0, result } = await evalAt(values, K);
+    reportIfBetter(loss, values, result, r0);
+    return loss;
   };
 
   const opt = await optimize({
     params: req.params,
-    evaluate,
+    evaluate: makeEvaluate(gridK),
+    evaluateRefine: makeEvaluate(req.K),
     gridSteps: req.gridSteps,
     nmIters: req.nmIters,
     signal: req.signal,
