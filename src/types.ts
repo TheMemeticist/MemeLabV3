@@ -288,3 +288,36 @@ export type WorkerCommand =
   | { cmd: 'reset'; config: SimConfig }
   | { cmd: 'updateConfig'; config: SimConfig }
   | { cmd: 'patchConfig'; config: SimConfig };
+
+// ─── R₀ Estimator fitting-worker protocol ────────────────────────────────────
+// A separate, isolated worker pool (`src/worker/fit.worker.ts`) runs headless
+// Engine trials for inverse parameter fitting. It never touches the live
+// `sim.worker.ts` engine, so the determinism / population-conservation
+// invariants of a running simulation are untouched. The worker is pure: it runs
+// K stochastic trials of a candidate config and returns the mean per-capita
+// SEIR curves; the loss function and observed data live on the UI thread.
+
+export interface FitWorkerCommand {
+  /** Correlates the reply with the pending promise on the UI thread. */
+  id: number;
+  config: SimConfig;
+  /** Number of days (ticks) to simulate; curve length is days + 1 (day 0..days). */
+  days: number;
+  /** Stochastic trials to average over. */
+  K: number;
+  /** Base seed; trial k uses a decorrelated derivative of it. */
+  seed: number;
+}
+
+export interface FitWorkerResult {
+  id: number;
+  /** Per-capita fractions in [0..1], averaged over K trials, length days + 1. */
+  curves: {
+    cumulative_infections: number[];
+    cumulative_deaths: number[];
+    active_infections: number[];
+  };
+  /** The engine's analytic R₀ for this candidate (any geometry, incl. voronoi).
+   *  Null only for degenerate configs (e.g. grid < 8). */
+  rNaught: number | null;
+}

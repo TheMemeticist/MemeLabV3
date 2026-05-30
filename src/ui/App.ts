@@ -7,6 +7,7 @@ import { ControlPanel } from './ControlPanel';
 import { Onboarding } from './Onboarding';
 import { AboutModal } from './AboutModal';
 import { CostModal } from './CostModal';
+import { R0Modal } from './R0Modal';
 import { ShareMenu } from './ShareMenu';
 import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
@@ -38,6 +39,7 @@ export class App {
   private aboutBtn!: HTMLButtonElement;
   private about = new AboutModal();
   private costModal!: CostModal;
+  private r0Modal!: R0Modal;
   private costConfig!: CostConfig;
   private toastEl!: HTMLElement;
   private lastFrame: FrameMessage | null = null;
@@ -208,6 +210,9 @@ export class App {
           <button class="btn ghost" data-act="cost" data-tip="Edit the economic cost model — region, currency, severity, unit costs, hospital capacity.">
             <span class="btn-icon">💲</span>Cost model
           </button>
+          <button class="btn ghost" data-act="fit" data-tip="R₀ Estimator — fit an observed outbreak curve back to disease parameters and read off the implied R₀.">
+            <span class="btn-icon">📉</span>R₀ Estimator
+          </button>
           <button class="btn" data-act="share" data-tip="Share this run — copies the permalink and opens a QR code. The link encodes the full state so anyone can replay it exactly.">
             <span class="btn-icon">🔗</span>Share
           </button>
@@ -344,6 +349,16 @@ export class App {
         // paused/ended, so we can't rely on the next frame to push it.
         if (this.lastFrame) this.updateCost(this.lastFrame);
       });
+    // R₀ Estimator — inverse parameter fitting. Inherits the current config as
+    // its baseline and applies fitted strain genes back through the normal
+    // config-change path.
+    this.r0Modal = new R0Modal({
+      getConfig: () => this.controls.config(),
+      onApply: (fitted) => this.applyFit(fitted),
+    });
+    (this.root.querySelector('[data-act="fit"]') as HTMLButtonElement)
+      .addEventListener('click', () => this.r0Modal.open());
+
     (this.root.querySelector('[data-act="reset-defaults"]') as HTMLButtonElement)
       .addEventListener('click', () => { localStorage.clear(); location.reload(); });
 
@@ -610,6 +625,18 @@ export class App {
       this.send({ cmd: 'play', tps: this.tps() });
     }
     this.persist();
+  }
+
+  /** Merge fitted strain genes from the R₀ Estimator into the live config. Only
+   *  the genes are taken (the estimator runs on its own grid/mutation settings);
+   *  the change routes through the normal patch path so the disease updates
+   *  without resetting the user's grid. */
+  private applyFit(fitted: SimConfig): void {
+    const cfg = this.controls.config();
+    cfg.strain = { ...cfg.strain, ...fitted.strain };
+    this.controls.hydrate(cfg, this.controls.currentPresetId());
+    this.onConfigChange();
+    this.toast('Applied fitted disease parameters.');
   }
 
   private needsRebuild(prev: SimConfig | null, next: SimConfig): boolean {
