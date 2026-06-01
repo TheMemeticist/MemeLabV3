@@ -632,8 +632,19 @@ export class App {
     const cfg = this.controls.config();
     cfg.strain = { ...cfg.strain, ...fitted.strain };
     this.controls.hydrate(cfg, this.controls.currentPresetId());
-    this.onConfigChange();
-    this.toast('Applied fitted disease parameters.');
+    // Start a fresh run from the single index case so the fitted disease plays out
+    // from day 0 — that's the outbreak the estimator fit (at this grid size), so the
+    // death curve now reproduces. Patching mid-run would not.
+    this.handleReset();
+    // The fitted genes are the *pre-intervention* disease (R₀ is the basic number).
+    // If interventions are active they'll act on top, pulling deaths below the fit.
+    const interventionsOn =
+      cfg.defenses.some((d) => d.enabled) || cfg.lockdown.enabled || cfg.quarantine.enabled;
+    this.toast(
+      interventionsOn
+        ? 'Applied fitted disease — your active interventions will reduce deaths below the fit.'
+        : 'Applied fitted disease parameters.',
+    );
   }
 
   private needsRebuild(prev: SimConfig | null, next: SimConfig): boolean {

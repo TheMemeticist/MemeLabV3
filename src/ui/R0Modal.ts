@@ -67,6 +67,14 @@ const DEMO_ATTACK = 0.08;
 const DEMO_RANGE = 2;
 const DEMO_K = 8;
 
+// The fit runs at the *live grid size* so the fit's config matches the simulation the
+// user will run after Apply — a MemeLab outbreak spreads as a traveling wave from the
+// index case, so its per-capita curve is NOT scale-invariant (absolute spread over a
+// fixed horizon is ~size-independent ⇒ per-capita deaths scale as 1/N). Fitting at any
+// other grid size would therefore not reproduce. FIT_GRID_CAP only bounds the cost on
+// very large grids; above it we fit at the cap and warn that reproduction degrades.
+const FIT_GRID_CAP = 128;
+
 // Historical outbreak datasets — sparse, real-world-flavored collections of
 // cumulative cases/deaths. The `population` is an *effective susceptible pool*
 // chosen so the spatial model can reproduce the curve (a country's full census
@@ -519,6 +527,9 @@ export class R0Modal {
     if (expanded) this.note('Timing params added (your data spans the peak) — fitting…');
 
     const base = this.fitBaseConfig();
+    if (this.events.getConfig().size > FIT_GRID_CAP) {
+      this.note(`Fitting on a ${FIT_GRID_CAP}×${FIT_GRID_CAP} grid for speed — on a larger grid the outbreak spreads farther per capita, so deaths may not reproduce exactly. Reduce the grid size for a faithful fit.`);
+    }
     try {
       const result = await runFit({
         observed,
@@ -619,7 +630,12 @@ export class R0Modal {
   private fitBaseConfig(): SimConfig {
     const cfg = structuredClone(this.events.getConfig());
     cfg.mutate = false;
-    cfg.size = Math.min(Math.max(cfg.size, 48), 80);
+    // Fit at the live grid size (capped for performance) so the fitted curve reproduces
+    // in the live sim — the spatial wave makes per-capita dynamics size-dependent.
+    cfg.size = Math.min(cfg.size, FIT_GRID_CAP);
+    // Single index case (patient-zero only) — the most realistic outbreak start, and
+    // the seeding the live sim uses by default. Anything else would shift the curve.
+    cfg.seedInfections = 0;
     cfg.defenses = cfg.defenses.map((d) => ({ ...d, enabled: false }));
     cfg.lockdown = { ...cfg.lockdown, enabled: false };
     cfg.quarantine = { ...cfg.quarantine, enabled: false };

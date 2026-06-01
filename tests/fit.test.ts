@@ -323,3 +323,41 @@ describe('R₀ confidence interval — loss-correct, honest degeneracy', () => {
     expect(b.r0CIKind).toBe(a.r0CIKind);
   }, 30_000);
 });
+
+describe('fit must run at the live grid size to reproduce', () => {
+  // A MemeLab outbreak spreads as a traveling wave from the single index case, so over
+  // a fixed horizon the *absolute* spread is ~grid-size-independent ⇒ per-capita deaths
+  // scale as 1/N. The R₀ Estimator therefore fits at the live grid size (R0Modal
+  // `fitBaseConfig`), not a fixed small grid — otherwise the fitted per-capita death
+  // curve wouldn't reproduce after Apply. A lethal, spreading strain so deaths matter.
+  const lethal: Partial<StrainGenes> = { attackRate: 0.25, range: 2, infectious: 6, incubation: 2, ifr: 0.05 };
+  const DAYS = 50;
+  const K = 6;
+  const mk = (size: number): SimConfig =>
+    baseConfig({ size, seedInfections: 0, strain: { ...baseConfig().strain, ...lethal } });
+  const finalDeaths = (cfg: SimConfig): number => {
+    const c = runTrials(cfg, DAYS, K, cfg.seed).curves.cumulative_deaths;
+    return c[c.length - 1];
+  };
+
+  it('per-capita deaths are size-dependent under single-index seeding', () => {
+    // The core reason the fit must use the live size. If this ever stops holding (e.g.
+    // seeding switched to a dense fraction), fitting on a small grid would be valid —
+    // but the model would no longer be a spatial wave.
+    const small = finalDeaths(mk(64));
+    const large = finalDeaths(mk(96));
+    // Both produce a real epidemic (guards a degenerate match at ~0); the smaller grid
+    // has the higher per-capita toll because the wave fills more of it.
+    expect(small).toBeGreaterThan(0.01);
+    expect(large).toBeGreaterThan(0.004);
+    expect(small / large).toBeGreaterThan(1.5); // ≈ (96/64)² as the wave fills less of a bigger grid
+  }, 30_000);
+
+  it('reproduces exactly when the fit and live grid sizes match', () => {
+    // Fitting at the live size makes the fit config == the live config, so the
+    // per-capita death curve is identical — deterministic, bit-for-bit.
+    const a = runTrials(mk(96), DAYS, K, mk(96).seed).curves.cumulative_deaths;
+    const b = runTrials(mk(96), DAYS, K, mk(96).seed).curves.cumulative_deaths;
+    expect(b).toEqual(a);
+  }, 30_000);
+});
