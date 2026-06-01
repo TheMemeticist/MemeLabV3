@@ -24,6 +24,8 @@
 
 import type { GeometryType, SimConfig, StrainGenes } from '../types';
 import { makeGeometry, torus } from '../sim/neighbors';
+import { Rng } from '../sim/rng';
+import { runGA } from './ga';
 
 // ─── Observed data ───────────────────────────────────────────────────────────
 
@@ -61,6 +63,13 @@ export interface SimResult {
 }
 
 export type LossType = 'poisson' | 'mse';
+
+/** How to read the R₀ confidence interval:
+ *  - `interval`: a genuine 95% profile-likelihood interval `[lo, hi]`.
+ *  - `exact`:    the data over-determines R₀ (noise-free / huge N) so the interval
+ *                collapses — reported honestly rather than as a zero-width "CI".
+ *  - `none`:     no interval available (R₀ unknown, or no R₀-driving param fitted). */
+export type CIKind = 'interval' | 'exact' | 'none';
 
 // ─── Fittable-parameter registry ─────────────────────────────────────────────
 // Each entry maps a strain gene to a search dimension. `get`/`set` localize the
@@ -259,10 +268,20 @@ export function analyticR0(
 }
 
 // ─── Optimizer ───────────────────────────────────────────────────────────────
-// Coarse grid scan (robust against the stochastic loss surface's local minima)
-// followed by a bounded Nelder–Mead simplex refine from the grid minimum. The
-// objective `evaluate(values) => Promise<loss>` is injected, so the optimizer is
-// agnostic about whether sims run in a worker pool or in-process.
+// Three derivative-free, pool-parallel stages:
+//   1. A seeded Latin-hypercube sample fills the parameter box with `budget`
+//      candidates — space-filling and, crucially, independent of dimensionality.
+//      (A full-factorial grid is `gridSteps^dims`, which explodes past 2–3 genes.)
+//   2. Successive-halving races those candidates on *trial count*: screen them all
+//      at a few stochastic trials, keep the top `1/eta`, re-run the survivors at
+//      `eta×` the trials, repeat to full fidelity. Common random numbers (shared
+//      trial seeds across candidates, see fit-sim.ts) keep low-trial ranking
+//      faithful, so the optimum is rarely screened out — and the bulk of the eval
+//      budget never gets spent on hopeless candidates.
+//   3. Multi-start Nelder–Mead refines the top survivors concurrently, so the
+//      worker pool stays saturated instead of idling behind one serial simplex.
+// The objective `evaluate(values, K)` is injected and takes the trial count, so
+// the optimizer is agnostic about where sims run; the pool memoizes by (genes, K).
 
 export interface GridSample {
   values: number[];
@@ -271,55 +290,182 @@ export interface GridSample {
 
 export interface OptimizeResult {
   best: GridSample;
-  /** Every coarse-grid sample, reused downstream for the profile-likelihood CI. */
-  grid: GridSample[];
   evaluations: number;
 }
 
 export interface OptimizeOptions {
   params: FitParamDef[];
-  /** Objective for the coarse grid scan (may use a reduced trial count). */
-  evaluate: (values: number[]) => Promise<number>;
-  /** Objective for the Nelder–Mead refine. Defaults to `evaluate` when omitted —
-   *  pass a full-fidelity variant to refine at higher accuracy than the grid. */
-  evaluateRefine?: (values: number[]) => Promise<number>;
-  /** Coarse-grid resolution per dimension. */
-  gridSteps?: number;
-  /** Max Nelder–Mead iterations. */
+  /** Objective at a chosen trial count K. Called at escalating K by the racing
+   *  stage and at `Kfull` by the refine; the injected pool memoizes by (genes,K). */
+  evaluate: (values: number[], K: number) => Promise<number>;
+  /** Full-fidelity trial count (final racing rung + Nelder–Mead refine). */
+  Kfull: number;
+  /** Quasi-random sampling budget. Defaults to 16·dims (min 16). */
+  budget?: number;
+  /** Successive-halving: starting trials per candidate and reduction factor. */
+  K0?: number;
+  eta?: number;
+  /** Nelder–Mead iterations per simplex. */
   nmIters?: number;
+  /** Independent NM restarts (top survivors), run concurrently. */
+  restarts?: number;
+  /** Seed for the deterministic Latin-hypercube sampler. */
+  seed: number;
   onProgress?: (done: number, total: number) => void;
   signal?: { aborted: boolean };
 }
 
 export async function optimize(opts: OptimizeOptions): Promise<OptimizeResult> {
-  const { params, evaluate } = opts;
-  const evaluateRefine = opts.evaluateRefine ?? evaluate;
-  const gridSteps = opts.gridSteps ?? (params.length >= 3 ? 4 : 6);
-  const nmIters = opts.nmIters ?? 40;
+  const { params, evaluate, Kfull } = opts;
   const dims = params.length;
+  const budget = Math.max(16, opts.budget ?? 16 * dims);
+  // Screen at a *reliable* trial count, not a noisy handful. Successive-halving
+  // assumes low-fidelity ranking is faithful, but high-variance objectives (e.g.
+  // Voronoi "settlements", where hub ignition is near-bimodal) can make a good
+  // candidate look terrible in 3–4 trials and get wrongly culled. Screening at
+  // ~half the full trials (min 8) keeps ranking trustworthy; the speedup then comes
+  // from not spending *full* trials on the clearly-bad tail (largest at high budget
+  // / dimensionality), not from shrinking the screen itself.
+  const K0 = Math.max(1, Math.min(opts.K0 ?? Math.max(8, Math.round(Kfull / 2)), Kfull));
+  const eta = Math.max(2, opts.eta ?? 2);
+  // 24 simplex iterations is plenty on a noisy stochastic objective — past that NM
+  // mostly chases sampling noise — and it's the dominant per-fit cost, so keeping it
+  // tight matters more than the (already cheap) screening.
+  const nmIters = opts.nmIters ?? 24;
+  const restarts = Math.max(1, opts.restarts ?? 3);
 
-  // Total is approximate (Nelder–Mead does a variable number of evals); it only
-  // drives the progress bar, so over-counting slightly is fine.
-  const gridTotal = Math.pow(gridSteps, dims);
-  const total = gridTotal + nmIters + 1;
+  // Approximate eval budget for the progress bar (over-counting is harmless).
+  const total = budget * 2 + restarts * nmIters + 1;
   let done = 0;
   const tick = () => { done++; opts.onProgress?.(Math.min(done, total), total); };
 
-  // ── Coarse grid ──
-  const axes = params.map((p) => linspace(p.bounds[0], p.bounds[1], gridSteps, p.integer));
-  const grid: GridSample[] = [];
-  const combos = cartesian(axes);
-  // Evaluate the grid concurrently; the injected pool serializes/parallelizes.
-  const losses = await mapWithProgress(combos, evaluate, opts.signal, tick);
-  for (let i = 0; i < combos.length; i++) grid.push({ values: combos[i], loss: losses[i] });
+  // ── 1. Initial candidate set ──
+  const rng = new Rng((opts.seed ^ 0xf17f17f1) >>> 0);
+  const candidates = sampleCandidates(params, budget, rng);
 
-  let best = grid.reduce((a, b) => (b.loss < a.loss ? b : a), grid[0]);
-  if (opts.signal?.aborted) return { best, grid, evaluations: done };
+  // ── 2. Successive-halving on trial count ──
+  const survivors = await successiveHalving(
+    candidates, evaluate, K0, eta, Kfull, restarts, opts.signal, tick,
+  );
+  if (opts.signal?.aborted || survivors.length === 0) {
+    const best = survivors[0] ?? { values: candidates[0], loss: Number.POSITIVE_INFINITY };
+    return { best, evaluations: done };
+  }
 
-  // ── Nelder–Mead refine ── (full-fidelity objective)
-  best = await nelderMead(best, params, evaluateRefine, nmIters, opts.signal, tick);
+  // ── 3. Multi-start Nelder–Mead refine (concurrent → pool stays busy) ──
+  const refineEval = (v: number[]) => evaluate(v, Kfull);
+  const refined = await Promise.all(
+    survivors.map((s) => nelderMead(s, params, refineEval, nmIters, opts.signal, tick)),
+  );
+  const best = refined.reduce((a, b) => (b.loss < a.loss ? b : a), survivors[0]);
 
-  return { best, grid, evaluations: done };
+  return { best, evaluations: done };
+}
+
+// Pick the initial candidate set. For 1–3 genes a full-factorial grid is both cheap
+// and *exhaustive* — it guarantees joint coverage of narrow basins (e.g. low attack
+// rate × range 1) that a sparse, randomly-paired Latin-hypercube can miss entirely,
+// which would strand the racing + local refine in a worse optimum. Past 3 genes the
+// grid is `steps^dims` and explodes, so we switch to a space-filling LHS of the same
+// budget — the dimensionality where LHS's scaling earns its slightly weaker coverage.
+function sampleCandidates(params: FitParamDef[], budget: number, rng: Rng): number[][] {
+  if (params.length <= 3) {
+    const steps = Math.max(2, Math.round(Math.pow(budget, 1 / params.length)));
+    return gridCandidates(params, steps);
+  }
+  return latinHypercube(params, budget, rng);
+}
+
+// Full-factorial grid: a per-axis set of `steps` evenly-spaced values (integer axes
+// enumerate their distinct integers, capped at `steps`), then the Cartesian product.
+function gridCandidates(params: FitParamDef[], steps: number): number[][] {
+  const axes = params.map((p) => {
+    const [lo, hi] = p.bounds;
+    if (p.integer) {
+      const a = Math.round(lo);
+      const span = Math.round(hi) - a;
+      const count = Math.min(span + 1, Math.max(2, steps));
+      const out: number[] = [];
+      for (let i = 0; i < count; i++) out.push(Math.round(a + (span * i) / (count - 1)));
+      return Array.from(new Set(out));
+    }
+    if (steps <= 1) return [(lo + hi) / 2];
+    const out: number[] = [];
+    for (let i = 0; i < steps; i++) out.push(lo + ((hi - lo) * i) / (steps - 1));
+    return out;
+  });
+  return axes.reduce<number[][]>(
+    (acc, axis) => acc.flatMap((combo) => axis.map((v) => [...combo, v])),
+    [[]],
+  );
+}
+
+// Latin-hypercube sample over the parameter box: stratify each axis into `n` equal
+// bins, draw one jittered point per bin, then shuffle the per-axis columns
+// independently so the strata recombine without correlation. Integer axes are
+// rounded (small ranges yield repeats, which the pool cache dedupes for free).
+export function latinHypercube(params: FitParamDef[], n: number, rng: Rng): number[][] {
+  const cols = params.map((p) => {
+    const col: number[] = [];
+    const [lo, hi] = p.bounds;
+    for (let i = 0; i < n; i++) {
+      const u = (i + rng.random()) / n; // stratified jitter in [0,1)
+      const v = lo + u * (hi - lo);
+      col.push(p.integer ? Math.round(v) : v);
+    }
+    for (let i = n - 1; i > 0; i--) {
+      const j = rng.intRange(i + 1);
+      const t = col[i]; col[i] = col[j]; col[j] = t;
+    }
+    return col;
+  });
+  const out: number[][] = [];
+  for (let i = 0; i < n; i++) out.push(cols.map((c) => c[i]));
+  return out;
+}
+
+// Successive-halving (Hyperband's inner loop): evaluate the whole pool at the
+// current trial count, sort by loss, keep the top `1/eta` (never below
+// `keepFinal`), bump the trial count by `eta`, repeat until the survivors have
+// been scored at full fidelity. Returns the `keepFinal` best, each scored at Kfull.
+async function successiveHalving(
+  candidates: number[][],
+  evaluate: (v: number[], K: number) => Promise<number>,
+  K0: number,
+  eta: number,
+  Kfull: number,
+  keepFinal: number,
+  signal: { aborted: boolean } | undefined,
+  tick: () => void,
+): Promise<GridSample[]> {
+  let pool: GridSample[] = candidates.map((values) => ({ values, loss: Number.POSITIVE_INFINITY }));
+  let K = Math.min(K0, Kfull);
+
+  for (;;) {
+    if (signal?.aborted) break;
+    const losses = await Promise.all(
+      pool.map(async (c) => {
+        if (signal?.aborted) return Number.POSITIVE_INFINITY;
+        const loss = await evaluate(c.values, K);
+        tick();
+        return loss;
+      }),
+    );
+    pool.forEach((c, i) => { c.loss = losses[i]; });
+    pool.sort((a, b) => a.loss - b.loss);
+
+    if (K >= Kfull) break; // survivors now scored at full fidelity
+    const nextN = Math.max(keepFinal, Math.ceil(pool.length / eta));
+    if (nextN >= pool.length) {
+      // Can't shrink further without dropping below keepFinal — jump to full K.
+      pool = pool.slice(0, nextN);
+      K = Kfull;
+    } else {
+      pool = pool.slice(0, nextN);
+      K = Math.min(Kfull, K * eta);
+    }
+  }
+  return pool.slice(0, keepFinal);
 }
 
 async function nelderMead(
@@ -403,17 +549,31 @@ async function nelderMead(
 // ─── Orchestrator ────────────────────────────────────────────────────────────
 
 export interface FitOptions {
-  /** Stochastic trials per candidate (10–100), used for the refine + CI passes. */
+  /** Full-fidelity stochastic trials per candidate (final racing rung, refine, and
+   *  CI sweep). The racing stage screens most candidates at far fewer (see `K0`). */
   K: number;
-  /** Trials per candidate for the coarse grid scan. The grid is the largest eval
-   *  count and tolerates noise, so it runs at a reduced K for speed; defaults to
-   *  ~K/3 (min 8). The refined optimum + CI sweep still run at full K. */
-  gridK?: number;
   loss: LossType;
   /** Real-world population the observed counts are drawn from. */
   population: number;
-  gridSteps?: number;
+  /** Quasi-random sampling budget (default 16·#params). */
+  budget?: number;
+  /** Successive-halving starting trials + reduction factor (defaults 4, 3). */
+  K0?: number;
+  eta?: number;
   nmIters?: number;
+  /** Nelder–Mead restarts from the top survivors (default 3). */
+  restarts?: number;
+  /** Search strategy: `local` (grid/LHS → Nelder–Mead) or `genetic` (population
+   *  GA — global, robust on rugged/multimodal surfaces). Defaults to `local` in the
+   *  core; the UI defaults to `genetic`. */
+  optimizer?: 'local' | 'genetic';
+  /** GA knobs (only used when optimizer === 'genetic'; sensible defaults in runGA). */
+  gaPopulation?: number;
+  gaGenerations?: number;
+  gaMutationRate?: number;
+  gaCrossoverRate?: number;
+  gaElitism?: number;
+  gaTournament?: number;
 }
 
 /** Best-so-far snapshot streamed during a fit so the UI can animate convergence. */
@@ -448,6 +608,8 @@ export interface FitResult {
   params: FittedParam[];
   r0: number | null;
   r0CI: [number, number] | null;
+  /** How to read `r0CI` — a real interval, an over-determined point, or absent. */
+  r0CIKind: CIKind;
   gof: GoodnessOfFit;
   loss: number;
   days: number;
@@ -468,14 +630,9 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     return cfg;
   };
 
-  // Coarse grid runs at a reduced trial count (it tolerates noise and dominates
-  // the eval budget); the refine + CI run at full K. The pool memoizes by params
-  // *and* K, so the two phases never collide and each phase reuses its own grid.
-  const gridK = Math.max(8, Math.min(req.K, req.gridK ?? Math.round(req.K / 3)));
-
-  // One sim of a candidate at `K` trials, yielding both the loss and the engine's
-  // R₀. The pool memoizes by params+K, so the optimizer, the final best, and the
-  // CI sweep all share results for free.
+  // One sim of a candidate at `K` trials, yielding the loss, the engine's R₀, and
+  // the curves. The pool memoizes by (genes, K), so the racing rungs, the refine,
+  // the final best, and the CI sweep all share results for free.
   const evalAt = async (
     values: number[],
     K: number,
@@ -483,10 +640,11 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     const result = await req.simulate(configFor(values), days, K, baseSeed);
     return { loss: lossOf(req.observed, result.curves, req.population, req.loss), r0: result.rNaught, result };
   };
-  const evalFull = (values: number[]) => evalAt(values, req.K);
 
-  // Stream the best-so-far to the UI. Tracked across both objectives so the live
-  // overlay only ever moves toward better fits.
+  // Stream the best-so-far to the UI — but only from full-fidelity (Kfull) evals,
+  // so the live overlay compares like-for-like. Losses from the low-trial racing
+  // rungs are noisier and not comparable across rungs, so feeding them in would
+  // let a lucky low-K candidate pin `bestLoss` and freeze the overlay.
   let bestLoss = Number.POSITIVE_INFINITY;
   const reportIfBetter = (loss: number, values: number[], result: SimResult, r0: number | null): void => {
     if (!req.onImprove || !Number.isFinite(loss) || loss >= bestLoss) return;
@@ -494,26 +652,48 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     req.onImprove({ values: values.slice(), curves: result.curves, loss, r0 });
   };
 
-  const makeEvaluate = (K: number) => async (values: number[]): Promise<number> => {
+  const evaluate = async (values: number[], K: number): Promise<number> => {
     if (req.signal?.aborted) return Number.POSITIVE_INFINITY;
     const { loss, r0, result } = await evalAt(values, K);
-    reportIfBetter(loss, values, result, r0);
+    if (K >= req.K) reportIfBetter(loss, values, result, r0);
     return loss;
   };
 
-  const opt = await optimize({
-    params: req.params,
-    evaluate: makeEvaluate(gridK),
-    evaluateRefine: makeEvaluate(req.K),
-    gridSteps: req.gridSteps,
-    nmIters: req.nmIters,
-    signal: req.signal,
-    onProgress: (d, t) => req.onProgress?.(d / t),
-  });
+  const onProgress = (d: number, t: number): void => { req.onProgress?.(d / t); };
+  const opt = req.optimizer === 'genetic'
+    ? await runGA({
+        params: req.params,
+        evaluate,
+        Kfull: req.K,
+        K0: req.K0,
+        seed: baseSeed,
+        population: req.gaPopulation,
+        generations: req.gaGenerations,
+        mutationRate: req.gaMutationRate,
+        crossoverRate: req.gaCrossoverRate,
+        elitism: req.gaElitism,
+        tournament: req.gaTournament,
+        signal: req.signal,
+        onProgress,
+      })
+    : await optimize({
+        params: req.params,
+        evaluate,
+        Kfull: req.K,
+        budget: req.budget,
+        K0: req.K0,
+        eta: req.eta,
+        nmIters: req.nmIters,
+        restarts: req.restarts,
+        seed: baseSeed,
+        signal: req.signal,
+        onProgress,
+      });
 
   const bestConfig = configFor(opt.best.values);
-  const best = await evalFull(opt.best.values); // cache hit
-  const r0CI = await profileR0CI(opt, req, evalFull);
+  const best = await evalAt(opt.best.values, req.K); // cache hit
+  const ciEval = (values: number[]) => evalAt(values, req.K).then((r) => ({ loss: r.loss, r0: r.r0 }));
+  const { ci: r0CI, kind: r0CIKind } = await profileR0CI(opt.best, req, ciEval);
 
   return {
     params: req.params.map((p, i) => ({
@@ -525,6 +705,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     // consistent with the topbar readout (no separate analytic formula).
     r0: best.r0,
     r0CI,
+    r0CIKind,
     gof: goodnessOfFit(req.observed, best.result.curves, req.population),
     loss: opt.best.loss,
     days,
@@ -538,51 +719,94 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
 // Parameters that move R₀ — the CI is only profiled over these.
 const R0_DRIVERS = new Set<FitParamName>(['attackRate', 'range', 'infectious']);
 
-// Profile-likelihood 95% CI on R₀. We sweep each R₀-driving parameter
-// one-at-a-time through the refined optimum (holding the others at their best
-// values), keeping the R₀ (the engine's own estimate, returned by `evalFull`)
-// of every candidate whose loss is within ΔNLL ≤ 1.92 (½·χ²₁,₀.₉₅) of the global
-// minimum. A per-axis sweep gives a far tighter, unbiased interval than the
-// coarse grid alone (whose nodes routinely straddle the true value). Works for
-// every geometry, since R₀ comes from the engine rather than a closed form.
+// χ²₁,₀.₉₅ / 2 — the profile-likelihood deviance threshold for a 95% interval on a
+// single parameter (here R₀, profiled through its driving genes).
+const CHI2_HALF = 1.920729;
+
+// Convert a raw loss into a deviance whose *differences* are χ²₁-calibrated, so the
+// one threshold (CHI2_HALF) is valid for both loss functions. Poisson NLL is
+// already a log-likelihood → use as-is. Least-squares maps to the Gaussian profile
+// deviance (n/2)·ln(SSR); with SSR = n·MSE the constant ln(n) cancels in
+// differences, so (n/2)·ln(MSE) suffices. Without this, applying the NLL threshold
+// directly to a raw MSE (which can run into the thousands) puts *every* off-optimum
+// candidate past the cutoff and collapses the interval to a point.
+function deviance(loss: number, type: LossType, n: number): number {
+  return type === 'poisson' ? loss : (n / 2) * Math.log(Math.max(loss, EPS));
+}
+
+export interface CIResult {
+  ci: [number, number] | null;
+  kind: CIKind;
+}
+
+// Profile-likelihood 95% CI on R₀. Holding the other genes at the optimum, we walk
+// each R₀-driving axis outward from the optimum and bisect for the last point whose
+// deviance stays within CHI2_HALF of the minimum; the engine's R₀ at those crossing
+// points bounds the interval. Local bisection gives a far tighter, unbiased interval
+// than the old full-bounds coarse sweep — and when the data over-determines R₀
+// (noise-free / huge N) the interval collapses, which we report honestly as `exact`
+// rather than a misleading zero-width "95% CI". Works for every geometry, since R₀
+// comes from the engine rather than a closed form.
 async function profileR0CI(
-  opt: OptimizeResult,
+  best: GridSample,
   req: FitRequest,
   evalFull: (values: number[]) => Promise<{ loss: number; r0: number | null }>,
-): Promise<[number, number] | null> {
-  const samples: { r0: number; loss: number }[] = [];
-  let minLoss = Infinity;
+): Promise<CIResult> {
+  const n = req.observed.length;
+  const drivers = req.params
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => R0_DRIVERS.has(p.name));
+  if (drivers.length === 0 || n === 0) return { ci: null, kind: 'none' };
 
-  const add = (r0: number | null, loss: number): void => {
+  const base = await evalFull(best.values);
+  if (base.r0 == null) return { ci: null, kind: 'none' };
+  const minDev = deviance(base.loss, req.loss, n);
+
+  let lo = base.r0;
+  let hi = base.r0;
+  const consider = (r0: number | null): void => {
     if (r0 == null) return;
-    samples.push({ r0, loss });
-    if (loss < minLoss) minLoss = loss;
+    if (r0 < lo) lo = r0;
+    if (r0 > hi) hi = r0;
   };
 
-  // Candidates to profile: the refined optimum plus a per-axis sweep through it
-  // (only the R₀-driving axes). All are cache-backed in the pool.
-  const candidates: number[][] = [opt.best.values];
-  req.params.forEach((p, i) => {
-    if (!R0_DRIVERS.has(p.name)) return;
-    for (const v of linspace(p.bounds[0], p.bounds[1], 9, p.integer)) {
-      const values = opt.best.values.slice();
-      values[i] = v;
-      candidates.push(values);
+  // Excess deviance + R₀ at a candidate differing from the optimum only on axis `i`.
+  const evalAxis = async (i: number, x: number) => {
+    const values = best.values.slice();
+    values[i] = x;
+    const r = await evalFull(values);
+    return { excess: deviance(r.loss, req.loss, n) - minDev, r0: r.r0 };
+  };
+
+  for (const { p, i } of drivers) {
+    const x0 = best.values[i];
+    for (const bound of [p.bounds[0], p.bounds[1]]) {
+      if (bound === x0) continue;
+      const edge = await evalAxis(i, bound);
+      if (edge.excess <= CHI2_HALF) {
+        // The whole half-axis stays within the threshold → the bound is the edge.
+        consider(edge.r0);
+        continue;
+      }
+      // Bisect between x0 (inside) and the bound (outside) for the last inside point.
+      let inside = x0;
+      let outside = bound;
+      let r0Inside = base.r0;
+      for (let it = 0; it < 11; it++) { // 2^-11 of the axis range — finer than the noise floor
+        const mid = p.integer ? Math.round((inside + outside) / 2) : (inside + outside) / 2;
+        if (mid === inside || mid === outside) break; // integer axis converged
+        const m = await evalAxis(i, mid);
+        if (m.excess <= CHI2_HALF) { inside = mid; if (m.r0 != null) r0Inside = m.r0; }
+        else { outside = mid; }
+      }
+      consider(r0Inside);
     }
-  });
-
-  await Promise.all(candidates.map((values) => evalFull(values).then((r) => add(r.r0, r.loss))));
-  if (samples.length === 0) return null; // R₀ unavailable (e.g. grid < 8)
-
-  const threshold = minLoss + 1.92;
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (const s of samples) {
-    if (s.loss > threshold) continue;
-    lo = Math.min(lo, s.r0);
-    hi = Math.max(hi, s.r0);
   }
-  return lo <= hi ? [lo, hi] : null;
+
+  // Over-determined data pins R₀ — report it honestly instead of "x – x".
+  const rel = base.r0 !== 0 ? (hi - lo) / Math.abs(base.r0) : hi - lo;
+  if (rel < 1e-3) return { ci: null, kind: 'exact' };
+  return { ci: [lo, hi], kind: 'interval' };
 }
 
 // ─── CSV / TSV parser ────────────────────────────────────────────────────────
@@ -638,44 +862,4 @@ export function proposeInitialGuess(_observed: ObservedPoint[], params: FitParam
 
 export function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
-}
-
-function linspace(lo: number, hi: number, steps: number, integer?: boolean): number[] {
-  if (integer) {
-    // One grid point per integer in range, capped at `steps` for wide bounds.
-    const span = Math.round(hi) - Math.round(lo);
-    const count = Math.min(span + 1, Math.max(2, steps));
-    const out: number[] = [];
-    for (let i = 0; i < count; i++) {
-      out.push(Math.round(lo + (span * i) / (count - 1)));
-    }
-    return Array.from(new Set(out));
-  }
-  if (steps <= 1) return [(lo + hi) / 2];
-  const out: number[] = [];
-  for (let i = 0; i < steps; i++) out.push(lo + ((hi - lo) * i) / (steps - 1));
-  return out;
-}
-
-function cartesian(axes: number[][]): number[][] {
-  return axes.reduce<number[][]>(
-    (acc, axis) => acc.flatMap((combo) => axis.map((v) => [...combo, v])),
-    [[]],
-  );
-}
-
-async function mapWithProgress(
-  combos: number[][],
-  evaluate: (v: number[]) => Promise<number>,
-  signal: { aborted: boolean } | undefined,
-  tick: () => void,
-): Promise<number[]> {
-  return Promise.all(
-    combos.map(async (c) => {
-      if (signal?.aborted) return Number.POSITIVE_INFINITY;
-      const loss = await evaluate(c);
-      tick();
-      return loss;
-    }),
-  );
 }

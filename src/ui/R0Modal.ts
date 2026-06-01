@@ -46,6 +46,14 @@ const CAT_COLOR: Record<FitCategory, string> = {
   active_infections: 'rgb(34, 197, 94)',
 };
 
+// Short legend labels — the full CATEGORY_LABELS ("Cumulative infections") make the
+// legend pills overflow and hide the value readout, so the chart uses these instead.
+const CAT_SHORT: Record<FitCategory, string> = {
+  cumulative_infections: 'Infections',
+  cumulative_deaths: 'Deaths',
+  active_infections: 'Active',
+};
+
 // The demo dataset is generated from the engine itself (via the worker pool) at
 // a planted attackRate + range, sampled every few days and scaled to a
 // population. Because it overrides only the two parameters the default fit
@@ -115,6 +123,19 @@ const HISTORICAL_PRESETS: DemoPreset[] = [
 // Persisted snapshot of the panel so a closed/reopened session restores exactly
 // (settings *and* the observed dataset/preset). Versioned via storage.ts.
 const STORAGE_KEY = 'r0-estimator';
+type OptimizerKind = 'local' | 'genetic';
+interface GASettings {
+  population: number;
+  generations: number;
+  mutationRate: number;
+  crossoverRate: number;
+  elitism: number;
+  tournament: number;
+}
+const DEFAULT_GA: GASettings = {
+  population: 40, generations: 25, mutationRate: 0.2, crossoverRate: 0.9, elitism: 2, tournament: 3,
+};
+
 interface R0Snapshot {
   population: number;
   selected: FitParamName[];
@@ -123,6 +144,9 @@ interface R0Snapshot {
   loss: LossType;
   observed: ObservedPoint[];
   presetId: string;
+  optimizer?: OptimizerKind;
+  ga?: GASettings;
+  indexOffset?: number;
 }
 
 export class R0Modal {
@@ -139,6 +163,13 @@ export class R0Modal {
   );
   private K = 30;
   private loss: LossType = 'poisson';
+  // Days to shift the dataset later in model time — gives the outbreak a head start
+  // before the first reported case (corrects for early under-detection). 0 = none.
+  private indexOffset = 0;
+  // Genetic algorithm is the default search — global and robust on MemeLab's rugged,
+  // multimodal loss surfaces, and it evolves the disease genome the way the sim does.
+  private optimizer: OptimizerKind = 'genetic';
+  private ga: GASettings = { ...DEFAULT_GA };
   private presetId = 'synthetic';
   private running = false;
   private signal = { aborted: false };
@@ -215,6 +246,9 @@ export class R0Modal {
       loss: this.loss,
       observed: this.observed,
       presetId: this.presetId,
+      optimizer: this.optimizer,
+      ga: { ...this.ga },
+      indexOffset: this.indexOffset,
     });
   }
 
@@ -232,6 +266,9 @@ export class R0Modal {
     if (s.loss === 'mse' || s.loss === 'poisson') this.loss = s.loss;
     if (Array.isArray(s.observed)) this.observed = s.observed.map((p) => ({ ...p }));
     if (typeof s.presetId === 'string') this.presetId = s.presetId;
+    if (s.optimizer === 'local' || s.optimizer === 'genetic') this.optimizer = s.optimizer;
+    if (s.ga && typeof s.ga === 'object') this.ga = { ...DEFAULT_GA, ...s.ga };
+    if (Number.isFinite(s.indexOffset)) this.indexOffset = Math.max(0, Math.round(s.indexOffset!));
   }
 
   private onKey = (ev: KeyboardEvent) => {
@@ -249,9 +286,21 @@ export class R0Modal {
       if (Number.isFinite(v) && v > 0) { this.population = v; this.persist(); }
     });
 
+    const offsetInput = q<HTMLInputElement>('[data-r0="offset"]');
+    offsetInput.value = String(this.indexOffset);
+    offsetInput.addEventListener('change', () => {
+      const v = Number(offsetInput.value);
+      this.indexOffset = Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+      offsetInput.value = String(this.indexOffset);
+      this.persist();
+    });
+
     q<HTMLButtonElement>('[data-r0="add-row"]').addEventListener('click', () => {
       const lastDay = this.observed.length ? Math.max(...this.observed.map((p) => p.day)) : 0;
       this.observed.push({ day: lastDay + 1, value: 0, category: 'cumulative_infections' });
+      // Reveal the table so the new row is visible even when collapsed.
+      const details = this.el!.querySelector<HTMLDetailsElement>('[data-r0="data-details"]');
+      if (details) details.open = true;
       this.renderTable();
       this.persist();
     });
@@ -314,6 +363,35 @@ export class R0Modal {
       });
     });
 
+    // Optimizer toggle (local vs genetic) + show/hide the GA controls.
+    this.el!.querySelectorAll<HTMLButtonElement>('[data-opt]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        this.optimizer = btn.dataset['opt'] as OptimizerKind;
+        this.syncOptimizerUI();
+        this.persist();
+      });
+    });
+
+    // GA numeric controls — bind each to its GASettings field.
+    const gaFields: [keyof GASettings, number, number][] = [
+      ['population', 8, 200], ['generations', 1, 100], ['mutationRate', 0, 1],
+      ['crossoverRate', 0, 1], ['elitism', 0, 20], ['tournament', 2, 10],
+    ];
+    for (const [key, lo, hi] of gaFields) {
+      const input = this.el!.querySelector<HTMLInputElement>(`[data-ga="${key}"]`);
+      if (!input) continue;
+      input.value = String(this.ga[key]);
+      input.addEventListener('change', () => {
+        const v = Number(input.value);
+        if (Number.isFinite(v)) {
+          this.ga[key] = Math.min(hi, Math.max(lo, v));
+          input.value = String(this.ga[key]);
+          this.persist();
+        }
+      });
+    }
+    this.syncOptimizerUI();
+
     q<HTMLButtonElement>('[data-r0="run"]').addEventListener('click', () => this.run());
     q<HTMLButtonElement>('[data-r0="cancel"]').addEventListener('click', () => { this.signal.aborted = true; });
     q<HTMLButtonElement>('[data-r0="apply"]').addEventListener('click', () => {
@@ -359,6 +437,19 @@ export class R0Modal {
     });
     const count = this.el!.querySelector<HTMLElement>('[data-r0="row-count"]');
     if (count) count.textContent = `${this.observed.length} point${this.observed.length === 1 ? '' : 's'}`;
+    this.fillPasteBox();
+  }
+
+  /** Mirror the current dataset into the Paste CSV box so the user can see and copy
+   *  the expected `day,value,category` format. Skipped while the box is focused so
+   *  we never clobber what they're actively typing/pasting. */
+  private fillPasteBox(): void {
+    const ta = this.el?.querySelector<HTMLTextAreaElement>('[data-r0="paste"]');
+    if (!ta || document.activeElement === ta) return;
+    const header = 'day,value,category';
+    const rows = this.observed.map((p) => `${p.day},${p.value},${p.category}`);
+    // Header makes the columns self-evident; the parser skips it (non-numeric row).
+    ta.value = [header, ...rows].join('\n');
   }
 
   // ── Parameter checkboxes + bounds ──
@@ -403,6 +494,18 @@ export class R0Modal {
   private async run(): Promise<void> {
     if (this.running || !this.pool) return;
     if (this.observed.length < 2) { this.note('Add at least two observed points.'); return; }
+
+    // Shift every observed day later in model time by the index-case offset, so the
+    // simulated outbreak (which starts at model day 0) gets a head start before the
+    // first reported case — correcting for early under-detection.
+    const off = this.indexOffset || 0;
+    const observed = this.observed
+      .filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value))
+      .map((p) => (off ? { ...p, day: p.day + off } : p));
+    // Curve timing (incubation, infectious) is what fits the rise + peak shape; if
+    // the data clearly spans a peak/plateau and the user hasn't enabled those genes,
+    // add them so R² isn't capped by attack-rate + range alone.
+    const expanded = this.autoExpandShapeParams(observed);
     const params = this.activeParams();
     if (params.length === 0) { this.note('Select at least one parameter to fit.'); return; }
 
@@ -412,8 +515,8 @@ export class R0Modal {
     const bar = this.el!.querySelector<HTMLElement>('[data-r0="progress-fill"]')!;
     bar.style.width = '0%';
 
-    const observed = this.observed.filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value));
     this.renderLive(observed); // persistent chart + provisional metrics, updated live
+    if (expanded) this.note('Timing params added (your data spans the peak) — fitting…');
 
     const base = this.fitBaseConfig();
     try {
@@ -424,6 +527,13 @@ export class R0Modal {
         population: this.population,
         K: this.K,
         loss: this.loss,
+        optimizer: this.optimizer,
+        gaPopulation: this.ga.population,
+        gaGenerations: this.ga.generations,
+        gaMutationRate: this.ga.mutationRate,
+        gaCrossoverRate: this.ga.crossoverRate,
+        gaElitism: this.ga.elitism,
+        gaTournament: this.ga.tournament,
         simulate: (cfg, days, K, seed) => this.pool!.simulate(cfg, days, K, seed),
         signal: this.signal,
         onProgress: (frac) => { bar.style.width = `${Math.round(frac * 100)}%`; },
@@ -572,6 +682,48 @@ export class R0Modal {
     }));
   }
 
+  /** Reflect the active optimizer in the toggle, and show the GA controls only when
+   *  the genetic optimizer is selected. */
+  private syncOptimizerUI(): void {
+    if (!this.el) return;
+    this.el.querySelectorAll<HTMLButtonElement>('[data-opt]').forEach((b) =>
+      b.classList.toggle('active', b.dataset['opt'] === this.optimizer));
+    const gaBlock = this.el.querySelector<HTMLElement>('[data-r0="ga-controls"]');
+    if (gaBlock) gaBlock.hidden = this.optimizer !== 'genetic';
+  }
+
+  /** When the data spans a peak/plateau, auto-enable the timing genes (incubation,
+   *  infectious) so the fit can match curve shape, not just height. Returns whether
+   *  anything was added (so the caller can surface a note). User can uncheck them. */
+  private autoExpandShapeParams(observed: ObservedPoint[]): boolean {
+    if (!this.dataSpansPeak(observed)) return false;
+    let added = false;
+    for (const name of ['incubation', 'infectious'] as FitParamName[]) {
+      if (!this.selected.has(name)) { this.selected.add(name); added = true; }
+    }
+    if (added) { this.renderParams(); this.persist(); }
+    return added;
+  }
+
+  /** Heuristic: does the observed data actually *identify* the timing genes? Only
+   *  an active-infections (prevalence) curve with an interior peak does — its rise
+   *  and fall pin incubation + infectious. A cumulative-only curve does not: many
+   *  (incubation, infectious) pairs reproduce the same cumulative shape, so adding
+   *  those genes there is ill-posed and sends the optimizer to a degenerate corner.
+   *  So we require an interior peak in active_infections and stay 2-param otherwise. */
+  private dataSpansPeak(observed: ObservedPoint[]): boolean {
+    const active = observed
+      .filter((p) => p.category === 'active_infections')
+      .sort((a, b) => a.day - b.day);
+    if (active.length < 4) return false;
+    let maxIdx = 0;
+    for (let i = 1; i < active.length; i++) if (active[i].value > active[maxIdx].value) maxIdx = i;
+    // Interior peak (rises then clearly falls) — both phases present.
+    return maxIdx > 0
+      && maxIdx < active.length - 1
+      && active[active.length - 1].value < active[maxIdx].value * 0.7;
+  }
+
   private setRunning(on: boolean): void {
     const run = this.el!.querySelector<HTMLButtonElement>('[data-r0="run"]')!;
     const cancel = this.el!.querySelector<HTMLButtonElement>('[data-r0="cancel"]')!;
@@ -620,7 +772,12 @@ export class R0Modal {
     applyBtn.disabled = false;
 
     const r0 = r.r0 == null ? '—' : r.r0.toFixed(2);
-    const ci = r.r0CI ? `${r.r0CI[0].toFixed(2)} – ${r.r0CI[1].toFixed(2)}` : '—';
+    // Read the CI honestly: a real interval, an over-determined point estimate, or
+    // none. An equal-bounds "95% CI 10.89 – 10.89" is misleading, so we don't show it.
+    const ciSub =
+      r.r0CIKind === 'exact' ? '≈ exact (data over-determines R₀)'
+      : r.r0CI ? `95% CI ${r.r0CI[0].toFixed(2)} – ${r.r0CI[1].toFixed(2)}`
+      : '95% CI —';
     const rating = gofRating(r.gof.r2);
     const barPct = Math.max(0, Math.min(1, r.gof.r2)) * 100;
     const paramRows = r.params
@@ -632,7 +789,7 @@ export class R0Modal {
         <div class="r0-metric r0-metric-hero">
           <span class="r0-metric-label">Basic reproduction number</span>
           <span class="r0-metric-value">R₀ = ${r0}</span>
-          <span class="r0-metric-sub">95% CI ${ci}</span>
+          <span class="r0-metric-sub">${ciSub}</span>
         </div>
         <div class="r0-metric r0-gof ${rating.cls}">
           <span class="r0-metric-label">Goodness of fit</span>
@@ -664,6 +821,11 @@ export class R0Modal {
     this.livePop = population;
     this.liveCats = FIT_CATEGORIES.filter((c) => observed.some((p) => p.category === c));
 
+    // Legend readout: the model curves carry fractional means (fraction × pop), so
+    // format them as compact counts instead of dumping a long-decimal float.
+    const legendVal = (_u: uPlot, v: number | null): string =>
+      v == null || !Number.isFinite(v) ? '–' : fmtNum(v);
+
     const xs = this.chartXs(days);
     const data: (number | null)[][] = [xs];
     const series: uPlot.Series[] = [{}];
@@ -677,15 +839,30 @@ export class R0Modal {
       }
       data.push(sim, obs);
       series.push(
-        { label: `${CATEGORY_LABELS[cat]} (sim)`, stroke: CAT_COLOR[cat], width: 2 },
+        { label: `${CAT_SHORT[cat]} · model`, stroke: CAT_COLOR[cat], width: 2, value: legendVal },
         {
-          label: `${CATEGORY_LABELS[cat]} (obs)`,
+          label: `${CAT_SHORT[cat]} · data`,
           stroke: CAT_COLOR[cat],
           paths: () => null, // dots only
           points: { show: true, size: 7, stroke: CAT_COLOR[cat], fill: '#fff' },
+          value: legendVal,
         },
       );
     }
+
+    // uPlot draws axis ticks, labels and grid on canvas, so they ignore CSS — feed
+    // them the theme colors explicitly or they render in uPlot's default near-black,
+    // which is invisible against the dark "Lab" theme.
+    const css = getComputedStyle(document.documentElement);
+    const axisInk = css.getPropertyValue('--text-muted').trim() || '#6b7280';
+    const gridInk = css.getPropertyValue('--border').trim() || 'rgba(128,128,128,0.25)';
+    const axisOpts = (label: string, extra: uPlot.Axis): uPlot.Axis => ({
+      label,
+      stroke: axisInk,
+      grid: { stroke: gridInk, width: 1 },
+      ticks: { stroke: gridInk, width: 1 },
+      ...extra,
+    });
 
     const w = host.clientWidth || 520;
     this.plot = new uPlot(
@@ -697,10 +874,10 @@ export class R0Modal {
         legend: { show: true },
         scales: { x: { time: false } },
         axes: [
-          { label: 'Day', space: 56, values: (_u, splits) => splits.map((v) => String(Math.round(v))) },
+          axisOpts('Day', { space: 56, values: (_u, splits) => splits.map((v) => String(Math.round(v))) }),
           // fmtNum keeps big counts compact (12k, 1.2M) so ticks stay inside the
           // gutter instead of clipping; the wider size + gaps give the label room.
-          { label: 'Count', size: 76, gap: 8, labelGap: 8, values: (_u, splits) => splits.map((v) => fmtNum(v)) },
+          axisOpts('Count', { size: 76, gap: 8, labelGap: 8, values: (_u, splits) => splits.map((v) => fmtNum(v)) }),
         ],
         series,
       },
@@ -788,12 +965,14 @@ const TEMPLATE = `
       <span>Population</span>
       <input class="r0-in" type="number" step="any" min="1" data-r0="population" />
     </label>
-    <div class="r0-table">
-      <div class="r0-row r0-row-head">
-        <span>Day</span><span>Value</span><span>Category</span><span></span>
-      </div>
-      <div data-r0="rows"></div>
-    </div>
+    <label class="r0-field">
+      <span>Index-case offset (days)</span>
+      <input class="r0-in" type="number" step="1" min="0" max="365" data-r0="offset" />
+    </label>
+    <p class="r0-blurb r0-hint">Shifts every data point this many days later in model time, giving the
+      outbreak a head start before the first reported case. Early surveillance undercounts a new
+      epidemic (low testing, sampling bias), so the true index case usually predates the data — raise
+      this if the model can't grow fast enough to reach the earliest points.</p>
     <div class="r0-actions">
       <label class="r0-check" style="gap:6px">Dataset
         <select class="r0-in" data-r0="preset" aria-label="Load a dataset">
@@ -802,8 +981,16 @@ const TEMPLATE = `
       </label>
       <button class="btn ghost" type="button" data-r0="add-row">+ Add row</button>
       <button class="btn ghost" type="button" data-r0="clear">Clear</button>
-      <span class="r0-muted" data-r0="row-count"></span>
     </div>
+    <details class="r0-details r0-data-details" data-r0="data-details">
+      <summary>Data table · <span class="r0-muted" data-r0="row-count"></span></summary>
+      <div class="r0-table">
+        <div class="r0-row r0-row-head">
+          <span>Day</span><span>Value</span><span>Category</span><span></span>
+        </div>
+        <div data-r0="rows"></div>
+      </div>
+    </details>
     <details class="r0-details">
       <summary>Paste CSV / TSV</summary>
       <textarea class="r0-paste" data-r0="paste" rows="4"
@@ -824,14 +1011,29 @@ const TEMPLATE = `
   <section class="r0-section">
     <h3>3 · Run</h3>
     <div class="r0-run-controls">
+      <div class="r0-toggle" role="group" aria-label="Search strategy">
+        <button class="r0-toggle-btn" type="button" data-opt="genetic" title="Population-based global evolutionary search — robust on rugged, multimodal surfaces">Genetic algorithm</button>
+        <button class="r0-toggle-btn" type="button" data-opt="local" title="Grid/Latin-hypercube sample → Nelder–Mead local refine">Local search</button>
+      </div>
       <div class="r0-toggle" role="group" aria-label="Loss function">
         <button class="r0-toggle-btn active" type="button" data-loss="poisson" title="Maximum-likelihood for count data">Poisson NLL</button>
         <button class="r0-toggle-btn" type="button" data-loss="mse" title="Plain least-squares">MSE</button>
       </div>
       <label class="r0-field r0-field-inline">
-        <span>Trials per candidate: <b data-r0="k-label">30</b></span>
+        <span>Max trials per candidate: <b data-r0="k-label">30</b></span>
         <input type="range" min="10" max="100" step="5" data-r0="k" />
       </label>
+    </div>
+    <div class="r0-ga" data-r0="ga-controls">
+      <p class="r0-blurb">Evolves a population of disease genomes — selection, crossover, and Gaussian mutation — like the simulation's own strain mutation. Larger population / more generations search harder.</p>
+      <div class="r0-ga-grid">
+        <label class="r0-field r0-field-inline"><span>Population</span><input class="r0-in tiny" type="number" min="8" max="200" step="1" data-ga="population" /></label>
+        <label class="r0-field r0-field-inline"><span>Generations</span><input class="r0-in tiny" type="number" min="1" max="100" step="1" data-ga="generations" /></label>
+        <label class="r0-field r0-field-inline"><span>Mutation rate</span><input class="r0-in tiny" type="number" min="0" max="1" step="0.05" data-ga="mutationRate" /></label>
+        <label class="r0-field r0-field-inline"><span>Crossover rate</span><input class="r0-in tiny" type="number" min="0" max="1" step="0.05" data-ga="crossoverRate" /></label>
+        <label class="r0-field r0-field-inline"><span>Elitism</span><input class="r0-in tiny" type="number" min="0" max="20" step="1" data-ga="elitism" /></label>
+        <label class="r0-field r0-field-inline"><span>Tournament</span><input class="r0-in tiny" type="number" min="2" max="10" step="1" data-ga="tournament" /></label>
+      </div>
     </div>
     <div class="r0-actions">
       <button class="btn primary" type="button" data-r0="run">Run fit</button>

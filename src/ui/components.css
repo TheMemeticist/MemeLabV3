@@ -2045,6 +2045,7 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 .r0-body {
   padding: 24px 26px 22px;
   overflow-y: auto;
+  overflow-x: hidden; /* no stray horizontal scroll / empty gutter on narrow screens */
   color: var(--text);
   font-size: 14px;
   line-height: 1.55;
@@ -2064,6 +2065,8 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   color: var(--accent);
 }
 .r0-blurb { margin: 0 0 12px; color: var(--text-muted); font-size: 12.5px; }
+/* Explanatory hint under a control — smaller, looser, tighter to its field. */
+.r0-hint { margin-top: -4px; font-size: 11.5px; color: var(--text-subtle); line-height: 1.5; max-width: 520px; }
 .r0-muted { color: var(--text-muted); font-size: 12px; }
 
 .r0-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; max-width: 280px; }
@@ -2097,6 +2100,10 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   border-top: 1px solid var(--border);
 }
 .r0-row:first-child { border-top: none; }
+/* Let the day/value/category cells shrink instead of forcing the row wider than
+   the card (number inputs otherwise keep their intrinsic min-width on mobile). */
+.r0-row > * { min-width: 0; }
+.r0-row .r0-in { width: 100%; }
 .r0-row-head {
   background: var(--bg-sunken);
   font-size: 11px;
@@ -2142,7 +2149,11 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   font-size: 13px;
 }
 .r0-param-bounds { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); }
-.r0-bound { display: inline-flex; align-items: center; gap: 3px; }
+/* Fixed-width input + a reserved suffix slot, so the "%" on attack-rate / IFR rows
+   doesn't shove the separator and upper-bound input out of column alignment. */
+.r0-bound { display: inline-grid; grid-template-columns: 64px 12px; align-items: center; gap: 3px; }
+.r0-bound .r0-in.tiny { width: 64px; }
+.r0-param-suffix { color: var(--text-muted); font-size: 12px; }
 .r0-sep { color: var(--text-muted); }
 
 /* Run controls */
@@ -2162,6 +2173,28 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 }
 .r0-toggle-btn:last-child { border-right: none; }
 .r0-toggle-btn.active { background: var(--accent); color: #fff; }
+
+/* Genetic-algorithm controls — shown only when the GA optimizer is selected. */
+.r0-ga {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+.r0-ga[hidden] { display: none; }
+.r0-ga .r0-blurb { margin-top: 0; }
+.r0-ga-grid {
+  display: grid;
+  /* Exactly three per row; minmax(0,*) lets columns shrink so a long label can't
+     blow the track out and overflow the card. Drops to 2 then 1 on narrow widths. */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+.r0-ga-grid .r0-field { margin-bottom: 0; flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.r0-ga-grid .r0-field > span { white-space: nowrap; }
+.r0-ga-grid .r0-in.tiny { width: 64px; flex: none; }
+@media (max-width: 640px) { .r0-ga-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
 .r0-progress {
   flex: 1 1 120px;
@@ -2201,9 +2234,10 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 .r0-params-table th, .r0-params-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 .r0-params-table th { color: var(--text-muted); font-weight: 600; }
 .r0-chart { width: 100%; }
-
-/* Percent suffix on fraction-param bound inputs (attack rate, IFR). */
-.r0-param-suffix { color: var(--text-muted); font-size: 12px; }
+/* Estimator chart legend: compact, centered, and never clipping the value readout. */
+.r0-chart .u-legend { justify-content: center; }
+.r0-chart .u-legend th { white-space: nowrap; }
+.r0-chart .u-legend .u-value { min-width: 0; white-space: nowrap; }
 
 /* Goodness-of-fit: plain-language, color-coded rating instead of a bare R². */
 .r0-gof { gap: 6px; }
@@ -2245,4 +2279,5 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   .r0-body { padding: 20px 16px 18px; }
   .r0-row { grid-template-columns: 1fr 1.2fr 1.6fr 28px; gap: 4px; }
   .r0-run-controls { gap: 12px; }
+  .r0-ga-grid { grid-template-columns: 1fr; }
 }
