@@ -13,6 +13,9 @@ let scheduled = false;
 let lastFrame = 0;
 let lastPost = 0;
 let lastStats: import('../types').SimStats | null = null;
+// Tick through which the UI's long-history mirror is up to date. -1 forces the
+// next post to carry a full snapshot (new engine / reset).
+let lastLongTick = -1;
 
 // The sim steps at full `tps` for determinism, but visual frames are only
 // useful up to display refresh. Cap posted frames at ~60/s so high speeds
@@ -50,18 +53,21 @@ function postFrame(): void {
     quarantined: qCopy,
     size,
     stats,
-    longStats: cloneLong(engine.longStats),
     retiredCost: { ...engine.retiredCost },
     rNaught: engine.rNaught,
   };
+  // Send only the rows the UI hasn't seen; fall back to a full snapshot after
+  // a rebuild/reset or if more ticks elapsed than the window still holds.
+  const newRows = engine.tick - lastLongTick;
+  if (lastLongTick < 0 || newRows < 0 || newRows > engine.history.length) {
+    msg.longFull = engine.history.toLongStats();
+  } else {
+    msg.longDelta = engine.history.lastRows(newRows);
+  }
+  lastLongTick = engine.tick;
   const transfer: Transferable[] = [stateCopy.buffer, defCopy.buffer];
   if (qCopy) transfer.push(qCopy.buffer);
   self.postMessage(msg, transfer);
-}
-
-function cloneLong<T>(long: T): T {
-  // structuredClone preserves arrays without prototype tricks.
-  return structuredClone(long);
 }
 
 // Build topology once and share it:
@@ -136,6 +142,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
     case 'init': {
       const topo = buildAndPostTopology(m.config);
       engine = new Engine(m.config, topo);
+      lastLongTick = -1;
       lastFrame = performance.now();
       lastStats = null;
       postFrame();
@@ -144,6 +151,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
     case 'reset': {
       const topo = buildAndPostTopology(m.config);
       engine = new Engine(m.config, topo);
+      lastLongTick = -1;
       lastFrame = performance.now();
       playing = false;
       lastStats = null;
@@ -155,6 +163,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
       // strain genes). Resets RNG trajectory + population.
       const topo = buildAndPostTopology(m.config);
       engine = new Engine(m.config, topo);
+      lastLongTick = -1;
       lastFrame = performance.now();
       lastStats = null;
       postFrame();
@@ -163,7 +172,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
     case 'patchConfig': {
       // Soft update: change intervention / defense parameters mid-run without
       // a reset. Engine applies minimal stochastic adjustment.
-      if (!engine) engine = new Engine(m.config);
+      if (!engine) { engine = new Engine(m.config); lastLongTick = -1; }
       else engine.patchConfig(m.config);
       postFrame();
       break;

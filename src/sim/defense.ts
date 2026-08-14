@@ -8,6 +8,18 @@ export interface ResolvedDefenses {
   sourceControl: Float64Array;
   mortalityReduction: Float64Array;
   uptake: Float64Array;
+  /** Combined multipliers indexed directly by a cell's defense bitmask
+   *  (products over set flags, in FLAG_ORDER). These are the hot-loop path:
+   *  `protByMask[defenses[j] & MASK_ALL]` replaces a per-neighbor flag walk. */
+  protByMask: Float64Array;
+  srcByMask: Float64Array;
+  mortByMask: Float64Array;
+}
+
+/** Index bound for the by-mask tables: all defense flags OR'd together. */
+export const MASK_ALL = FLAG_ORDER_MASK();
+function FLAG_ORDER_MASK(): number {
+  return DefenseFlag.Mask | DefenseFlag.Vaccine;
 }
 
 const FLAG_ORDER: DefenseFlag[] = [DefenseFlag.Mask, DefenseFlag.Vaccine];
@@ -41,34 +53,42 @@ export function resolveDefenses(specs: DefenseSpec[]): ResolvedDefenses {
     uptake[idx] = clamp01(spec.uptake);
   }
 
-  return { flags, protection, sourceControl, mortalityReduction, uptake };
+  // Precompute the per-bitmask products once per resolve. Same factor order as
+  // the old per-flag walk (FLAG_ORDER), so results are bit-identical doubles.
+  const protByMask = new Float64Array(MASK_ALL + 1);
+  const srcByMask = new Float64Array(MASK_ALL + 1);
+  const mortByMask = new Float64Array(MASK_ALL + 1);
+  for (let mask = 0; mask <= MASK_ALL; mask++) {
+    let p = 1, s = 1, m = 1;
+    for (const f of FLAG_ORDER) {
+      if (mask & f) {
+        const idx = bitIndex(f);
+        p *= protection[idx];
+        s *= sourceControl[idx];
+        m *= mortalityReduction[idx];
+      }
+    }
+    protByMask[mask] = p;
+    srcByMask[mask] = s;
+    mortByMask[mask] = m;
+  }
+
+  return { flags, protection, sourceControl, mortalityReduction, uptake, protByMask, srcByMask, mortByMask };
 }
 
 /** Multiplier on attack success against a wearer with the given defense bitmask. */
 export function protectionMultiplier(d: ResolvedDefenses, wearerFlags: number): number {
-  let m = 1;
-  for (const f of FLAG_ORDER) {
-    if (wearerFlags & f) m *= d.protection[bitIndex(f)];
-  }
-  return m;
+  return d.protByMask[wearerFlags & MASK_ALL];
 }
 
 /** Multiplier on attack success outgoing from a wearer with the given defense bitmask. */
 export function sourceControlMultiplier(d: ResolvedDefenses, wearerFlags: number): number {
-  let m = 1;
-  for (const f of FLAG_ORDER) {
-    if (wearerFlags & f) m *= d.sourceControl[bitIndex(f)];
-  }
-  return m;
+  return d.srcByMask[wearerFlags & MASK_ALL];
 }
 
 /** Multiplier on IFR for a wearer. */
 export function mortalityMultiplier(d: ResolvedDefenses, wearerFlags: number): number {
-  let m = 1;
-  for (const f of FLAG_ORDER) {
-    if (wearerFlags & f) m *= d.mortalityReduction[bitIndex(f)];
-  }
-  return m;
+  return d.mortByMask[wearerFlags & MASK_ALL];
 }
 
 function bitIndex(flag: number): number {

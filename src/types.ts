@@ -148,7 +148,15 @@ export interface FrameMessage {
   quarantined: Uint8Array | null;
   size: number;
   stats: SimStats;
-  longStats: LongStats;
+  /** Full long-history snapshot. Present on init/reset/rebuild posts (and any
+   *  time the worker can't express the update as a delta); the UI replaces its
+   *  mirror with it. Exactly one of longFull / longDelta is set. */
+  longFull?: LongStats;
+  /** Only the rows appended since the previous frame post (same shape as
+   *  LongStats, length = new ticks). The UI appends these to its mirror and
+   *  trims it to the LONG_CAP window — this replaces structured-cloning the
+   *  entire history on every posted frame. */
+  longDelta?: LongStats;
   /** Cost-count sums for ticks aged out of the LongStats window (cumulative). */
   retiredCost: RetiredCostTotals;
   rNaught: number | null;

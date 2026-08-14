@@ -6,7 +6,10 @@ export interface PopulationBuffers {
   n: number;
   state: Uint8Array; // current SEIR-D
   next: Uint8Array; // staging buffer (swapped at end of step)
-  age: Uint16Array; // total ticks alive
+  // Reset to 0 at birth but NOT incremented per tick — nothing reads it, and
+  // the per-cell increment cost real frame time. Reinstate maintenance in the
+  // life-cycle pass before building any age-dependent feature on it.
+  age: Uint16Array;
   infectedAge: Uint16Array; // ticks since exposure (capped)
   defenses: Uint8Array; // bitmask
   strainId: Uint16Array;

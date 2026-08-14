@@ -9,6 +9,7 @@
     "build": "tsc -b --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "bench": "vite-node tests/bench.ts",
     "test:watch": "vitest",
     "typecheck": "tsc -b --noEmit"
   },

@@ -13,6 +13,8 @@ import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
 import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
 import { computeLedger, costConfigFromProfile, findCurrency, formatMoney } from '../lib/cost';
+import { appendLongDelta, emptyLongStats } from '../sim/long-history';
+import type { LongStats } from '../types';
 import { downloadText, downloadDataUrl, timestamp } from '../lib/export';
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
@@ -43,6 +45,10 @@ export class App {
   private costConfig!: CostConfig;
   private toastEl!: HTMLElement;
   private lastFrame: FrameMessage | null = null;
+  // UI-thread mirror of the engine's ring-buffered long history. Frames carry
+  // either a full snapshot (replace) or a delta of new rows (append + trim);
+  // deltas are applied in onFrame, before any frame coalescing can drop them.
+  private longMirror: LongStats = emptyLongStats();
   private renderScheduled = false;
   private persistTimer = 0;
   private interventionEvents: InterventionEvent[] = [];
@@ -376,6 +382,8 @@ export class App {
   }
 
   private onFrame(msg: FrameMessage): void {
+    if (msg.longFull) this.longMirror = msg.longFull;
+    else if (msg.longDelta) appendLongDelta(this.longMirror, msg.longDelta);
     // Keep only the most recent frame and render it on the next animation
     // frame. The worker can post faster than we can paint (hex/tri repaints are
     // expensive); coalescing here drops stale frames so a fast run never floods
@@ -394,7 +402,7 @@ export class App {
   private renderFrame(msg: FrameMessage): void {
     this.petri.paint(msg.state, msg.defenses, msg.quarantined, msg.size, this.controls.config().geometry ?? 'square');
     this.updateCost(msg);
-    this.chart.update(msg.longStats);
+    this.chart.update(this.longMirror);
     this.stats.update(msg.stats, msg.size * msg.size);
     this.stats.setRNaught(msg.rNaught);
     const rNStr = msg.rNaught == null ? '—' : msg.rNaught.toFixed(1);
@@ -408,7 +416,7 @@ export class App {
   // the current profile, then push to the tile, the chart, and the open modal.
   private updateCost(msg: FrameMessage): void {
     const n = msg.size * msg.size;
-    const { ledger, series } = computeLedger(msg.longStats, this.costConfig.profile, n, msg.retiredCost);
+    const { ledger, series } = computeLedger(this.longMirror, this.costConfig.profile, n, msg.retiredCost);
     const cur = findCurrency(this.costConfig.currencyCode);
     const rate = this.costConfig.currencyRate;
     // Pass the USD total (currency-independent) so the danger animation scales
@@ -847,7 +855,7 @@ export class App {
   private exportRun(): void {
     if (!this.lastFrame) return;
     const t = timestamp();
-    const csv = this.chart.exportCsv(this.lastFrame.longStats);
+    const csv = this.chart.exportCsv(this.longMirror);
     downloadText(`memelab-${t}.csv`, csv, 'text/csv');
     const json = JSON.stringify({
       config: this.controls.config(),
@@ -855,7 +863,7 @@ export class App {
       tick: this.lastFrame.tick,
       rNaught: this.lastFrame.rNaught,
       stats: this.lastFrame.stats,
-      longStats: this.lastFrame.longStats,
+      longStats: this.longMirror,
     }, null, 2);
     downloadText(`memelab-${t}.json`, json, 'application/json');
     downloadDataUrl(`memelab-${t}.png`, this.petri.toDataURL());

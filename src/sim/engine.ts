@@ -1,5 +1,6 @@
 import { CellState } from '../types';
 import type { LongStats, RetiredCostTotals, SimConfig, SimStats, VoronoiTopology } from '../types';
+import { LongHistory } from './long-history';
 import { Rng } from './rng';
 import { StrainPool } from './strain';
 import { allocate, seed, type PopulationBuffers } from './population';
@@ -8,13 +9,26 @@ import { buildVoronoi } from './voronoi';
 import {
   resolveDefenses,
   protectionMultiplier,
-  sourceControlMultiplier,
-  mortalityMultiplier,
+  MASK_ALL,
   type ResolvedDefenses,
 } from './defense';
 
 const REFF_WINDOW = 14;
-const LONG_CAP = 4096;
+
+// Module-level copy of CellState.Dead for neighborAliveFraction — cross-module
+// const enum members aren't inlined by esbuild, so keep the hot read local.
+const DEAD = CellState.Dead;
+
+/** Cumulative per-pass wall-clock time (ms), populated only while
+ *  `Engine.profile` is set. Used by the bench harness (`tests/bench.ts`);
+ *  costs two `performance.now()` calls per pass per tick when enabled and
+ *  nothing when null. */
+export interface PassProfile {
+  transmission: number;
+  quarantine: number;
+  lifecycle: number;
+  stats: number;
+}
 
 export class Engine {
   private rng!: Rng;
@@ -35,9 +49,19 @@ export class Engine {
   private cumInfectious = 0;
   private cumRecovered = 0;
   private cumDead = 0;
-  longStats: LongStats = emptyLong();
+  history: LongHistory = new LongHistory();
+
+  /** Full ordered snapshot of the ring-buffered history. Allocates on every
+   *  access — for tests/exports, not for per-frame use (the worker sends
+   *  deltas via `history.lastRows()`). */
+  get longStats(): LongStats {
+    return this.history.toLongStats();
+  }
+
   retiredCost: RetiredCostTotals = emptyRetired();
   rNaught: number | null = null;
+  /** Set to a PassProfile to accumulate per-pass timings; null = no overhead. */
+  profile: PassProfile | null = null;
 
   constructor(config: SimConfig, prebuiltTopo?: VoronoiTopology | null) {
     this.reset(config, prebuiltTopo);
@@ -90,7 +114,7 @@ export class Engine {
     this.cumInfectious = i0;
     this.cumRecovered = 0;
     this.cumDead = 0;
-    this.longStats = emptyLong();
+    this.history = new LongHistory();
     this.retiredCost = emptyRetired();
     this.rNaught = this.estimateR0(config);
   }
@@ -175,6 +199,8 @@ export class Engine {
     const pop = this.pop;
     const { state, next, age, infectedAge, defenses, strainId, quarantined, quarantineExpiry, n } = pop;
     const D = this.defenses;
+    const protByMask = D.protByMask;
+    const mortByMask = D.mortByMask;
     const rng = this.rng;
     const strains = this.strains;
     const mutate = this.config.mutate;
@@ -187,12 +213,28 @@ export class Engine {
     const qSrcMul = quarantineOn ? 1 - quarantine.sourceControl : 1;
     const qProtMul = quarantineOn ? 1 - quarantine.protection : 1;
 
+    // Hot-loop hoists — see stepSpatial for the const-enum / LoadIC rationale.
+    const ST_S = CellState.Susceptible;
+    const ST_E = CellState.Exposed;
+    const ST_I = CellState.Infectious;
+    const ST_R = CellState.Recovered;
+    const ST_D = CellState.Dead;
+    const tickNow = this.tick;
+    const solo = strains.count() === 1 ? strains.get(0) : null;
+    const soloIncub = solo !== null ? solo.incubation : 0;
+    const soloIncubEnd = solo !== null ? solo.incubation + solo.infectious : 0;
+    const soloIfr = solo !== null ? solo.ifr : 0;
+    const soloWane = solo !== null ? (solo.immunityDays > 0 ? 1 / solo.immunityDays : 1) : 0;
+
+    const prof = this.profile;
+    let tMark = prof ? performance.now() : 0;
+
     next.set(state);
 
     // Count infectious for global mixing force-of-infection.
     let iCount = 0;
     for (let i = 0; i < n; i++) {
-      if (state[i] === CellState.Infectious) iCount++;
+      if (state[i] === ST_I) iCount++;
     }
 
     let newInfections = 0;
@@ -211,8 +253,8 @@ export class Engine {
       const baseAttack = dominantStrain.attackRate;
 
       for (let j = 0; j < n; j++) {
-        if (state[j] !== CellState.Susceptible) continue;
-        let protMul = protectionMultiplier(D, defenses[j]);
+        if (state[j] !== ST_S) continue;
+        let protMul = protByMask[defenses[j] & MASK_ALL];
         if (quarantineOn && quarantined[j]) protMul *= qProtMul;
         // Effective per-tick exposure: 1 − (1−p)^(I × k / N)
         // where p = baseAttack × srcMul_avg × protMul
@@ -225,38 +267,48 @@ export class Engine {
         const pExposed = 1 - Math.pow(1 - p, (iCount * k) / n);
         if (pExposed <= 0) continue;
         if (rng.bernoulli(pExposed)) {
-          if (next[j] === CellState.Susceptible) {
-            next[j] = CellState.Exposed;
+          if (next[j] === ST_S) {
+            next[j] = ST_E;
             infectedAge[j] = 0;
-            strainId[j] = mutate ? strains.spawnChild(0, this.tick, rng) : 0;
+            strainId[j] = mutate ? strains.spawnChild(0, tickNow, rng) : 0;
             newInfections++;
           }
         }
       }
     }
 
+    if (prof) { const t = performance.now(); prof.transmission += t - tMark; tMark = t; }
+
     // Quarantine detection — same as spatial.
     if (quarantineOn && quarantine.detectionRate > 0 && quarantine.duration > 0) {
       const detRate = quarantine.detectionRate;
-      const expiry = this.tick + quarantine.duration;
+      const expiry = tickNow + quarantine.duration;
       for (let i = 0; i < n; i++) {
-        if (state[i] !== CellState.Infectious || quarantined[i]) continue;
+        if (state[i] !== ST_I || quarantined[i]) continue;
         if (!rng.bernoulli(detRate)) continue;
         quarantined[i] = 1;
         quarantineExpiry[i] = expiry;
       }
     }
 
-    // Life-cycle pass — identical to spatial.
+    if (prof) { const t = performance.now(); prof.quarantine += t - tMark; tMark = t; }
+
+    // Life-cycle pass — identical to spatial (see stepSpatial for the census
+    // fold and single-strain fast-path rationale); the only difference is the
+    // birth roll, which has no neighbor term under global mixing.
+    const maskEnabled = this.config.defenses[0]?.enabled === true;
+    const vaxEnabled = this.config.defenses[1]?.enabled === true;
+    const census = new Int32Array(5); // indexed by CellState
+    let masked = 0, vaccinated = 0, quarCount = 0;
     for (let i = 0; i < n; i++) {
-      if (quarantined[i] && this.tick >= quarantineExpiry[i]) {
+      if (quarantineOn && quarantined[i] && tickNow >= quarantineExpiry[i]) {
         quarantined[i] = 0;
         quarantineExpiry[i] = 0;
       }
       const s = state[i];
-      if (s === CellState.Dead) {
+      if (s === ST_D) {
         if (birthRate > 0 && rng.bernoulli(birthRate)) {
-          next[i] = CellState.Susceptible;
+          next[i] = ST_S;
           age[i] = 0;
           infectedAge[i] = 0;
           strainId[i] = 0;
@@ -265,51 +317,80 @@ export class Engine {
           if (rng.bernoulli(D.uptake[1])) flags |= 2;
           defenses[i] = flags;
         }
-        continue;
-      }
-      age[i]++;
-      if (s === CellState.Exposed) {
+      } else if (s === ST_E) {
         infectedAge[i]++;
-        const strain = strains.get(strainId[i]);
-        if (infectedAge[i] >= strain.incubation) {
-          next[i] = CellState.Infectious;
+        const incub = solo !== null ? soloIncub : strains.get(strainId[i]).incubation;
+        if (infectedAge[i] >= incub) {
+          next[i] = ST_I;
           newInfectious++;
         }
-      } else if (s === CellState.Infectious) {
+      } else if (s === ST_I) {
         infectedAge[i]++;
-        const strain = strains.get(strainId[i]);
-        if (infectedAge[i] >= strain.incubation + strain.infectious) {
-          const ifr = strain.ifr * mortalityMultiplier(D, defenses[i]);
+        let incubEnd: number, baseIfr: number;
+        if (solo !== null) {
+          incubEnd = soloIncubEnd;
+          baseIfr = soloIfr;
+        } else {
+          const strain = strains.get(strainId[i]);
+          incubEnd = strain.incubation + strain.infectious;
+          baseIfr = strain.ifr;
+        }
+        if (infectedAge[i] >= incubEnd) {
+          const ifr = baseIfr * mortByMask[defenses[i] & MASK_ALL];
           if (rng.bernoulli(ifr)) {
-            next[i] = CellState.Dead;
+            next[i] = ST_D;
             newDeaths++;
           } else {
-            next[i] = CellState.Recovered;
+            next[i] = ST_R;
             infectedAge[i] = 0;
             newRecovered++;
           }
         }
-      } else if (s === CellState.Recovered) {
-        const strain = strains.get(strainId[i]);
-        const dailyWane = strain.immunityDays > 0 ? 1 / strain.immunityDays : 1;
+      } else if (s === ST_R) {
+        let dailyWane: number;
+        if (solo !== null) {
+          dailyWane = soloWane;
+        } else {
+          const strain = strains.get(strainId[i]);
+          dailyWane = strain.immunityDays > 0 ? 1 / strain.immunityDays : 1;
+        }
         if (rng.bernoulli(dailyWane)) {
-          next[i] = CellState.Susceptible;
+          next[i] = ST_S;
           strainId[i] = 0;
         }
       }
+      const ns = next[i];
+      census[ns]++;
+      if (ns !== ST_D) {
+        const def = defenses[i];
+        if (maskEnabled && (def & 1)) masked++;
+        if (vaxEnabled && (def & 2)) vaccinated++;
+        if (quarantineOn && quarantined[i]) quarCount++;
+      }
     }
+    let cS = census[ST_S], cE = census[ST_E],
+      cI = census[ST_I], cR = census[ST_R],
+      cD = census[ST_D];
 
     pop.state = next;
     pop.next = state;
     this.tick++;
 
-    return this.computeStats(newInfections, newInfectious, newDeaths, newRecovered);
+    if (prof) { const t = performance.now(); prof.lifecycle += t - tMark; tMark = t; }
+    const stats = this.computeStats(newInfections, newInfectious, newDeaths, newRecovered, {
+      s: cS, e: cE, i: cI, r: cR, d: cD, masked, vaccinated, quar: quarCount,
+    });
+    if (prof) prof.stats += performance.now() - tMark;
+    return stats;
   }
 
   private stepSpatial(): SimStats {
     const pop = this.pop;
     const { state, next, age, infectedAge, defenses, strainId, lockdownCompliant, quarantined, quarantineExpiry, size, n } = pop;
     const D = this.defenses;
+    const protByMask = D.protByMask;
+    const srcByMask = D.srcByMask;
+    const mortByMask = D.mortByMask;
     const rng = this.rng;
     const strains = this.strains;
     const mutate = this.config.mutate;
@@ -326,6 +407,30 @@ export class Engine {
     const isVoronoi = geo.isVoronoi?.() ?? false;
     const voronoiGeo = isVoronoi ? (geo as VoronoiLattice) : null;
 
+    // esbuild can't inline cross-module `const enum` members (isolatedModules
+    // semantics), so `CellState.*` inside the hot loops compiles to a property
+    // load per use per cell — V8 profiling showed LoadIC handling eating ~35%
+    // of tick time. Hoist the states, and the per-cell `this.tick` read, into
+    // locals once per step.
+    const ST_S = CellState.Susceptible;
+    const ST_E = CellState.Exposed;
+    const ST_I = CellState.Infectious;
+    const ST_R = CellState.Recovered;
+    const ST_D = CellState.Dead;
+    const tickNow = this.tick;
+
+    // Single-strain fast path (used by both transmission and life-cycle):
+    // while the pool holds only strain 0 every cell carries strain 0, so its
+    // genes are loop constants instead of a per-cell object walk.
+    const solo = strains.count() === 1 ? strains.get(0) : null;
+    const soloIncub = solo !== null ? solo.incubation : 0;
+    const soloIncubEnd = solo !== null ? solo.incubation + solo.infectious : 0;
+    const soloIfr = solo !== null ? solo.ifr : 0;
+    const soloWane = solo !== null ? (solo.immunityDays > 0 ? 1 / solo.immunityDays : 1) : 0;
+
+    const prof = this.profile;
+    let tMark = prof ? performance.now() : 0;
+
     next.set(state);
 
     let newInfections = 0;
@@ -335,14 +440,15 @@ export class Engine {
 
     // 2) Transmission pass.
     for (let i = 0; i < n; i++) {
-      if (state[i] !== CellState.Infectious) continue;
-      const attackerStrain = strains.get(strainId[i]);
+      if (state[i] !== ST_I) continue;
+      const attackerStrain = solo !== null ? solo : strains.get(strainId[i]);
       const range = attackerStrain.range;
       const baseAttack = attackerStrain.attackRate;
-      let srcMul = sourceControlMultiplier(D, defenses[i]);
+      let srcMul = srcByMask[defenses[i] & MASK_ALL];
       if (quarantineOn && quarantined[i]) srcMul *= qSrcMul;
       srcMul *= lockdownTransMul;
-      if (baseAttack * srcMul <= 0) continue;
+      const atkSrc = baseAttack * srcMul;
+      if (atkSrc <= 0) continue;
       const srcUnderLockdown = lockdownOn && lockdownCompliant[i] === 1;
 
       if (voronoiGeo) {
@@ -350,15 +456,43 @@ export class Engine {
         for (let k = 0; k < nbrs.length; k++) {
           if (srcUnderLockdown && lockdownSkipP > 0 && rng.bernoulli(lockdownSkipP)) continue;
           const j = nbrs[k];
-          if (state[j] !== CellState.Susceptible) continue;
-          let protMul = protectionMultiplier(D, defenses[j]);
+          if (state[j] !== ST_S) continue;
+          let protMul = protByMask[defenses[j] & MASK_ALL];
           if (quarantineOn && quarantined[j]) protMul *= qProtMul;
-          const p = baseAttack * srcMul * protMul;
+          const p = atkSrc * protMul;
           if (p <= 0) continue;
-          if (rng.bernoulli(p) && next[j] === CellState.Susceptible) {
-            next[j] = CellState.Exposed;
+          if (rng.bernoulli(p) && next[j] === ST_S) {
+            next[j] = ST_E;
             infectedAge[j] = 0;
-            strainId[j] = mutate ? strains.spawnChild(strainId[i], this.tick, rng) : strainId[i];
+            strainId[j] = mutate ? strains.spawnChild(strainId[i], tickNow, rng) : strainId[i];
+            newInfections++;
+          }
+        }
+      } else if (
+        // Interior fast path: every offset is bounded by ±range per axis, so a
+        // cell at least `range` from every edge can never wrap — index directly
+        // and skip the two torus() calls per neighbor. At 320×320 range 1 this
+        // covers ~99% of cells and computes the exact same j as the torus path.
+        i % size >= range && i % size < size - range &&
+        ((i / size) | 0) >= range && ((i / size) | 0) < size - range
+      ) {
+        const x = i % size;
+        const y = (i / size) | 0;
+        const offsets = geo.getOffsets(range, x, y);
+        const m2 = offsets.length;
+        for (let k = 0; k < m2; k += 2) {
+          if (srcUnderLockdown && lockdownSkipP > 0 && rng.bernoulli(lockdownSkipP)) continue;
+          const j = i + offsets[k + 1] * size + offsets[k];
+          if (state[j] !== ST_S) continue;
+          let protMul = protByMask[defenses[j] & MASK_ALL];
+          if (quarantineOn && quarantined[j]) protMul *= qProtMul;
+          const p = atkSrc * protMul;
+          if (p <= 0) continue;
+          if (rng.bernoulli(p) && next[j] === ST_S) {
+            next[j] = ST_E;
+            infectedAge[j] = 0;
+            const childStrain = mutate ? strains.spawnChild(strainId[i], tickNow, rng) : strainId[i];
+            strainId[j] = childStrain;
             newInfections++;
           }
         }
@@ -372,15 +506,15 @@ export class Engine {
           const nx = torus(x + offsets[k], size);
           const ny = torus(y + offsets[k + 1], size);
           const j = ny * size + nx;
-          if (state[j] !== CellState.Susceptible) continue;
-          let protMul = protectionMultiplier(D, defenses[j]);
+          if (state[j] !== ST_S) continue;
+          let protMul = protByMask[defenses[j] & MASK_ALL];
           if (quarantineOn && quarantined[j]) protMul *= qProtMul;
-          const p = baseAttack * srcMul * protMul;
+          const p = atkSrc * protMul;
           if (p <= 0) continue;
-          if (rng.bernoulli(p) && next[j] === CellState.Susceptible) {
-            next[j] = CellState.Exposed;
+          if (rng.bernoulli(p) && next[j] === ST_S) {
+            next[j] = ST_E;
             infectedAge[j] = 0;
-            const childStrain = mutate ? strains.spawnChild(strainId[i], this.tick, rng) : strainId[i];
+            const childStrain = mutate ? strains.spawnChild(strainId[i], tickNow, rng) : strainId[i];
             strainId[j] = childStrain;
             newInfections++;
           }
@@ -388,13 +522,15 @@ export class Engine {
       }
     }
 
+    if (prof) { const t = performance.now(); prof.transmission += t - tMark; tMark = t; }
+
     // 2b) Quarantine detection pass.
     if (quarantineOn && quarantine.detectionRate > 0 && quarantine.duration > 0) {
       const detRate = quarantine.detectionRate;
       const contactsRange = Math.max(1, quarantine.contactsRange | 0);
-      const expiry = this.tick + quarantine.duration;
+      const expiry = tickNow + quarantine.duration;
       for (let i = 0; i < n; i++) {
-        if (state[i] !== CellState.Infectious || quarantined[i]) continue;
+        if (state[i] !== ST_I || quarantined[i]) continue;
         if (!rng.bernoulli(detRate)) continue;
         quarantined[i] = 1;
         quarantineExpiry[i] = expiry;
@@ -423,16 +559,28 @@ export class Engine {
       }
     }
 
-    // 3) Life-cycle pass.
+    if (prof) { const t = performance.now(); prof.quarantine += t - tMark; tMark = t; }
+
+    // 3) Life-cycle pass. Compartment + cost counts are folded in: after
+    // iteration i no later write touches next[i], defenses[i], or
+    // quarantined[i], so the post-tick census comes for free here instead of
+    // in a second full O(N) pass.
+    const maskEnabled = this.config.defenses[0]?.enabled === true;
+    const vaxEnabled = this.config.defenses[1]?.enabled === true;
+    const census = new Int32Array(5); // indexed by CellState
+    let masked = 0, vaccinated = 0, quarCount = 0;
     for (let i = 0; i < n; i++) {
-      if (quarantined[i] && this.tick >= quarantineExpiry[i]) {
+      // quarantined[] is all-zero whenever quarantine is disabled (reset seeds
+      // it zero; patchConfig clears it on disable), so gate both the expiry
+      // check and the census read to skip the buffer reads entirely.
+      if (quarantineOn && quarantined[i] && tickNow >= quarantineExpiry[i]) {
         quarantined[i] = 0;
         quarantineExpiry[i] = 0;
       }
       const s = state[i];
-      if (s === CellState.Dead) {
+      if (s === ST_D) {
         if (birthRate > 0 && rng.bernoulli(birthRate * neighborAliveFraction(state, i, size, geo))) {
-          next[i] = CellState.Susceptible;
+          next[i] = ST_S;
           age[i] = 0;
           infectedAge[i] = 0;
           strainId[i] = 0;
@@ -441,41 +589,60 @@ export class Engine {
           if (rng.bernoulli(D.uptake[1])) flags |= 2;
           defenses[i] = flags;
         }
-        continue;
-      }
-
-      age[i]++;
-
-      if (s === CellState.Exposed) {
+      } else if (s === ST_E) {
         infectedAge[i]++;
-        const strain = strains.get(strainId[i]);
-        if (infectedAge[i] >= strain.incubation) {
-          next[i] = CellState.Infectious;
+        const incub = solo !== null ? soloIncub : strains.get(strainId[i]).incubation;
+        if (infectedAge[i] >= incub) {
+          next[i] = ST_I;
           newInfectious++;
         }
-      } else if (s === CellState.Infectious) {
+      } else if (s === ST_I) {
         infectedAge[i]++;
-        const strain = strains.get(strainId[i]);
-        if (infectedAge[i] >= strain.incubation + strain.infectious) {
-          const ifr = strain.ifr * mortalityMultiplier(D, defenses[i]);
+        let incubEnd: number, baseIfr: number;
+        if (solo !== null) {
+          incubEnd = soloIncubEnd;
+          baseIfr = soloIfr;
+        } else {
+          const strain = strains.get(strainId[i]);
+          incubEnd = strain.incubation + strain.infectious;
+          baseIfr = strain.ifr;
+        }
+        if (infectedAge[i] >= incubEnd) {
+          const ifr = baseIfr * mortByMask[defenses[i] & MASK_ALL];
           if (rng.bernoulli(ifr)) {
-            next[i] = CellState.Dead;
+            next[i] = ST_D;
             newDeaths++;
           } else {
-            next[i] = CellState.Recovered;
+            next[i] = ST_R;
             infectedAge[i] = 0;
             newRecovered++;
           }
         }
-      } else if (s === CellState.Recovered) {
-        const strain = strains.get(strainId[i]);
-        const dailyWane = strain.immunityDays > 0 ? 1 / strain.immunityDays : 1;
+      } else if (s === ST_R) {
+        let dailyWane: number;
+        if (solo !== null) {
+          dailyWane = soloWane;
+        } else {
+          const strain = strains.get(strainId[i]);
+          dailyWane = strain.immunityDays > 0 ? 1 / strain.immunityDays : 1;
+        }
         if (rng.bernoulli(dailyWane)) {
-          next[i] = CellState.Susceptible;
+          next[i] = ST_S;
           strainId[i] = 0;
         }
       }
+      const ns = next[i];
+      census[ns]++;
+      if (ns !== ST_D) {
+        const def = defenses[i];
+        if (maskEnabled && (def & 1)) masked++;
+        if (vaxEnabled && (def & 2)) vaccinated++;
+        if (quarantineOn && quarantined[i]) quarCount++;
+      }
     }
+    let cS = census[ST_S], cE = census[ST_E],
+      cI = census[ST_I], cR = census[ST_R],
+      cD = census[ST_D];
 
     // 4) Swap.
     pop.state = next;
@@ -487,11 +654,7 @@ export class Engine {
       const seedStrain = this.strains.get(0);
       if (seedStrain.immunityDays < 36500 && this.tick > 30) {
         const cur = pop.state;
-        let extant = 0;
-        for (let k = 0; k < cur.length; k++) {
-          if (cur[k] === CellState.Exposed || cur[k] === CellState.Infectious) { extant++; break; }
-        }
-        if (extant === 0) {
+        if (cE + cI === 0) {
           let attempts = 0;
           while (attempts < 16) {
             const idx = this.rng.intRange(cur.length);
@@ -504,6 +667,8 @@ export class Engine {
                 cur[idx] = CellState.Infectious;
                 this.pop.infectedAge[idx] = seedStrain.incubation;
                 this.pop.strainId[idx] = 0;
+                cS--;
+                cI++;
               }
               break;
             }
@@ -513,39 +678,27 @@ export class Engine {
       }
     }
 
-    return this.computeStats(newInfections, newInfectious, newDeaths, newRecovered);
+    if (prof) { const t = performance.now(); prof.lifecycle += t - tMark; tMark = t; }
+    const stats = this.computeStats(newInfections, newInfectious, newDeaths, newRecovered, {
+      s: cS, e: cE, i: cI, r: cR, d: cD, masked, vaccinated, quar: quarCount,
+    });
+    if (prof) prof.stats += performance.now() - tMark;
+    return stats;
   }
 
-  private computeStats(newInfections: number, newInfectious: number, newDeaths: number, newRecovered: number): SimStats {
-    const pop = this.pop;
-    const { n } = pop;
-    const cur = pop.state;
-    const defenses = pop.defenses;
-    const quarantined = pop.quarantined;
-    let s = 0, e = 0, inf = 0, r = 0, d = 0;
-    // Cost-layer counts: defenses/quarantine among living cells only (the dead
-    // don't wear masks or occupy isolation beds). Mask/vaccine flags persist in
-    // the buffer when their intervention is toggled off, so gate by enabled —
-    // a disabled defense incurs no cost even though the per-cell flag remains.
-    const maskEnabled = this.config.defenses[0]?.enabled === true;
-    const vaxEnabled = this.config.defenses[1]?.enabled === true;
-    let masked = 0, vaccinated = 0, quar = 0;
-    for (let i = 0; i < n; i++) {
-      const cell = cur[i];
-      switch (cell) {
-        case CellState.Susceptible: s++; break;
-        case CellState.Exposed: e++; break;
-        case CellState.Infectious: inf++; break;
-        case CellState.Recovered: r++; break;
-        case CellState.Dead: d++; break;
-      }
-      if (cell !== CellState.Dead) {
-        const def = defenses[i];
-        if (maskEnabled && (def & 1)) masked++;
-        if (vaxEnabled && (def & 2)) vaccinated++;
-        if (quarantined[i]) quar++;
-      }
-    }
+  // Counts arrive pre-folded from the life-cycle pass (see stepSpatial /
+  // stepMeanField); this only assembles stats and maintains the histories.
+  // Cost-layer counts cover living cells only (the dead don't wear masks or
+  // occupy isolation beds), gated by each defense's enabled flag — a disabled
+  // defense incurs no cost even though the per-cell flag remains in the buffer.
+  private computeStats(
+    newInfections: number,
+    newInfectious: number,
+    newDeaths: number,
+    newRecovered: number,
+    counts: { s: number; e: number; i: number; r: number; d: number; masked: number; vaccinated: number; quar: number },
+  ): SimStats {
+    const { s, e, i: inf, r, d, masked, vaccinated, quar } = counts;
     const ld = this.config.lockdown;
     const lockdownStringency = ld.enabled === true ? ld.mobilityReduction * ld.compliance : 0;
 
@@ -568,9 +721,18 @@ export class Engine {
     this.cumInfectious += newInfectious;
     this.cumRecovered += newRecovered;
     this.cumDead += newDeaths;
-    const cum = { e: this.cumExposed, i: this.cumInfectious, r: this.cumRecovered, d: this.cumDead };
 
-    pushLong(this.longStats, stats, { masked, vaccinated, quarantined: quar, lockdownStringency }, cum, this.retiredCost);
+    this.history.push({
+      tick: stats.tick,
+      s, e, i: inf, r, d,
+      reff,
+      dnew: newDeaths,
+      masked, vaccinated, quarantined: quar, lockdownStringency,
+      ecum: this.cumExposed,
+      icum: this.cumInfectious,
+      rcum: this.cumRecovered,
+      dcum: this.cumDead,
+    }, this.retiredCost);
     return stats;
   }
 
@@ -650,7 +812,7 @@ function neighborAliveFraction(state: Uint8Array, i: number, size: number, geo: 
     if (nbrs.length === 0) return 0.5;
     let alive = 0;
     for (let k = 0; k < nbrs.length; k++) {
-      if (state[nbrs[k]] !== CellState.Dead) alive++;
+      if (state[nbrs[k]] !== DEAD) alive++;
     }
     return alive / nbrs.length;
   }
@@ -660,75 +822,23 @@ function neighborAliveFraction(state: Uint8Array, i: number, size: number, geo: 
   const m2 = offsets.length;
   if (m2 === 0) return 0.5; // mean-field: use flat rate, caller multiplies by birthRate
   let alive = 0;
-  for (let k = 0; k < m2; k += 2) {
-    const nx = torus(x + offsets[k], size);
-    const ny = torus(y + offsets[k + 1], size);
-    const j = ny * size + nx;
-    if (state[j] !== CellState.Dead) alive++;
+  if (x >= 1 && x < size - 1 && y >= 1 && y < size - 1) {
+    // Interior fast path — range-1 offsets are bounded by ±1 per axis, so no
+    // wrapping is possible; same j as the torus path below.
+    for (let k = 0; k < m2; k += 2) {
+      if (state[i + offsets[k + 1] * size + offsets[k]] !== DEAD) alive++;
+    }
+  } else {
+    for (let k = 0; k < m2; k += 2) {
+      const nx = torus(x + offsets[k], size);
+      const ny = torus(y + offsets[k + 1], size);
+      const j = ny * size + nx;
+      if (state[j] !== DEAD) alive++;
+    }
   }
   return alive / (m2 / 2);
 }
 
-function emptyLong(): LongStats {
-  return {
-    tick: [], s: [], e: [], i: [], r: [], d: [], reff: [],
-    dnew: [], masked: [], vaccinated: [], quarantined: [], lockdownStringency: [],
-    ecum: [], icum: [], rcum: [], dcum: [],
-  };
-}
-
-interface CostCounts {
-  masked: number;
-  vaccinated: number;
-  quarantined: number;
-  lockdownStringency: number;
-}
-
-interface CumCounts {
-  e: number;
-  i: number;
-  r: number;
-  d: number;
-}
-
 function emptyRetired(): RetiredCostTotals {
   return { ticks: 0, i: 0, dnew: 0, masked: 0, vaccinated: 0, quarantined: 0, lockdownStringency: 0 };
-}
-
-function pushLong(long: LongStats, stats: SimStats, costs: CostCounts, cum: CumCounts, retired: RetiredCostTotals): void {
-  long.tick.push(stats.tick);
-  long.s.push(stats.s);
-  long.e.push(stats.e);
-  long.i.push(stats.i);
-  long.r.push(stats.r);
-  long.d.push(stats.d);
-  long.reff.push(stats.reff);
-  long.dnew.push(stats.newDeaths);
-  long.masked.push(costs.masked);
-  long.vaccinated.push(costs.vaccinated);
-  long.quarantined.push(costs.quarantined);
-  long.lockdownStringency.push(costs.lockdownStringency);
-  long.ecum.push(cum.e);
-  long.icum.push(cum.i);
-  long.rcum.push(cum.r);
-  long.dcum.push(cum.d);
-  if (long.tick.length > LONG_CAP) {
-    // The oldest tick is aging out of the window. Fold its cost-relevant counts
-    // into the retired aggregate first, so the cost layer keeps a true cumulative
-    // total (cost is monotonic) even though the chart/window slides forward.
-    retired.ticks++;
-    retired.i += long.i[0];
-    retired.dnew += long.dnew[0];
-    retired.masked += long.masked[0];
-    retired.vaccinated += long.vaccinated[0];
-    retired.quarantined += long.quarantined[0];
-    retired.lockdownStringency += long.lockdownStringency[0];
-    long.tick.shift(); long.s.shift(); long.e.shift();
-    long.i.shift(); long.r.shift(); long.d.shift(); long.reff.shift();
-    long.dnew.shift(); long.masked.shift(); long.vaccinated.shift();
-    long.quarantined.shift(); long.lockdownStringency.shift();
-    // Cumulative arrays hold absolute totals, so dropping the oldest entry is
-    // harmless — the remaining values stay correct (no retired base needed).
-    long.ecum.shift(); long.icum.shift(); long.rcum.shift(); long.dcum.shift();
-  }
 }
