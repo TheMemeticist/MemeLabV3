@@ -96,7 +96,15 @@ Every run is reproducible. Click **Permalink** in the topbar to copy a URL that 
 
 ## Deploy to GitHub Pages
 
-`.github/workflows/deploy.yml` builds and deploys on push to `main`. For a project-page deploy (`username.github.io/<repo>/`), set `VITE_BASE` in the workflow to `/<repo>/`. For a user/org page, leave as `/`.
+`.github/workflows/deploy.yml` builds and deploys on push to `main`, with `VITE_BASE=/MemeLabV3/`. Full operational reference — verification steps and failure modes — in [`docs/deploy.md`](docs/deploy.md).
+
+## Docs
+
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivery phases and the standardized dev checklist. Read before starting work.
+- [`docs/architecture.md`](docs/architecture.md) — engine and geometry architecture diagram.
+- [`docs/ga-spec.md`](docs/ga-spec.md) — the ABCD codon-genome spec.
+- [`docs/ux-analysis.md`](docs/ux-analysis.md) — interface-theory analysis driving the UX phases.
+- [`CHANGELOG.md`](CHANGELOG.md) — user-visible changes.
 
 ## Branding
 
