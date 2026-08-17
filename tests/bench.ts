@@ -17,6 +17,7 @@
 //     long-stats window once it is full (4096 ticks)
 
 import { Engine } from '../src/sim/engine';
+import { runTrials } from '../src/lib/fit-sim';
 import type { GeometryType, SimConfig } from '../src/types';
 
 const SIZE = 320;
@@ -112,6 +113,42 @@ function benchFramePost(): void {
   );
 }
 
+// ── Fit-path micro-bench ─────────────────────────────────────────────────────
+// The R₀ estimator / GA fitter runs `runTrials` (K trials × days) per candidate,
+// hundreds of times per fit, so per-trial fixed costs matter as much as tick
+// rate. Voronoi at range > 1 is the worst case: each engine's analytic-R₀
+// estimate BFS-expands ~512 cells.
+function benchFitTrials(): void {
+  // Fit-shaped config: the R₀ estimator fits cumulative-incidence curves from a
+  // single index case with no births and lifelong immunity — not the endemic
+  // steady state the tick-rate benchmark above uses.
+  const fitCfg = (geometry: GeometryType, range: number, attackRate: number): SimConfig => {
+    const c = benchConfig(geometry);
+    c.size = 128; // FIT_GRID_CAP (R0Modal.ts:76) — the size real fits run at
+    c.seedInfections = 0;
+    c.birthRate = 0;
+    c.strain = { ...c.strain, range, attackRate, immunityDays: 36500 };
+    return c;
+  };
+  // A GA sweeps both regimes: candidates that burn out early (per-trial fixed
+  // costs dominate) and candidates that sweep the grid (stepping dominates).
+  const cases: Array<[string, SimConfig]> = [
+    ['square r1 spread', fitCfg('square', 1, 0.3)],
+    ['voronoi r3 burnout', fitCfg('voronoi', 3, 0.02)],
+    ['voronoi r3 spread', fitCfg('voronoi', 3, 0.3)],
+  ];
+  for (const [label, cfg] of cases) {
+    runTrials(cfg, 60, 5, 0xc0ffee); // warmup / JIT
+    const t0 = performance.now();
+    const r = runTrials(cfg, 60, 5, 0xc0ffee);
+    const ms = performance.now() - t0;
+    console.log(
+      `fit ${label.padEnd(18)} runTrials(60d, K=5) = ${ms.toFixed(1).padStart(7)} ms ` +
+      `(${(ms / 5).toFixed(1)} ms/trial)  R0=${r.rNaught?.toFixed(3)}`,
+    );
+  }
+}
+
 // ── History-maintenance micro-bench ──────────────────────────────────────────
 // Once tick > LONG_CAP (4096) the long-stats window slides every tick. Use a
 // small mean-field grid so the window cost dominates the tick cost.
@@ -156,4 +193,5 @@ for (const g of GEOMETRIES) {
 if (!only) {
   benchFramePost();
   benchHistoryMaintenance();
+  benchFitTrials();
 }

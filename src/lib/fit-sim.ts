@@ -57,7 +57,19 @@ export function runTrials(config: SimConfig, days: number, K: number, seed: numb
 
   for (let k = 0; k < K; k++) {
     const trialSeed = (seed ^ ((k * SEED_STRIDE) >>> 0)) >>> 0;
-    const engine = new Engine({ ...config, seed: trialSeed }, topo);
+    // Trials differ only by seed, and the analytic R₀ depends on the genes,
+    // geometry and topology — never the seed — so it is identical across all K.
+    // Compute it on trial 0 and hand it to the rest: `estimateR0` draws no
+    // randomness, so skipping it leaves every trial's PRNG trajectory (and
+    // therefore its curves) bit-identical. On Voronoi with range > 1 this is
+    // the expensive one — it BFS-expands ~512 cells per engine.
+    // Annotated to break the inference cycle: `rNaught` is assigned from
+    // `engine.rNaught` and also feeds the constructor.
+    const engine: Engine = new Engine(
+      { ...config, seed: trialSeed },
+      topo,
+      k === 0 ? undefined : { rNaught },
+    );
     if (k === 0) rNaught = engine.rNaught;
 
     // Day 0 — the seeded population before any step. Patient-zero / seed

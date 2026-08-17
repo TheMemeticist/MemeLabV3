@@ -30,6 +30,23 @@ export interface PassProfile {
   stats: number;
 }
 
+/** Construction options. */
+export interface EngineOptions {
+  /**
+   * Reuse an already-computed analytic R₀ instead of recomputing it in
+   * `reset()`. `estimateR0` depends only on the strain genes, the geometry and
+   * the Voronoi topology — never on the seed, the population buffers or the
+   * RNG — so a caller running many engines that differ *only* by seed (the
+   * fit/GA trial loop in `lib/fit-sim.ts`) can compute it once and hand it to
+   * the rest. It draws no randomness, so skipping it cannot perturb the PRNG
+   * trajectory: engines built with and without this option step identically.
+   *
+   * Omit the field to compute normally. Passing `null` reuses a null estimate
+   * (the degenerate `size < 8` case) rather than meaning "unset".
+   */
+  rNaught?: number | null;
+}
+
 export class Engine {
   private rng!: Rng;
   private pop!: PopulationBuffers;
@@ -63,11 +80,11 @@ export class Engine {
   /** Set to a PassProfile to accumulate per-pass timings; null = no overhead. */
   profile: PassProfile | null = null;
 
-  constructor(config: SimConfig, prebuiltTopo?: VoronoiTopology | null) {
-    this.reset(config, prebuiltTopo);
+  constructor(config: SimConfig, prebuiltTopo?: VoronoiTopology | null, opts?: EngineOptions) {
+    this.reset(config, prebuiltTopo, opts);
   }
 
-  reset(config: SimConfig, prebuiltTopo?: VoronoiTopology | null): void {
+  reset(config: SimConfig, prebuiltTopo?: VoronoiTopology | null, opts?: EngineOptions): void {
     this.config = config;
     if ((config.geometry ?? 'square') === 'voronoi') {
       if (prebuiltTopo) {
@@ -116,7 +133,11 @@ export class Engine {
     this.cumDead = 0;
     this.history = new LongHistory();
     this.retiredCost = emptyRetired();
-    this.rNaught = this.estimateR0(config);
+    // `undefined` (field omitted) means compute; an explicit number|null is a
+    // caller-supplied estimate for an identical config — see EngineOptions.
+    this.rNaught = opts !== undefined && opts.rNaught !== undefined
+      ? opts.rNaught
+      : this.estimateR0(config);
   }
 
   /**
