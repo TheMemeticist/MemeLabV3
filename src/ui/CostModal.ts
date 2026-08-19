@@ -157,7 +157,14 @@ export class CostModal {
 
     const close = () => this.close();
     overlay.querySelector('.about-close')?.addEventListener('click', close);
-    overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close(); });
+    // Same pointerdown guard as R0Modal: a drag that starts inside an input and
+    // ends on the backdrop fires `click` on the overlay and must not dismiss.
+    let pressOnBackdrop = false;
+    overlay.addEventListener('pointerdown', (ev) => { pressOnBackdrop = ev.target === overlay; });
+    overlay.addEventListener('click', (ev) => {
+      if (ev.target === overlay && pressOnBackdrop) close();
+      pressOnBackdrop = false;
+    });
     document.addEventListener('keydown', this.onKey);
 
     this.renderBody();

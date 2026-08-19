@@ -168,6 +168,43 @@ const HISTORICAL_PRESETS: DemoPreset[] = [
       ]),
     ],
   },
+  {
+    // Alternative reading of the same feed: the day 0–16 block's magnitudes
+    // match the day 36–47 sitreps, so the early block looks like a mis-dated
+    // duplicate of later data (or a different case definition), not real early
+    // counts. From day 17 the series is strictly monotone (the day 63 → 68 jump
+    // of ~460 cases is a plausible batch reporting catch-up, which a cumulative
+    // series allows), so the preset keeps the full day 17–96 backbone verbatim.
+    // Population is the effective susceptible pool (see note above): at census
+    // scale one 128-grid cell is worth hundreds of people, the whole outbreak
+    // collapses into a few cells, and the fitted curve degenerates into a
+    // staircase.
+    id: 'ebola-sitrep',
+    label: 'Ebola — outbreak sitreps, days 17–96 (cleaned)',
+    population: 80_000,
+    points: [
+      ...series('cumulative_infections', [
+        [17, 352], [18, 359], [20, 378], [21, 397], [22, 471], [23, 507], [24, 534], [25, 569],
+        [26, 617], [27, 654], [28, 695], [30, 729], [36, 975], [37, 1022], [38, 1067], [40, 1114],
+        [41, 1139], [42, 1176], [43, 1224], [45, 1295], [46, 1328], [47, 1354], [51, 1549],
+        [52, 1582], [53, 1645], [54, 1729], [55, 1780], [59, 1813], [60, 1851], [61, 1894],
+        [62, 1947], [63, 1984], [68, 2444], [69, 2494], [70, 2557], [72, 2926], [73, 2994],
+        [74, 3096], [75, 3221], [76, 3283], [77, 3381], [78, 3463], [79, 3553], [80, 3626],
+        [81, 3695], [82, 3769], [83, 3823], [84, 3895], [85, 3994], [86, 4074], [88, 4141],
+        [91, 4470], [92, 4587], [94, 4864], [95, 4966], [96, 5042],
+      ]),
+      ...series('cumulative_deaths', [
+        [17, 49], [18, 61], [20, 63], [21, 65], [22, 84], [23, 88], [24, 93], [25, 103],
+        [26, 117], [27, 129], [28, 138], [30, 151], [36, 249], [37, 256], [38, 269], [40, 279],
+        [41, 293], [42, 306], [43, 323], [45, 362], [46, 379], [47, 401], [51, 494], [52, 508],
+        [53, 523], [54, 582], [55, 602], [59, 627], [60, 650], [61, 674], [62, 704], [63, 721],
+        [68, 969], [69, 1001], [70, 1035], [72, 1271], [73, 1311], [74, 1356], [75, 1407],
+        [76, 1439], [77, 1489], [78, 1523], [79, 1558], [80, 1589], [81, 1623], [82, 1659],
+        [83, 1709], [84, 1753], [85, 1803], [86, 1852], [88, 1889], [91, 2063], [92, 2130],
+        [94, 2274], [95, 2327], [96, 2380],
+      ]),
+    ],
+  },
 ];
 
 // Persisted snapshot of the panel so a closed/reopened session restores exactly
