@@ -83,7 +83,10 @@ export type FitParamName =
   | 'range'
   | 'incubation'
   | 'infectious'
-  | 'ifr';
+  | 'ifr'
+  // Synthetic search dimension (not a gene, not in FIT_PARAMS): the index-date
+  // offset, evolved by the optimizer when FitRequest.offset is set.
+  | 'indexOffset';
 
 export interface FitParamDef {
   name: FitParamName;
@@ -588,12 +591,31 @@ export interface FitProgress {
   loss: number;
   r0: number | null;
   provisional: boolean;
+  /** The candidate's index-date offset (0 when the offset isn't evolved) — lets
+   *  the live chart slide the model line to align with the raw-day data dots. */
+  indexOffset: number;
+}
+
+/** Profile-likelihood interval over the index-date offset. Calibrated via the
+ *  2·ln(L_max/L) ≤ χ²₁ rule (3.84 → 95%, 1.0 → ≈68%) — legitimate because the
+ *  Poisson NLL is a proper likelihood. This is the cheap frequentist analogue
+ *  of a posterior; NOT the fan chart's ensemble percentile bands. */
+export interface OffsetCI {
+  ci95: [number, number];
+  ci68: [number, number];
+  /** The profile mode — always equals the reported point estimate. */
+  mode: number;
 }
 
 export interface FitRequest extends FitOptions {
   observed: ObservedPoint[];
   baseConfig: SimConfig;
   params: FitParamDef[];
+  /** Evolve the index-date offset (days of outbreak head start before the
+   *  observed days) as an extra bounded integer search dimension. The offset
+   *  shifts the loss's day mapping only — never the SimConfig — so same-gene
+   *  candidates at different offsets share one memoized sim. */
+  offset?: { bounds: [number, number] };
   /** Runs K trials of `config` for `days` days and returns mean per-capita curves
    *  plus the candidate's analytic R₀. */
   simulate: (config: SimConfig, days: number, K: number, seed: number) => Promise<SimResult>;
@@ -624,11 +646,42 @@ export interface FitResult {
   simulated: SimCurves;
   /** The fully-resolved best-fit config (genes applied), ready to apply to the sim. */
   config: SimConfig;
+  /** Evolved index-date offset (days), present when FitRequest.offset was set.
+   *  `observed` is already shifted by it. */
+  indexOffset?: number;
+  /** Profile-likelihood CI for the index date (null when not evolved). */
+  offsetCI?: OffsetCI | null;
 }
 
 export async function runFit(req: FitRequest): Promise<FitResult> {
-  const days = Math.max(1, ...req.observed.map((p) => Math.round(p.day)));
+  const maxObsDay = Math.max(1, ...req.observed.map((p) => Math.round(p.day)));
+  // With an evolved index offset the sim horizon must cover the data at the
+  // largest candidate shift; without one this reduces to the old fixed horizon.
+  const offLo = req.offset ? Math.max(0, Math.round(req.offset.bounds[0])) : 0;
+  const offHi = req.offset ? Math.max(offLo, Math.round(req.offset.bounds[1])) : 0;
+  const days = maxObsDay + offHi;
   const baseSeed = req.baseConfig.seed;
+
+  // The searched vector = the gene params plus (optionally) the index-date
+  // offset as a final integer dimension. The offset never touches the
+  // SimConfig — it only shifts the loss's day mapping — so the pool's
+  // (genes, K) memo makes same-gene candidates at different offsets free:
+  // one sim, many losses.
+  const offsetDef: FitParamDef | null = req.offset
+    ? {
+        name: 'indexOffset',
+        label: 'Index-date offset',
+        bounds: [offLo, offHi],
+        integer: true,
+        get: () => 0,
+        set: () => { /* not a gene — applied in the loss day mapping */ },
+      }
+    : null;
+  const allParams = offsetDef ? [...req.params, offsetDef] : req.params;
+  const offsetOf = (values: number[]): number =>
+    offsetDef ? clamp(Math.round(values[req.params.length]), offLo, offHi) : 0;
+  const shiftPts = (pts: ObservedPoint[], o: number): ObservedPoint[] =>
+    o ? pts.map((p) => ({ ...p, day: p.day + o })) : pts;
 
   const configFor = (values: number[]): SimConfig => {
     const cfg = structuredClone(req.baseConfig);
@@ -638,13 +691,14 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
 
   // One sim of a candidate at `K` trials, yielding the loss, the engine's R₀, and
   // the curves. The pool memoizes by (genes, K), so the racing rungs, the refine,
-  // the final best, and the CI sweep all share results for free.
+  // the final best, and the CI sweeps all share results for free.
   const evalAt = async (
     values: number[],
     K: number,
   ): Promise<{ loss: number; r0: number | null; result: SimResult }> => {
     const result = await req.simulate(configFor(values), days, K, baseSeed);
-    return { loss: lossOf(req.observed, result.curves, req.population, req.loss), r0: result.rNaught, result };
+    const shifted = shiftPts(req.observed, offsetOf(values));
+    return { loss: lossOf(shifted, result.curves, req.population, req.loss), r0: result.rNaught, result };
   };
 
   // Stream the best-so-far to the UI. Full-fidelity (Kfull) improvements gate
@@ -659,7 +713,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   const reportIfBetter = (loss: number, values: number[], result: SimResult, r0: number | null): void => {
     if (!req.onImprove || !Number.isFinite(loss) || loss >= bestLoss) return;
     bestLoss = loss;
-    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0, provisional: false });
+    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0, provisional: false, indexOffset: offsetOf(values) });
   };
 
   // Provisional (low-K) best, tracked per trial count: comparisons are only
@@ -674,7 +728,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     // Once a full-fidelity best exists, stop streaming noisier low-K frames
     // over it — the authoritative overlay has taken over.
     if (bestLoss < Number.POSITIVE_INFINITY) return;
-    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0, provisional: true });
+    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0, provisional: true, indexOffset: offsetOf(values) });
   };
 
   const evaluate = async (values: number[], K: number): Promise<number> => {
@@ -688,7 +742,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   const onProgress = (d: number, t: number): void => { req.onProgress?.(d / t); };
   const opt = req.optimizer === 'genetic'
     ? await runGA({
-        params: req.params,
+        params: allParams,
         evaluate,
         Kfull: req.K,
         K0: req.K0,
@@ -703,7 +757,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
         onProgress,
       })
     : await optimize({
-        params: req.params,
+        params: allParams,
         evaluate,
         Kfull: req.K,
         budget: req.budget,
@@ -716,30 +770,86 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
         onProgress,
       });
 
-  const bestConfig = configFor(opt.best.values);
-  const best = await evalAt(opt.best.values, req.K); // cache hit
+  const bestValues = opt.best.values.slice();
+  let bestLossFinal = opt.best.loss;
+
+  // ── Profile-likelihood CI over the index date (the "cheap posterior") ──
+  // 1D integer grid over the offset bounds with the genes held at their best.
+  // The genes don't change, so the sim is one pool cache hit and every grid
+  // point is just a loss re-scoring — a handful of milliseconds, deterministic.
+  let offsetCI: OffsetCI | null = null;
+  if (offsetDef && !req.signal?.aborted) {
+    const profile: { offset: number; loss: number }[] = [];
+    for (let o = offLo; o <= offHi; o++) {
+      const v = bestValues.slice();
+      v[req.params.length] = o;
+      const { loss } = await evalAt(v, req.K);
+      profile.push({ offset: o, loss });
+    }
+    let mi = 0;
+    for (let i = 1; i < profile.length; i++) if (profile[i].loss < profile[mi].loss) mi = i;
+    // Adopt the profile mode as the point estimate: a strict deterministic
+    // improvement when the joint search landed a day off, and it guarantees the
+    // reported offset IS the mode of the profile the CI is read from.
+    if (profile[mi].loss < bestLossFinal) {
+      bestValues[req.params.length] = profile[mi].offset;
+      bestLossFinal = profile[mi].loss;
+    }
+    offsetCI = profileOffsetCI(profile, mi, req.loss, req.observed.length);
+  }
+
+  const bestConfig = configFor(bestValues);
+  const best = await evalAt(bestValues, req.K); // cache hit
+  const bestOffset = offsetOf(bestValues);
+  const shiftedObserved = shiftPts(req.observed, bestOffset);
   const ciEval = (values: number[]) => evalAt(values, req.K).then((r) => ({ loss: r.loss, r0: r.r0 }));
-  const { ci: r0CI, kind: r0CIKind } = await profileR0CI(opt.best, req, ciEval);
+  const { ci: r0CI, kind: r0CIKind } = await profileR0CI({ values: bestValues, loss: bestLossFinal }, req, ciEval);
 
   return {
     params: req.params.map((p, i) => ({
       name: p.name,
       label: p.label,
-      value: p.integer ? Math.round(opt.best.values[i]) : opt.best.values[i],
+      value: p.integer ? Math.round(bestValues[i]) : bestValues[i],
     })),
     // R₀ from the engine's own estimate — correct for every geometry, and
     // consistent with the topbar readout (no separate analytic formula).
     r0: best.r0,
     r0CI,
     r0CIKind,
-    gof: goodnessOfFit(req.observed, best.result.curves, req.population),
-    loss: opt.best.loss,
+    gof: goodnessOfFit(shiftedObserved, best.result.curves, req.population),
+    loss: bestLossFinal,
     days,
     population: req.population,
-    observed: req.observed,
+    observed: shiftedObserved,
     simulated: best.result.curves,
     config: bestConfig,
+    indexOffset: offsetDef ? bestOffset : undefined,
+    offsetCI,
   };
+}
+
+/** Profile-likelihood CI over a 1D offset profile via 2·ln(L_max/L) ≤ χ²₁
+ *  (3.84 → 95%, 1.0 → ≈68%). Walks OUTWARD from the mode so the interval is the
+ *  connected region containing it (a disconnected below-threshold pocket does
+ *  not extend the interval). `deviance` maps both loss types onto units whose
+ *  differences are χ²₁-calibrated — for Poisson NLL, 2·Δdev IS 2·ln(L_max/L). */
+export function profileOffsetCI(
+  profile: { offset: number; loss: number }[],
+  modeIdx: number,
+  lossType: LossType,
+  nObs: number,
+): OffsetCI {
+  const dev = profile.map((p) => deviance(p.loss, lossType, nObs));
+  const dMin = dev[modeIdx];
+  const within = (i: number, thr: number): boolean => 2 * (dev[i] - dMin) <= thr;
+  const bounds = (thr: number): [number, number] => {
+    let lo = modeIdx;
+    while (lo > 0 && within(lo - 1, thr)) lo--;
+    let hi = modeIdx;
+    while (hi < profile.length - 1 && within(hi + 1, thr)) hi++;
+    return [profile[lo].offset, profile[hi].offset];
+  };
+  return { ci95: bounds(3.841459), ci68: bounds(1.0), mode: profile[modeIdx].offset };
 }
 
 // Parameters that move R₀ — the CI is only profiled over these.

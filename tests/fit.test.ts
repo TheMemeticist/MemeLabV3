@@ -14,6 +14,7 @@ import {
   multiplierAt,
   percentileBands,
   poissonNLL,
+  profileOffsetCI,
   quantileSorted,
   resolutionFitSize,
   revisionEnvelope,
@@ -508,4 +509,73 @@ describe('keyframe multipliers + vintaged accumulation', () => {
     expect(out.upper[0].value).toBe(50);
     expect(out.central[0].value).toBe(50);
   });
+});
+
+describe('index-date offset: evolved param + profile-likelihood CI', () => {
+  it('profileOffsetCI applies 2·ln(Lmax/L) ≤ χ²₁ correctly (hand-checked)', () => {
+    // Poisson loss IS the NLL, so deviance = loss and 2Δdev = 2·ln(Lmax/L).
+    // loss(o) = 100 + 0.3·(o−5)² → 2Δ = 0.6·(o−5)²:
+    //   o=4/6 → 0.6, o=3/7 → 2.4 (≤3.84, in 95%), o=2/8 → 5.4 (out).
+    //   68% (2Δ ≤ 1.0): only o ∈ {4,5,6}.
+    const profile = [];
+    for (let o = 0; o <= 8; o++) profile.push({ offset: o, loss: 100 + 0.3 * (o - 5) ** 2 });
+    // Disconnected below-threshold pocket at o=10 must NOT extend the interval
+    // (o=9 is far above threshold, so the outward walk stops at 7).
+    profile.push({ offset: 9, loss: 108 });
+    profile.push({ offset: 10, loss: 100.1 });
+    const ci = profileOffsetCI(profile, 5, 'poisson', 10);
+    expect(ci.mode).toBe(5);
+    expect(ci.ci95).toEqual([3, 7]);
+    expect(ci.ci68).toEqual([4, 6]);
+  });
+
+  it('evolves the offset to the true head start and the CI brackets it', async () => {
+    const POP = 50_000;
+    const K = 6;
+    const TRUE_OFFSET = 8;
+    const truthCfg = baseConfig();
+    const truthCurves = runTrials(truthCfg, 48, K, truthCfg.seed).curves;
+    // Reports start TRUE_OFFSET days after the model outbreak: raw day = model day − 8.
+    const observed: ObservedPoint[] = [];
+    for (let m = 10; m <= 40; m += 5) {
+      observed.push({
+        day: m - TRUE_OFFSET,
+        value: Math.round(truthCurves.cumulative_infections[m] * POP),
+        category: 'cumulative_infections',
+      });
+    }
+    const params = [
+      { ...findFitParam('attackRate'), bounds: [0.05, 0.6] as [number, number] },
+      { ...findFitParam('range'), bounds: [1, 3] as [number, number] },
+    ];
+    const run = () => runFit({
+      observed,
+      baseConfig: baseConfig({ strain: { ...baseConfig().strain, attackRate: 0.5, range: 2 } }),
+      params,
+      offset: { bounds: [0, 16] },
+      population: POP,
+      K,
+      loss: 'poisson',
+      simulate,
+      budget: 24,
+      nmIters: 15,
+    });
+    const r = await run();
+    expect(r.indexOffset).toBeDefined();
+    expect(Math.abs(r.indexOffset! - TRUE_OFFSET)).toBeLessThanOrEqual(2);
+    // Point estimate is the mode of the profile, and the CIs bracket it.
+    expect(r.offsetCI).not.toBeNull();
+    expect(r.offsetCI!.mode).toBe(r.indexOffset);
+    expect(r.offsetCI!.ci95[0]).toBeLessThanOrEqual(r.indexOffset!);
+    expect(r.offsetCI!.ci95[1]).toBeGreaterThanOrEqual(r.indexOffset!);
+    expect(r.offsetCI!.ci68[0]).toBeGreaterThanOrEqual(r.offsetCI!.ci95[0]);
+    expect(r.offsetCI!.ci68[1]).toBeLessThanOrEqual(r.offsetCI!.ci95[1]);
+    // result.observed is shifted by the fitted offset; the fit is good.
+    expect(Math.min(...r.observed.map((p) => p.day))).toBe(10 - TRUE_OFFSET + r.indexOffset!);
+    expect(r.gof.r2).toBeGreaterThan(0.9);
+    // Deterministic: same seed → identical offset and CI.
+    const r2 = await run();
+    expect(r2.indexOffset).toBe(r.indexOffset);
+    expect(r2.offsetCI).toEqual(r.offsetCI);
+  }, 40_000);
 });

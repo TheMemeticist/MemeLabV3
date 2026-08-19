@@ -290,6 +290,8 @@ interface R0Snapshot {
   history?: FitHistoryEntry[];
   fanTrials?: number;
   adjust?: AdjustSettings;
+  offsetEvolve?: boolean;
+  offsetBounds?: [number, number];
 }
 
 export class R0Modal {
@@ -308,7 +310,11 @@ export class R0Modal {
   private loss: LossType = 'poisson';
   // Days to shift the dataset later in model time — gives the outbreak a head start
   // before the first reported case (corrects for early under-detection). 0 = none.
+  // When offsetEvolve is on, the optimizer searches this within offsetBounds and
+  // writes the fitted value back here (one field, evolved — not a duplicate).
   private indexOffset = 0;
+  private offsetEvolve = true;
+  private offsetBounds: [number, number] = [0, 28];
   // Genetic algorithm is the default search — global and robust on MemeLab's rugged,
   // multimodal loss surfaces, and it evolves the disease genome the way the sim does.
   private optimizer: OptimizerKind = 'genetic';
@@ -347,6 +353,12 @@ export class R0Modal {
   private liveAdjustPts: Partial<Record<FitCategory, { floor: [number, number][]; central: [number, number][]; upper: [number, number][] }>> | null = null;
   // Highest overlay value (people) so y-autoscale includes bands above the data.
   private overlayMax = 0;
+  // During an offset-evolving fit the dots sit at raw days; slide the model line
+  // right by the current best candidate's offset so the two stay aligned.
+  private liveModelShift = 0;
+  // Index-date profile-CI marker for the final chart (x = plausible positions of
+  // the first observation given the CI; line = where it actually sits).
+  private liveOffsetBand: { lo95: number; hi95: number; lo68: number; hi68: number; at: number } | null = null;
   private liveDays = 0;
   private livePop = 0;
   private pendingSnapshot: FitProgress | null = null;
@@ -432,6 +444,8 @@ export class R0Modal {
       history: this.history,
       fanTrials: this.fanTrials,
       adjust: { ...this.adjust },
+      offsetEvolve: this.offsetEvolve,
+      offsetBounds: [...this.offsetBounds] as [number, number],
     });
   }
 
@@ -456,6 +470,11 @@ export class R0Modal {
     if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
     if (Number.isFinite(s.fanTrials)) this.fanTrials = Math.min(100, Math.max(1, Math.round(s.fanTrials!)));
     if (s.adjust && typeof s.adjust === 'object') this.adjust = { ...DEFAULT_ADJUST, ...s.adjust };
+    if (typeof s.offsetEvolve === 'boolean') this.offsetEvolve = s.offsetEvolve;
+    if (Array.isArray(s.offsetBounds) && s.offsetBounds.length === 2) {
+      const lo = Math.max(0, Math.round(s.offsetBounds[0]));
+      this.offsetBounds = [lo, Math.max(lo, Math.round(s.offsetBounds[1]))];
+    }
   }
 
   // ── Restored-session banner + reset ──
@@ -494,9 +513,12 @@ export class R0Modal {
     this.history = [];
     this.fanTrials = 30;
     this.adjust = { ...DEFAULT_ADJUST };
+    this.offsetEvolve = true;
+    this.offsetBounds = [0, 28];
     this.lastRaw = null;
     this.lastAdjust = null;
     this.lastFan = null;
+    this.liveOffsetBand = null;
     // close() persists by default — that would immediately re-save the state we
     // just wiped, so gate it off for this teardown, then reopen after the 200ms
     // exit animation clears the old DOM.
@@ -528,6 +550,25 @@ export class R0Modal {
       offsetInput.value = String(this.indexOffset);
       this.persist();
     });
+
+    // Evolve-index-date toggle + bounds (the offset above becomes the fitted value).
+    const offEvolve = q<HTMLInputElement>('[data-r0="offset-evolve"]');
+    const offLo = q<HTMLInputElement>('[data-r0="offset-lo"]');
+    const offHi = q<HTMLInputElement>('[data-r0="offset-hi"]');
+    offEvolve.checked = this.offsetEvolve;
+    offLo.value = String(this.offsetBounds[0]);
+    offHi.value = String(this.offsetBounds[1]);
+    offEvolve.addEventListener('change', () => { this.offsetEvolve = offEvolve.checked; this.persist(); });
+    const readBounds = (): void => {
+      const lo = Math.max(0, Math.round(Number(offLo.value) || 0));
+      const hi = Math.max(lo, Math.round(Number(offHi.value) || 0));
+      this.offsetBounds = [lo, hi];
+      offLo.value = String(lo);
+      offHi.value = String(hi);
+      this.persist();
+    };
+    offLo.addEventListener('change', readBounds);
+    offHi.addEventListener('change', readBounds);
 
     q<HTMLButtonElement>('[data-r0="add-row"]').addEventListener('click', () => {
       const lastDay = this.observed.length ? Math.max(...this.observed.map((p) => p.day)) : 0;
@@ -860,7 +901,9 @@ export class R0Modal {
     raw: ObservedPoint[] | null;
     adjustBands: { floor: ObservedPoint[]; central: ObservedPoint[]; upper: ObservedPoint[] } | null;
   } {
-    const off = this.indexOffset || 0;
+    // When the index date is evolved, the optimizer applies the shift itself —
+    // the manual offset only pre-shifts in fixed mode.
+    const off = this.offsetEvolve ? 0 : (this.indexOffset || 0);
     const finite = this.observed
       .filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value))
       .map((p) => ({ ...p }));
@@ -917,6 +960,8 @@ export class R0Modal {
     this.lastRaw = raw;
     this.lastAdjust = adjustBands;
     this.lastFan = null; // computed after the fit lands
+    this.liveOffsetBand = null;
+    this.liveModelShift = 0;
     this.renderLive(observed, raw); // persistent chart + provisional metrics, updated live
     if (expanded) this.note('Timing params added (your data spans the peak) — fitting…');
 
@@ -955,6 +1000,7 @@ export class R0Modal {
         population: this.population,
         K: this.K,
         loss: this.loss,
+        offset: this.offsetEvolve ? { bounds: [...this.offsetBounds] as [number, number] } : undefined,
         optimizer: this.optimizer,
         gaPopulation: this.ga.population,
         gaGenerations: this.ga.generations,
@@ -979,6 +1025,35 @@ export class R0Modal {
         // the live sim shows after Apply. Recompute it on the user's real grid.
         this.note('Refining R₀ for your grid…');
         this.result = await this.reconcileR0(result);
+        // Evolved index date: write the fitted offset back into the (single)
+        // indexOffset field, re-anchor the transient overlays to the shifted
+        // days, and stage the profile-CI marker for the chart.
+        if (this.result.indexOffset != null) {
+          const o = this.result.indexOffset;
+          this.indexOffset = o;
+          const oi = this.el?.querySelector<HTMLInputElement>('[data-r0="offset"]');
+          if (oi) oi.value = String(o);
+          const sh = (pts: ObservedPoint[]): ObservedPoint[] => pts.map((p) => ({ ...p, day: p.day + o }));
+          if (this.lastRaw) this.lastRaw = sh(this.lastRaw);
+          if (this.lastAdjust) {
+            this.lastAdjust = {
+              floor: sh(this.lastAdjust.floor),
+              central: sh(this.lastAdjust.central),
+              upper: sh(this.lastAdjust.upper),
+            };
+          }
+          const ci = this.result.offsetCI;
+          if (ci) {
+            const firstRaw = Math.min(...this.result.observed.map((p) => p.day)) - o;
+            this.liveOffsetBand = {
+              lo95: firstRaw + ci.ci95[0],
+              hi95: firstRaw + ci.ci95[1],
+              lo68: firstRaw + ci.ci68[0],
+              hi68: firstRaw + ci.ci68[1],
+              at: firstRaw + o,
+            };
+          }
+        }
         // Fan chart: re-run the best config as an ensemble (each trial from a
         // different index case) and aggregate into percentile bands. Display
         // only — the fit result above is already final. Deterministic in
@@ -1059,6 +1134,9 @@ export class R0Modal {
       const s = this.pendingSnapshot;
       this.pendingSnapshot = null;
       if (!s) return;
+      // Slide the model line to the candidate's index-date offset so it aligns
+      // with the raw-day data dots while the offset is being evolved.
+      this.liveModelShift = s.indexOffset ?? 0;
       this.updateChartData(s.curves);
       const r0El = this.el?.querySelector<HTMLElement>('[data-r0="live-r0"]');
       if (r0El) r0El.textContent = `R₀ = ${s.r0 == null ? '—' : s.r0.toFixed(2)}`;
@@ -1251,7 +1329,15 @@ export class R0Modal {
     const barPct = Math.max(0, Math.min(1, r.gof.r2)) * 100;
     const paramRows = r.params
       .map((p) => `<tr><td>${p.label}</td><td>${fmtParam(p.name, p.value)}</td></tr>`)
-      .join('');
+      .join('')
+      + (r.indexOffset == null ? '' : `<tr>
+          <td title="Evolved during the fit. The interval is a PROFILE-LIKELIHOOD CI — calibrated via 2·ln(Lmax/L) ≤ 3.84 (95%) / 1.0 (68%) over the index-date grid with the other parameters at their best. It is a parameter interval, distinct from the fan chart's ensemble percentile bands (predictive spread).">Index date (head start)</td>
+          <td>≈ day ${r.indexOffset}${r.offsetCI
+            ? (r.offsetCI.ci95[0] === r.offsetCI.ci95[1]
+              ? ' <span class="r0-muted">(≈ exact — the data over-determines the date)</span>'
+              : ` <span class="r0-muted">(95% CI ${r.offsetCI.ci95[0]}–${r.offsetCI.ci95[1]} · 68% ${r.offsetCI.ci68[0]}–${r.offsetCI.ci68[1]})</span>`)
+            : ''}</td>
+        </tr>`);
 
     host.innerHTML = `
       <div class="r0-result-grid">
@@ -1338,6 +1424,7 @@ export class R0Modal {
           this.lastRaw = null;
           this.lastAdjust = null;
           this.lastFan = null;
+          this.liveOffsetBand = null;
           this.renderOutput();
           this.note('Loaded fit from history.');
         });
@@ -1371,6 +1458,9 @@ export class R0Modal {
     this.liveCats = FIT_CATEGORIES.filter((c) => observed.some((p) => p.category === c));
 
     // Cache the hook-painted overlays (people-scaled) + the y-range they need.
+    // A fresh chart is aligned (dots and model in the same day coordinates);
+    // only onImprove sets a nonzero shift while an offset-evolving fit runs.
+    this.liveModelShift = 0;
     this.liveFanCols = null;
     this.liveAdjustPts = null;
     this.overlayMax = 0;
@@ -1526,7 +1616,8 @@ export class R0Modal {
       const p50 = this.liveFanCols?.[cat]?.[FAN_PROBS.indexOf(50)];
       const arr = p50 ?? curves[cat] ?? [];
       const scale = p50 ? 1 : this.livePop; // fan rows are already people-scaled
-      const sim = xs.map((d) => (arr[Math.min(d, arr.length - 1)] ?? 0) * scale);
+      const shift = p50 ? 0 : this.liveModelShift; // fan renders post-fit, already aligned
+      const sim = xs.map((d) => (arr[Math.min(d + shift, arr.length - 1)] ?? 0) * scale);
       const obs: (number | null)[] = xs.map(() => null);
       for (const pt of this.liveObserved) {
         if (pt.category !== cat) continue;
@@ -1546,7 +1637,7 @@ export class R0Modal {
   private paintOverlays(u: uPlot): void {
     const fan = this.liveFanCols;
     const adj = this.liveAdjustPts;
-    if (!fan && !adj) return;
+    if (!fan && !adj && !this.liveOffsetBand) return;
     const ctx = u.ctx;
     ctx.save();
     ctx.beginPath();
@@ -1554,6 +1645,24 @@ export class R0Modal {
     ctx.clip();
     const X = (d: number): number => u.valToPos(d, 'x', true);
     const Y = (v: number): number => u.valToPos(v, 'y', true);
+    // Index-date profile-CI marker: the grey band spans the plausible positions
+    // of the FIRST OBSERVATION under the CI (darker = 68%), with a dashed line
+    // where the fitted offset actually anchors it.
+    const ob = this.liveOffsetBand;
+    if (ob) {
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.10)';
+      ctx.fillRect(X(ob.lo95), u.bbox.top, Math.max(1, X(ob.hi95) - X(ob.lo95)), u.bbox.height);
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.14)';
+      ctx.fillRect(X(ob.lo68), u.bbox.top, Math.max(1, X(ob.hi68) - X(ob.lo68)), u.bbox.height);
+      ctx.beginPath();
+      ctx.moveTo(X(ob.at), u.bbox.top);
+      ctx.lineTo(X(ob.at), u.bbox.top + u.bbox.height);
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.7)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     for (const cat of this.liveCats) {
       const color = CAT_COLOR[cat];
       const rows = fan?.[cat];
@@ -1663,6 +1772,15 @@ const TEMPLATE = `
       <span>Index-case offset (days)</span>
       <input class="r0-in" type="number" step="1" min="0" max="365" data-r0="offset" />
     </label>
+    <div class="r0-actions">
+      <label class="r0-check" title="Search the index date during the fit: the offset becomes an evolved, bounded integer parameter (like the other ranges), deterministic and seeded. The fitted value is written back into the offset field above, and a profile-likelihood CI for it is reported with the result.">
+        <input type="checkbox" data-r0="offset-evolve" /> evolve index date within
+      </label>
+      <span class="r0-bound"><input class="r0-in tiny" type="number" step="1" min="0" data-r0="offset-lo" aria-label="Index-date offset lower bound" /></span>
+      <span class="r0-sep">–</span>
+      <span class="r0-bound"><input class="r0-in tiny" type="number" step="1" min="0" data-r0="offset-hi" aria-label="Index-date offset upper bound" /></span>
+      <span class="r0-muted">days head start</span>
+    </div>
     <p class="r0-blurb r0-hint">Shifts every data point this many days later in model time, giving the
       outbreak a head start before the first reported case. Early surveillance undercounts a new
       epidemic (low testing, sampling bias), so the true index case usually predates the data — raise
