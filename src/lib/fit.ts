@@ -849,6 +849,66 @@ export function parseObservedCSV(text: string, defaultCategory: FitCategory = 'c
   return { points, skipped };
 }
 
+// ─── Revised-cumulative cleaning ─────────────────────────────────────────────
+// Real surveillance data gets *revised down* as duplicates and misdiagnoses are
+// removed: an early cumulative count can exceed a later one (impossible for true
+// cumulative counts). Later reports supersede earlier over-counts, so the
+// consistent monotone series is the right-to-left running-min envelope: clip each
+// value to the minimum of all later values in its category. Non-destructive —
+// callers fit against the cleaned copy while the table keeps the raw data.
+// `active_infections` is prevalence (legitimately non-monotone) and passes
+// through untouched.
+
+const CUMULATIVE_CATS: FitCategory[] = ['cumulative_infections', 'cumulative_deaths'];
+
+/** Right-to-left running-min envelope over each cumulative category. */
+export function revisionEnvelope(points: ObservedPoint[]): ObservedPoint[] {
+  const out = points.map((p) => ({ ...p }));
+  for (const cat of CUMULATIVE_CATS) {
+    const idx = out
+      .map((p, i) => ({ p, i }))
+      .filter(({ p }) => p.category === cat)
+      .sort((a, b) => a.p.day - b.p.day);
+    let min = Number.POSITIVE_INFINITY;
+    for (let k = idx.length - 1; k >= 0; k--) {
+      min = Math.min(min, idx[k].p.value);
+      out[idx[k].i].value = min;
+    }
+  }
+  return out;
+}
+
+/** True if any cumulative-category value exceeds a later value in its category
+ *  (a downward revision — the envelope would change the data). */
+export function hasDownwardRevisions(points: ObservedPoint[]): boolean {
+  const cleaned = revisionEnvelope(points);
+  return points.some((p, i) => p.value !== cleaned[i].value);
+}
+
+// ─── Fit-grid resolution ─────────────────────────────────────────────────────
+// One grid cell represents population/size² real people — the smallest nonzero
+// value the model can produce (day 0 is exactly one index-case cell). If that
+// quantum exceeds the smallest observed data point, the Poisson loss carries an
+// irreducible floor the optimizer cannot fix and every curve renders as giant
+// steps. So the fit grid must satisfy population/size² ≤ min positive observed:
+// size ≥ ceil(√(population / minObs)). We fit at the live size when it already
+// satisfies this (reproduce-on-Apply), raise it to the resolution floor when it
+// doesn't (with a UI warning that Apply needs a larger live grid), and cap for
+// cost — beyond the cap the caller warns that resolution is insufficient.
+
+export function resolutionFitSize(
+  liveSize: number,
+  population: number,
+  minPositiveObs: number,
+  cap: number,
+): number {
+  const floor =
+    Number.isFinite(minPositiveObs) && minPositiveObs > 0 && population > 0
+      ? Math.ceil(Math.sqrt(population / minPositiveObs))
+      : 0;
+  return Math.min(cap, Math.max(Math.min(liveSize, cap), floor, 8));
+}
+
 // ─── Initial-guess seam ──────────────────────────────────────────────────────
 // Heuristic warm start for the optimizer. Currently returns the bound midpoints;
 // this is the documented hook where a future TensorFlow.js surrogate (trained on

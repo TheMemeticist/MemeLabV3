@@ -7,10 +7,13 @@ import {
   analyticR0,
   findFitParam,
   goodnessOfFit,
+  hasDownwardRevisions,
   mse,
   optimize,
   parseObservedCSV,
   poissonNLL,
+  resolutionFitSize,
+  revisionEnvelope,
   runFit,
 } from '../src/lib/fit';
 import type { ObservedPoint, SimCurves, SimResult } from '../src/lib/fit';
@@ -360,4 +363,59 @@ describe('fit must run at the live grid size to reproduce', () => {
     const b = runTrials(mk(96), DAYS, K, mk(96).seed).curves.cumulative_deaths;
     expect(b).toEqual(a);
   }, 30_000);
+});
+
+describe('revised-cumulative envelope + fit-grid resolution', () => {
+  const pts = (pairs: [number, number][], category = 'cumulative_infections' as const): ObservedPoint[] =>
+    pairs.map(([day, value]) => ({ day, value, category }));
+
+  it('clips each cumulative value to the minimum of all later values', () => {
+    // The Ebola revision shape: 1262 (day 14) later revised down via 681 → 352.
+    const raw = pts([[10, 1042], [14, 1262], [16, 681], [17, 352], [18, 359], [20, 378]]);
+    const cleaned = revisionEnvelope(raw);
+    expect(cleaned.map((p) => p.value)).toEqual([352, 352, 352, 352, 359, 378]);
+    // Non-destructive: the input is untouched.
+    expect(raw.map((p) => p.value)).toEqual([1042, 1262, 681, 352, 359, 378]);
+    // Result is monotone non-decreasing in day order.
+    const sorted = cleaned.slice().sort((a, b) => a.day - b.day);
+    for (let i = 1; i < sorted.length; i++) expect(sorted[i].value).toBeGreaterThanOrEqual(sorted[i - 1].value);
+  });
+
+  it('is a no-op on monotone data and never touches active_infections', () => {
+    const mono = pts([[0, 1], [5, 10], [9, 50]]);
+    expect(revisionEnvelope(mono).map((p) => p.value)).toEqual([1, 10, 50]);
+    expect(hasDownwardRevisions(mono)).toBe(false);
+    const active: ObservedPoint[] = pts([[0, 5], [5, 90], [10, 20]], undefined)
+      .map((p) => ({ ...p, category: 'active_infections' as const }));
+    expect(revisionEnvelope(active).map((p) => p.value)).toEqual([5, 90, 20]);
+    expect(hasDownwardRevisions(active)).toBe(false);
+  });
+
+  it('detects downward revisions and cleans categories independently', () => {
+    const mixed = [
+      ...pts([[0, 100], [5, 60], [9, 80]]),
+      ...pts([[0, 10], [5, 20], [9, 30]], 'cumulative_infections').map((p) => ({ ...p, category: 'cumulative_deaths' as const })),
+    ];
+    expect(hasDownwardRevisions(mixed)).toBe(true);
+    const cleaned = revisionEnvelope(mixed);
+    expect(cleaned.slice(0, 3).map((p) => p.value)).toEqual([60, 60, 80]); // infections clipped
+    expect(cleaned.slice(3).map((p) => p.value)).toEqual([10, 20, 30]);   // deaths untouched
+  });
+
+  it('sizes the fit grid so one cell never exceeds the smallest observed value', () => {
+    // The regression scenario: 8×8 live grid, census-scale population. One cell
+    // was 1e6/64 = 15,625 people; the floor must push size to ≥ 84 so that
+    // pop/size² ≤ 144 (the smallest data point).
+    const size = resolutionFitSize(8, 1_000_000, 144, 128);
+    expect(size).toBeGreaterThanOrEqual(84);
+    expect(1_000_000 / (size * size)).toBeLessThanOrEqual(144);
+    // Live size already sufficient → fit at the live size (reproduce-on-Apply).
+    expect(resolutionFitSize(100, 80_000, 50, 128)).toBe(100);
+    // Cap respected in both directions.
+    expect(resolutionFitSize(200, 80_000, 50, 128)).toBe(128);
+    expect(resolutionFitSize(8, 1_000_000, 10, 128)).toBe(128); // floor beyond cap → cap (UI warns)
+    // Degenerate inputs fall back to the live size (min 8).
+    expect(resolutionFitSize(40, 1_000_000, Number.NaN, 128)).toBe(40);
+    expect(resolutionFitSize(2, 0, 0, 128)).toBe(8);
+  });
 });

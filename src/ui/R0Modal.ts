@@ -13,12 +13,15 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { SimConfig } from '../types';
 import { FitPool } from '../lib/fit-pool';
-import { read, write } from '../lib/storage';
+import { read, remove, write } from '../lib/storage';
 import {
   CATEGORY_LABELS,
   FIT_CATEGORIES,
   FIT_PARAMS,
+  hasDownwardRevisions,
   parseObservedCSV,
+  resolutionFitSize,
+  revisionEnvelope,
   runFit,
 } from '../lib/fit';
 import type {
@@ -45,6 +48,9 @@ const CAT_COLOR: Record<FitCategory, string> = {
   cumulative_deaths: 'rgb(239, 68, 68)',
   active_infections: 'rgb(34, 197, 94)',
 };
+
+// Greyed ink for raw points superseded by the revision cleaning.
+const RAW_INK = 'rgba(148, 163, 184, 0.55)';
 
 // Short legend labels — the full CATEGORY_LABELS ("Cumulative infections") make the
 // legend pills overflow and hide the value readout, so the chart uses these instead.
@@ -126,6 +132,42 @@ const HISTORICAL_PRESETS: DemoPreset[] = [
     population: 120_000,
     points: series('cumulative_deaths', [[0, 0], [7, 120], [14, 1600], [21, 6800], [28, 11700], [35, 14200], [42, 15400], [49, 16000]]),
   },
+  // Stored RAW, downward revisions and all (days 12–16 were revised down as
+  // duplicates/misdiagnoses were removed). The "honor downward revisions"
+  // cleaning — on by default — fits against the running-min envelope, and the
+  // chart greys the superseded raw points. Toggle it off to fit the raw series.
+  {
+    id: 'ebola-rev',
+    label: 'Ebola — 2026 outbreak (revised counts)',
+    population: 15_000,
+    points: [
+      ...series('cumulative_infections', [
+        [0, 653], [5, 968], [6, 1010], [10, 1042], [12, 1205], [13, 1038], [14, 1262],
+        [16, 681], [17, 352], [18, 359], [20, 378], [21, 397], [22, 471], [23, 507],
+        [24, 534], [25, 569], [26, 617], [27, 654], [28, 695], [30, 729], [36, 975],
+        [37, 1022], [38, 1067], [40, 1114], [41, 1139], [42, 1176], [43, 1224],
+        [45, 1295], [46, 1328], [47, 1354], [51, 1549], [52, 1582], [53, 1645],
+        [54, 1729], [55, 1780], [59, 1813], [60, 1851], [61, 1894], [62, 1947],
+        [63, 1984], [68, 2444], [69, 2494], [70, 2557], [72, 2926], [73, 2994],
+        [74, 3096], [75, 3221], [76, 3283], [77, 3381], [78, 3463], [79, 3553],
+        [80, 3626], [81, 3695], [82, 3769], [83, 3823], [84, 3895], [85, 3994],
+        [86, 4074], [88, 4141], [91, 4470], [92, 4587], [94, 4864], [95, 4966],
+        [96, 5042],
+      ]),
+      ...series('cumulative_deaths', [
+        [0, 144], [5, 216], [6, 231], [10, 240], [12, 264], [13, 241], [14, 241],
+        [16, 56], [17, 49], [18, 61], [20, 63], [21, 65], [22, 84], [23, 88],
+        [24, 93], [25, 103], [26, 117], [27, 129], [28, 138], [30, 151], [36, 249],
+        [37, 256], [38, 269], [40, 279], [41, 293], [42, 306], [43, 323], [45, 362],
+        [46, 379], [47, 401], [51, 494], [52, 508], [53, 523], [54, 582], [55, 602],
+        [59, 627], [60, 650], [61, 674], [62, 704], [63, 721], [68, 969], [69, 1001],
+        [70, 1035], [72, 1271], [73, 1311], [74, 1356], [75, 1407], [76, 1439],
+        [77, 1489], [78, 1523], [79, 1558], [80, 1589], [81, 1623], [82, 1659],
+        [83, 1709], [84, 1753], [85, 1803], [86, 1852], [88, 1889], [91, 2063],
+        [92, 2130], [94, 2274], [95, 2327], [96, 2380],
+      ]),
+    ],
+  },
 ];
 
 // Persisted snapshot of the panel so a closed/reopened session restores exactly
@@ -144,6 +186,30 @@ const DEFAULT_GA: GASettings = {
   population: 40, generations: 25, mutationRate: 0.2, crossoverRate: 0.9, elitism: 2, tournament: 3,
 };
 
+/** One completed fit, kept for the history table. `hash` identifies the exact
+ *  effective dataset the loss saw (post-shift, post-cleaning, incl. population),
+ *  so fits are only ranked against the same data. */
+interface FitHistoryEntry {
+  t: number; // wall-clock ms — display only, never feeds the sim
+  hash: string;
+  presetId: string;
+  result: FitResult;
+}
+const HISTORY_CAP = 20;
+
+// FNV-1a over the effective dataset + population — the comparability key for
+// the history table.
+function datasetHash(points: ObservedPoint[], population: number): string {
+  const s = points
+    .slice()
+    .sort((a, b) => a.day - b.day || a.category.localeCompare(b.category) || a.value - b.value)
+    .map((p) => `${p.day}:${p.value}:${p.category}`)
+    .join('|') + `|${population}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
 interface R0Snapshot {
   population: number;
   selected: FitParamName[];
@@ -155,6 +221,8 @@ interface R0Snapshot {
   optimizer?: OptimizerKind;
   ga?: GASettings;
   indexOffset?: number;
+  honorRevisions?: boolean;
+  history?: FitHistoryEntry[];
 }
 
 export class R0Modal {
@@ -179,14 +247,24 @@ export class R0Modal {
   private optimizer: OptimizerKind = 'genetic';
   private ga: GASettings = { ...DEFAULT_GA };
   private presetId = 'synthetic';
+  // Fit against the revision-cleaned (right-to-left running-min) series when the
+  // data has downward revisions. A no-op on monotone data, so on by default.
+  private honorRevisions = true;
+  private history: FitHistoryEntry[] = [];
   private running = false;
   private signal = { aborted: false };
+  private skipPersist = false;
   private result: FitResult | null = null;
+  // Raw (pre-cleaning) points for the greyed preview overlay of the last fit.
+  private lastRaw: ObservedPoint[] | null = null;
 
   // Live-chart state (set by createChart, read by updateChartData) + an rAF
   // throttle so a burst of optimizer improvements coalesces into one redraw.
   private liveObserved: ObservedPoint[] = [];
   private liveCats: FitCategory[] = [];
+  // Per-category greyed raw-overlay columns (null = category has no revisions);
+  // parallel to liveCats, cached so live frames rebuild the same data shape.
+  private liveRawCols: ((number | null)[] | null)[] = [];
   private liveDays = 0;
   private livePop = 0;
   private pendingSnapshot: FitProgress | null = null;
@@ -212,7 +290,16 @@ export class R0Modal {
     this.pool = new FitPool();
 
     overlay.querySelector('.r0-close')?.addEventListener('click', () => this.close());
-    overlay.addEventListener('click', (ev) => { if (ev.target === overlay) this.close(); });
+    // Outside-click dismiss — but only when the *press* started on the backdrop
+    // too. Drag-selecting an input's value and releasing over the backdrop
+    // dispatches the click on the overlay (nearest common ancestor of down/up
+    // targets), which used to close the modal mid-edit.
+    let pressOnOverlay = false;
+    overlay.addEventListener('pointerdown', (ev) => { pressOnOverlay = ev.target === overlay; });
+    overlay.addEventListener('click', (ev) => {
+      if (ev.target === overlay && pressOnOverlay) this.close();
+      pressOnOverlay = false;
+    });
     document.addEventListener('keydown', this.onKey);
 
     // Restore the previous session if one was saved; otherwise fall back to the
@@ -224,12 +311,14 @@ export class R0Modal {
     this.renderTable();
     this.renderParams();
     this.renderOutput();
+    this.renderHistory();
+    if (saved) this.showRestoreBanner();
     if (!saved) void this.loadDemo();
   }
 
   close(): void {
     if (!this.el) return;
-    this.persist();
+    if (!this.skipPersist) this.persist();
     document.removeEventListener('keydown', this.onKey);
     this.signal.aborted = true;
     if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
@@ -257,6 +346,8 @@ export class R0Modal {
       optimizer: this.optimizer,
       ga: { ...this.ga },
       indexOffset: this.indexOffset,
+      honorRevisions: this.honorRevisions,
+      history: this.history,
     });
   }
 
@@ -277,6 +368,51 @@ export class R0Modal {
     if (s.optimizer === 'local' || s.optimizer === 'genetic') this.optimizer = s.optimizer;
     if (s.ga && typeof s.ga === 'object') this.ga = { ...DEFAULT_GA, ...s.ga };
     if (Number.isFinite(s.indexOffset)) this.indexOffset = Math.max(0, Math.round(s.indexOffset!));
+    if (typeof s.honorRevisions === 'boolean') this.honorRevisions = s.honorRevisions;
+    if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
+  }
+
+  // ── Restored-session banner + reset ──
+  // Persisted settings (population, bounds, offset, dataset) silently shape every
+  // new fit — e.g. a stale census-scale Population on a tiny grid. Surface the
+  // restore visibly and offer a one-click way back to a clean slate.
+  private showRestoreBanner(): void {
+    const host = this.el?.querySelector<HTMLElement>('[data-r0="banner"]');
+    if (!host) return;
+    host.hidden = false;
+    host.innerHTML = `
+      <span>Restored your previous session — population, dataset, bounds and offsets persist between visits and quietly shape new fits.</span>
+      <button class="btn ghost" type="button" data-r0="reset">Reset to defaults</button>
+      <button class="r0-banner-x" type="button" aria-label="Dismiss">×</button>
+    `;
+    host.querySelector<HTMLButtonElement>('[data-r0="reset"]')!.addEventListener('click', () => this.resetToDefaults());
+    host.querySelector<HTMLButtonElement>('.r0-banner-x')!.addEventListener('click', () => { host.hidden = true; });
+  }
+
+  /** Wipe the persisted snapshot and all panel state (including fit history),
+   *  then reopen fresh — lands on the auto-generated demo, like a first visit. */
+  private resetToDefaults(): void {
+    remove(STORAGE_KEY);
+    this.population = DEMO_POP;
+    this.selected = new Set(FIT_PARAMS.filter((p) => p.core).map((p) => p.name));
+    this.bounds = new Map(FIT_PARAMS.map((p) => [p.name, [...p.bounds] as [number, number]]));
+    this.K = 30;
+    this.loss = 'poisson';
+    this.indexOffset = 0;
+    this.optimizer = 'genetic';
+    this.ga = { ...DEFAULT_GA };
+    this.presetId = 'synthetic';
+    this.observed = [];
+    this.result = null;
+    this.honorRevisions = true;
+    this.history = [];
+    this.lastRaw = null;
+    // close() persists by default — that would immediately re-save the state we
+    // just wiped, so gate it off for this teardown, then reopen after the 200ms
+    // exit animation clears the old DOM.
+    this.skipPersist = true;
+    this.close();
+    setTimeout(() => { this.skipPersist = false; this.open(); }, 220);
   }
 
   private onKey = (ev: KeyboardEvent) => {
@@ -348,6 +484,18 @@ export class R0Modal {
       this.renderTable();
       this.persist();
       this.note(`Loaded ${points.length} point${points.length === 1 ? '' : 's'}${skipped ? `, skipped ${skipped}` : ''}.`);
+    });
+
+    // Revised-cumulative toggle. A no-op on monotone data, so it stays on by
+    // default; turning it off fits the raw series, revisions and all.
+    const revInput = q<HTMLInputElement>('[data-r0="revfix"]');
+    revInput.checked = this.honorRevisions;
+    revInput.addEventListener('change', () => {
+      this.honorRevisions = revInput.checked;
+      this.persist();
+      this.note(this.honorRevisions
+        ? 'Downward revisions will be cleaned (running-min envelope) before fitting.'
+        : 'Fitting the raw series — downward revisions left as-is.');
     });
 
     const kInput = q<HTMLInputElement>('[data-r0="k"]');
@@ -498,18 +646,32 @@ export class R0Modal {
     }
   }
 
+  /** The dataset the loss actually sees: finite points, day-shifted by the
+   *  index-case offset, and — when downward revisions exist and the toggle is
+   *  on — cleaned to the right-to-left running-min envelope. `raw` carries the
+   *  pre-cleaning (shifted) points for the preview overlay, or null when
+   *  cleaning is off / a no-op. Shared by run() and the history grouping. */
+  private effectiveObserved(): { observed: ObservedPoint[]; raw: ObservedPoint[] | null } {
+    const off = this.indexOffset || 0;
+    const shifted = this.observed
+      .filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value))
+      .map((p) => (off ? { ...p, day: p.day + off } : { ...p }));
+    if (this.honorRevisions && hasDownwardRevisions(shifted)) {
+      return { observed: revisionEnvelope(shifted), raw: shifted };
+    }
+    return { observed: shifted, raw: null };
+  }
+
   // ── Run the fit ──
   private async run(): Promise<void> {
     if (this.running || !this.pool) return;
     if (this.observed.length < 2) { this.note('Add at least two observed points.'); return; }
 
-    // Shift every observed day later in model time by the index-case offset, so the
-    // simulated outbreak (which starts at model day 0) gets a head start before the
-    // first reported case — correcting for early under-detection.
-    const off = this.indexOffset || 0;
-    const observed = this.observed
-      .filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value))
-      .map((p) => (off ? { ...p, day: p.day + off } : p));
+    // The effective dataset: day-shifted by the index-case offset and, when the
+    // data carries downward revisions (and the toggle is on), cleaned to the
+    // running-min envelope. `raw` keeps the pre-cleaning points for the greyed
+    // chart overlay; null when cleaning changed nothing.
+    const { observed, raw } = this.effectiveObserved();
     // Curve timing (incubation, infectious) is what fits the rise + peak shape; if
     // the data clearly spans a peak/plateau and the user hasn't enabled those genes,
     // add them so R² isn't capped by attack-rate + range alone.
@@ -523,13 +685,32 @@ export class R0Modal {
     const bar = this.el!.querySelector<HTMLElement>('[data-r0="progress-fill"]')!;
     bar.style.width = '0%';
 
-    this.renderLive(observed); // persistent chart + provisional metrics, updated live
+    this.lastRaw = raw;
+    this.renderLive(observed, raw); // persistent chart + provisional metrics, updated live
     if (expanded) this.note('Timing params added (your data spans the peak) — fitting…');
 
+    // Size the fit grid so one cell (population/size²) never exceeds the smallest
+    // positive observed value — otherwise the model's day-0 index case alone
+    // dwarfs the data and every curve is a giant staircase the loss can't fix.
     const base = this.fitBaseConfig();
-    if (this.events.getConfig().size > FIT_GRID_CAP) {
-      this.note(`Fitting on a ${FIT_GRID_CAP}×${FIT_GRID_CAP} grid for speed — on a larger grid the outbreak spreads farther per capita, so deaths may not reproduce exactly. Reduce the grid size for a faithful fit.`);
+    const liveSize = this.events.getConfig().size;
+    const positives = observed.map((p) => p.value).filter((v) => v > 0);
+    const minObs = positives.length ? Math.min(...positives) : Number.NaN;
+    base.size = resolutionFitSize(liveSize, this.population, minObs, FIT_GRID_CAP);
+    const cellPeople = this.population / (base.size * base.size);
+
+    const warnings: string[] = [];
+    if (raw) warnings.push('downward revisions detected — fitting the cleaned (running-min) series; raw points shown greyed');
+    if (base.size > liveSize) {
+      warnings.push(`fit ran at ${base.size}×${base.size} for resolution — enlarge the live grid before Apply to reproduce`);
     }
+    if (liveSize > FIT_GRID_CAP) {
+      warnings.push(`fitting on a ${FIT_GRID_CAP}×${FIT_GRID_CAP} grid for speed — on a larger grid the outbreak spreads farther per capita, so deaths may not reproduce exactly`);
+    }
+    if (Number.isFinite(minObs) && cellPeople > minObs) {
+      warnings.push(`one grid cell = ${fmtNum(cellPeople)} people — larger than your smallest data point (${fmtNum(minObs)}); raise grid size or lower Population`);
+    }
+    if (warnings.length) this.note(`⚠ ${warnings.join(' · ')}`);
     try {
       const result = await runFit({
         observed,
@@ -557,8 +738,19 @@ export class R0Modal {
         // the live sim shows after Apply. Recompute it on the user's real grid.
         this.note('Refining R₀ for your grid…');
         this.result = await this.reconcileR0(result);
+        // Record the fit in the history, keyed by the effective dataset it ran
+        // against, so the table only ranks like-for-like.
+        this.history.unshift({
+          t: Date.now(),
+          hash: datasetHash(observed, this.population),
+          presetId: this.presetId,
+          result: this.result,
+        });
+        if (this.history.length > HISTORY_CAP) this.history.length = HISTORY_CAP;
+        this.persist();
         this.renderOutput();
-        this.note('Fit complete.');
+        this.renderHistory();
+        this.note(warnings.length ? `Fit complete. ⚠ ${warnings.join(' · ')}` : 'Fit complete.');
       }
     } catch (err) {
       this.note(`Fit failed: ${(err as Error).message}`);
@@ -632,6 +824,9 @@ export class R0Modal {
     cfg.mutate = false;
     // Fit at the live grid size (capped for performance) so the fitted curve reproduces
     // in the live sim — the spatial wave makes per-capita dynamics size-dependent.
+    // run() may RAISE this above the live size for data resolution (one cell =
+    // population/size² people must not exceed the smallest observed value) — see
+    // resolutionFitSize; it warns that Apply then needs a larger live grid.
     cfg.size = Math.min(cfg.size, FIT_GRID_CAP);
     // Single index case (patient-zero only) — the most realistic outbreak start, and
     // the seeding the live sim uses by default. Anything else would shift the curve.
@@ -752,7 +947,7 @@ export class R0Modal {
 
   /** Provisional output shown while a fit runs: a live chart plus best-so-far R₀
    *  and loss readouts that the rAF-throttled onImprove updates as it converges. */
-  private renderLive(observed: ObservedPoint[]): void {
+  private renderLive(observed: ObservedPoint[], raw: ObservedPoint[] | null = null): void {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="output"]')!;
     const applyBtn = this.el!.querySelector<HTMLButtonElement>('[data-r0="apply"]')!;
     applyBtn.disabled = true;
@@ -773,7 +968,7 @@ export class R0Modal {
       </div>
       <div class="r0-chart" data-r0="chart"></div>
     `;
-    this.createChart(observed, days, this.population);
+    this.createChart(observed, days, this.population, raw);
   }
 
   private renderOutput(): void {
@@ -820,15 +1015,89 @@ export class R0Modal {
       </div>
       <div class="r0-chart" data-r0="chart"></div>
     `;
-    this.createChart(r.observed, r.days, r.population);
+    this.createChart(r.observed, r.days, r.population, this.lastRaw);
     this.updateChartData(r.simulated);
+  }
+
+  // ── Fit history ──
+  // Past fits, grouped by the effective dataset they ran against (hash of the
+  // shifted/cleaned points + population) so ranking is only ever like-for-like,
+  // best-to-worst by R² (ties → lower loss). Load restores the stored result
+  // into the panel; Apply pushes its config straight into the simulation.
+  private renderHistory(): void {
+    const host = this.el?.querySelector<HTMLElement>('[data-r0="history"]');
+    const count = this.el?.querySelector<HTMLElement>('[data-r0="history-count"]');
+    if (!host) return;
+    if (count) count.textContent = `${this.history.length} fit${this.history.length === 1 ? '' : 's'}`;
+    host.innerHTML = '';
+    if (this.history.length === 0) {
+      host.innerHTML = '<p class="r0-history-empty">No fits yet — completed fits appear here, ranked per dataset.</p>';
+      return;
+    }
+
+    const groups = new Map<string, FitHistoryEntry[]>();
+    for (const e of this.history) {
+      const g = groups.get(e.hash);
+      if (g) g.push(e); else groups.set(e.hash, [e]);
+    }
+    const currentHash = this.observed.length
+      ? datasetHash(this.effectiveObserved().observed, this.population)
+      : '';
+    const ordered = [...groups.entries()].sort((a, b) => {
+      if (a[0] === currentHash) return -1;
+      if (b[0] === currentHash) return 1;
+      return Math.max(...b[1].map((e) => e.t)) - Math.max(...a[1].map((e) => e.t));
+    });
+
+    const presetLabel = (id: string): string =>
+      id === 'synthetic' ? 'Synthetic demo' : HISTORICAL_PRESETS.find((p) => p.id === id)?.label ?? 'Custom data';
+
+    for (const [hash, entries] of ordered) {
+      entries.sort((a, b) => (b.result.gof.r2 - a.result.gof.r2) || (a.result.loss - b.result.loss));
+      const title = document.createElement('div');
+      title.className = 'r0-history-group';
+      title.textContent = `${presetLabel(entries[0].presetId)}${hash === currentHash ? ' — current data' : ''}`;
+      host.appendChild(title);
+      entries.forEach((e, rank) => {
+        const row = document.createElement('div');
+        row.className = 'r0-history-row';
+        const when = new Date(e.t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        const params = e.result.params.map((p) => `${p.label} ${fmtParam(p.name, p.value)}`).join(' · ');
+        row.innerHTML = `
+          <span class="r0-history-rank">#${rank + 1}</span>
+          <span class="r0-history-when">${when}</span>
+          <span>R₀ ${e.result.r0 == null ? '—' : e.result.r0.toFixed(2)}</span>
+          <span>R² ${e.result.gof.r2.toFixed(3)}</span>
+          <span class="r0-muted">loss ${fmtLoss(e.result.loss)}</span>
+          <span class="r0-history-params r0-muted" title="${params}">${params}</span>
+          <button class="btn ghost" type="button" data-act="load">Load</button>
+          <button class="btn ghost" type="button" data-act="apply">Apply</button>
+        `;
+        row.querySelector<HTMLButtonElement>('[data-act="load"]')!.addEventListener('click', () => {
+          this.result = e.result;
+          this.lastRaw = null; // stored results carry only the cleaned points
+          this.renderOutput();
+          this.note('Loaded fit from history.');
+        });
+        row.querySelector<HTMLButtonElement>('[data-act="apply"]')!.addEventListener('click', () => {
+          this.events.onApply(e.result.config);
+          this.close();
+        });
+        host.appendChild(row);
+      });
+    }
   }
 
   /** Build the uPlot overlay once (observed dots + an empty sim line per
    *  category present in the data). `updateChartData` then streams sim curves in
    *  via setData — far cheaper than destroy/recreate, and the basis for the live
    *  update during a fit. */
-  private createChart(observed: ObservedPoint[], days: number, population: number): void {
+  private createChart(
+    observed: ObservedPoint[],
+    days: number,
+    population: number,
+    raw: ObservedPoint[] | null = null,
+  ): void {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="chart"]')!;
     this.plot?.destroy();
     this.plot = null;
@@ -836,6 +1105,28 @@ export class R0Modal {
     this.liveDays = days;
     this.livePop = population;
     this.liveCats = FIT_CATEGORIES.filter((c) => observed.some((p) => p.category === c));
+
+    // Greyed overlay of raw points superseded by the revision cleaning: one extra
+    // dots-only column per category that has any point differing from the cleaned
+    // value at the same day. Columns are cached so updateChartData can rebuild
+    // the exact same data shape on every live frame.
+    this.liveRawCols = this.liveCats.map(() => null);
+    if (raw) {
+      const cleaned = new Map<string, number>();
+      for (const pt of observed) cleaned.set(`${pt.category}:${Math.round(pt.day)}`, pt.value);
+      this.liveCats.forEach((cat, ci) => {
+        let col: (number | null)[] | null = null;
+        for (const pt of raw) {
+          if (pt.category !== cat) continue;
+          const d = Math.round(pt.day);
+          if (d < 0 || d > days) continue;
+          if (cleaned.get(`${cat}:${d}`) === pt.value) continue; // not revised
+          if (!col) col = Array.from({ length: days + 1 }, () => null);
+          col[d] = pt.value;
+        }
+        this.liveRawCols[ci] = col;
+      });
+    }
 
     // Legend readout: the model curves carry fractional means (fraction × pop), so
     // format them as compact counts instead of dumping a long-decimal float.
@@ -845,7 +1136,7 @@ export class R0Modal {
     const xs = this.chartXs(days);
     const data: (number | null)[][] = [xs];
     const series: uPlot.Series[] = [{}];
-    for (const cat of this.liveCats) {
+    this.liveCats.forEach((cat, ci) => {
       const sim: (number | null)[] = xs.map(() => null);
       const obs: (number | null)[] = xs.map(() => null);
       for (const pt of observed) {
@@ -864,7 +1155,18 @@ export class R0Modal {
           value: legendVal,
         },
       );
-    }
+      const rawCol = this.liveRawCols[ci];
+      if (rawCol) {
+        data.push(rawCol);
+        series.push({
+          label: `${CAT_SHORT[cat]} · raw`,
+          stroke: RAW_INK,
+          paths: () => null, // dots only — superseded values, greyed
+          points: { show: true, size: 6, stroke: RAW_INK, fill: 'transparent' },
+          value: legendVal,
+        });
+      }
+    });
 
     // uPlot draws axis ticks, labels and grid on canvas, so they ignore CSS — feed
     // them the theme colors explicitly or they render in uPlot's default near-black,
@@ -902,12 +1204,14 @@ export class R0Modal {
     );
   }
 
-  /** Push fresh simulated curves into the existing plot (observed dots unchanged). */
+  /** Push fresh simulated curves into the existing plot (observed dots unchanged).
+   *  Must rebuild the exact column shape createChart declared — including the
+   *  greyed raw-overlay columns for categories that have them. */
   private updateChartData(curves: SimCurves): void {
     if (!this.plot) return;
     const xs = this.chartXs(this.liveDays);
     const data: (number | null)[][] = [xs];
-    for (const cat of this.liveCats) {
+    this.liveCats.forEach((cat, ci) => {
       const arr = curves[cat] ?? [];
       const sim = xs.map((d) => (arr[Math.min(d, arr.length - 1)] ?? 0) * this.livePop);
       const obs: (number | null)[] = xs.map(() => null);
@@ -917,7 +1221,9 @@ export class R0Modal {
         if (d >= 0 && d <= this.liveDays) obs[d] = pt.value;
       }
       data.push(sim, obs);
-    }
+      const rawCol = this.liveRawCols[ci];
+      if (rawCol) data.push(rawCol);
+    });
     this.plot.setData(data as uPlot.AlignedData);
   }
 
@@ -966,6 +1272,7 @@ function gofRating(r2: number): { label: string; cls: string } {
 
 // Static markup; dynamic regions are filled by render*() via [data-r0] hooks.
 const TEMPLATE = `
+  <div class="r0-banner" data-r0="banner" hidden></div>
   <header class="r0-head">
     <div class="r0-titles">
       <h2 id="r0-title">R₀ Estimator</h2>
@@ -997,6 +1304,9 @@ const TEMPLATE = `
       </label>
       <button class="btn ghost" type="button" data-r0="add-row">+ Add row</button>
       <button class="btn ghost" type="button" data-r0="clear">Clear</button>
+      <label class="r0-check" title="Cumulative counts revised DOWN later (duplicates removed) are impossible for true cumulative data. When on, the fit uses the running-min envelope — each value clipped to the minimum of all later values — and the chart greys the superseded raw points. No-op on clean data.">
+        <input type="checkbox" data-r0="revfix" /> honor downward revisions
+      </label>
     </div>
     <details class="r0-details r0-data-details" data-r0="data-details">
       <summary>Data table · <span class="r0-muted" data-r0="row-count"></span></summary>
@@ -1065,5 +1375,9 @@ const TEMPLATE = `
     <div class="r0-actions">
       <button class="btn primary" type="button" data-r0="apply" disabled>Apply to simulation</button>
     </div>
+    <details class="r0-details">
+      <summary>Fit history · <span class="r0-muted" data-r0="history-count"></span></summary>
+      <div data-r0="history"></div>
+    </details>
   </section>
 `;
