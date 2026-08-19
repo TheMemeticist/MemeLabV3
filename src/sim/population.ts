@@ -41,6 +41,9 @@ export interface SeedOptions {
   vaccineUptake: number;
   lockdownCompliance: number;
   patientZero: boolean;
+  /** Cell index for patient zero. Defaults to the grid center. Draws no
+   *  randomness, so overriding it cannot perturb the PRNG trajectory. */
+  indexCell?: number;
 }
 
 export function seed(buf: PopulationBuffers, rng: Rng, opts: SeedOptions): void {
@@ -69,9 +72,12 @@ export function seed(buf: PopulationBuffers, rng: Rng, opts: SeedOptions): void 
   }
   if (opts.patientZero) {
     const center = ((buf.size >> 1) * buf.size) + (buf.size >> 1);
-    state[center] = CellState.Exposed;
-    infectedAge[center] = 0;
-    strainId[center] = 0;
+    const cell = opts.indexCell != null && opts.indexCell >= 0 && opts.indexCell < n
+      ? opts.indexCell
+      : center;
+    state[cell] = CellState.Exposed;
+    infectedAge[cell] = 0;
+    strainId[cell] = 0;
   }
   buf.next.set(state);
 }

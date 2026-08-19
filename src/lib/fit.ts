@@ -60,6 +60,8 @@ export type SimCurves = Record<FitCategory, number[]>;
 export interface SimResult {
   curves: SimCurves;
   rNaught: number | null;
+  /** Per-trial curves — present only for ensemble (fan-chart) simulations. */
+  perTrial?: SimCurves[];
 }
 
 export type LossType = 'poisson' | 'mse';
@@ -576,12 +578,16 @@ export interface FitOptions {
   gaTournament?: number;
 }
 
-/** Best-so-far snapshot streamed during a fit so the UI can animate convergence. */
+/** Best-so-far snapshot streamed during a fit so the UI can animate convergence.
+ *  `provisional` marks snapshots from low-fidelity (K < Kfull) screening rungs /
+ *  early GA generations: they animate the search in real time but their losses
+ *  are noisier and not comparable to full-fidelity ones. */
 export interface FitProgress {
   values: number[];
   curves: SimCurves;
   loss: number;
   r0: number | null;
+  provisional: boolean;
 }
 
 export interface FitRequest extends FitOptions {
@@ -641,21 +647,41 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     return { loss: lossOf(req.observed, result.curves, req.population, req.loss), r0: result.rNaught, result };
   };
 
-  // Stream the best-so-far to the UI — but only from full-fidelity (Kfull) evals,
-  // so the live overlay compares like-for-like. Losses from the low-trial racing
-  // rungs are noisier and not comparable across rungs, so feeding them in would
-  // let a lucky low-K candidate pin `bestLoss` and freeze the overlay.
+  // Stream the best-so-far to the UI. Full-fidelity (Kfull) improvements gate
+  // `bestLoss` and are the authoritative overlay — losses from low-trial racing
+  // rungs are noisier and not comparable across rungs, so feeding them into the
+  // same gate would let a lucky low-K candidate pin it and freeze the overlay.
+  // Low-fidelity evals stream too (marked `provisional`, gated per-K) so the
+  // chart animates from the very first generation instead of sitting static
+  // until the first full-fidelity eval. Display only — the returned result is
+  // untouched.
   let bestLoss = Number.POSITIVE_INFINITY;
   const reportIfBetter = (loss: number, values: number[], result: SimResult, r0: number | null): void => {
     if (!req.onImprove || !Number.isFinite(loss) || loss >= bestLoss) return;
     bestLoss = loss;
-    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0 });
+    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0, provisional: false });
+  };
+
+  // Provisional (low-K) best, tracked per trial count: comparisons are only
+  // valid between losses computed at the same K.
+  let provisionalK = -1;
+  let provisionalLoss = Number.POSITIVE_INFINITY;
+  const reportProvisional = (K: number, loss: number, values: number[], result: SimResult, r0: number | null): void => {
+    if (!req.onImprove || !Number.isFinite(loss)) return;
+    if (K !== provisionalK) { provisionalK = K; provisionalLoss = Number.POSITIVE_INFINITY; }
+    if (loss >= provisionalLoss) return;
+    provisionalLoss = loss;
+    // Once a full-fidelity best exists, stop streaming noisier low-K frames
+    // over it — the authoritative overlay has taken over.
+    if (bestLoss < Number.POSITIVE_INFINITY) return;
+    req.onImprove({ values: values.slice(), curves: result.curves, loss, r0, provisional: true });
   };
 
   const evaluate = async (values: number[], K: number): Promise<number> => {
     if (req.signal?.aborted) return Number.POSITIVE_INFINITY;
     const { loss, r0, result } = await evalAt(values, K);
     if (K >= req.K) reportIfBetter(loss, values, result, r0);
+    else reportProvisional(K, loss, values, result, r0);
     return loss;
   };
 
@@ -883,6 +909,127 @@ export function revisionEnvelope(points: ObservedPoint[]): ObservedPoint[] {
 export function hasDownwardRevisions(points: ObservedPoint[]): boolean {
   const cleaned = revisionEnvelope(points);
   return points.some((p, i) => p.value !== cleaned[i].value);
+}
+
+// ─── Percentile bands (fan chart) ────────────────────────────────────────────
+// Aggregate an ensemble of per-trial curves into per-day percentile prediction
+// intervals — the standard ensemble method. Honest caveat (surface in the UI):
+// trials are deterministic seeded realizations differing by stochastic path and
+// index-case location, so the bands quantify that spread — they are NOT a
+// Bayesian posterior over parameters.
+
+/** Linear-interpolated quantile of a SORTED ascending array, p in [0, 100]. */
+export function quantileSorted(sorted: number[], p: number): number {
+  const n = sorted.length;
+  if (n === 0) return Number.NaN;
+  if (n === 1) return sorted[0];
+  const idx = (clamp(p, 0, 100) / 100) * (n - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  const frac = idx - lo;
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * frac;
+}
+
+/** Per-day percentile curves for each category: result[cat][i] is the curve of
+ *  the i-th requested percentile (same length as the trials' curves). */
+export function percentileBands(
+  perTrial: SimCurves[],
+  probs: number[],
+): Record<FitCategory, number[][]> {
+  const out = {} as Record<FitCategory, number[][]>;
+  for (const cat of FIT_CATEGORIES) {
+    const len = perTrial[0]?.[cat]?.length ?? 0;
+    const rows = probs.map(() => new Array<number>(len));
+    const vals = new Array<number>(perTrial.length);
+    for (let d = 0; d < len; d++) {
+      for (let t = 0; t < perTrial.length; t++) vals[t] = perTrial[t][cat][d] ?? 0;
+      vals.sort((a, b) => a - b);
+      probs.forEach((p, pi) => { rows[pi][d] = quantileSorted(vals, p); });
+    }
+    out[cat] = rows;
+  }
+  return out;
+}
+
+// ─── Case/death keyframe multipliers + vintaged accumulation ────────────────
+// Reported counts are a FLOOR on the true burden; early in an outbreak the
+// under-ascertainment multiplier is largest and decays as surveillance ramps
+// up. The multiplier is a piecewise-linear function of the report day defined
+// by keyframes (clamped to the first/last keyframe outside their range — the
+// pseudocode's min(max(w,0),T)/T ramp is exactly two keyframes). Crucially the
+// multiplier applies to INCREMENTS at their report date ("vintaged"
+// accumulation), not to the cumulative total:
+//
+//   upper(t_i)   = Σ_{j≤i} Δreported(t_j) · m(t_j)
+//   central(t_i) = (reported(t_i) + upper(t_i)) / 2
+//
+// The initial stock at the first observation uses m evaluated at the midpoint
+// of [t0, t_first] (those cases accrued over that whole window). Only the
+// cumulative categories are adjusted; active_infections passes through.
+
+export interface Keyframe {
+  day: number;
+  m: number;
+}
+
+/** Piecewise-linear multiplier at `day`, clamped to the end keyframes. */
+export function multiplierAt(frames: Keyframe[], day: number): number {
+  if (frames.length === 0) return 1;
+  const f = frames.slice().sort((a, b) => a.day - b.day);
+  if (day <= f[0].day) return f[0].m;
+  if (day >= f[f.length - 1].day) return f[f.length - 1].m;
+  for (let i = 1; i < f.length; i++) {
+    if (day <= f[i].day) {
+      const span = f[i].day - f[i - 1].day;
+      const t = span > 0 ? (day - f[i - 1].day) / span : 1;
+      return f[i - 1].m + (f[i].m - f[i - 1].m) * t;
+    }
+  }
+  return f[f.length - 1].m;
+}
+
+export interface AdjustedSeries {
+  /** Points with cumulative values replaced by the vintaged upper bound. */
+  upper: ObservedPoint[];
+  /** Points with cumulative values replaced by (reported + upper) / 2. */
+  central: ObservedPoint[];
+}
+
+/** Vintaged upper bound + central estimate over the observed points.
+ *  `frames` maps each cumulative category to its keyframes (missing category →
+ *  passthrough); `t0` is the date of the first confirmed case (for the
+ *  initial-stock midpoint rule). Assumes cumulative series are monotone — run
+ *  `revisionEnvelope` first if the data carries downward revisions. */
+export function vintagedAdjust(
+  points: ObservedPoint[],
+  frames: Partial<Record<FitCategory, Keyframe[]>>,
+  t0: number,
+): AdjustedSeries {
+  const upper = points.map((p) => ({ ...p }));
+  const central = points.map((p) => ({ ...p }));
+  for (const cat of CUMULATIVE_CATS) {
+    const f = frames[cat];
+    if (!f || f.length === 0) continue;
+    const idx = points
+      .map((p, i) => ({ p, i }))
+      .filter(({ p }) => p.category === cat)
+      .sort((a, b) => a.p.day - b.p.day);
+    if (idx.length === 0) continue;
+    let acc = 0;
+    let prevReported = 0;
+    for (let k = 0; k < idx.length; k++) {
+      const { p, i } = idx[k];
+      const delta = k === 0 ? p.value : p.value - prevReported;
+      // Initial stock accrued over [t0, t_first] → multiplier at the midpoint;
+      // later increments are vintaged at their own report day.
+      const mDay = k === 0 ? (t0 + p.day) / 2 : p.day;
+      acc += delta * multiplierAt(f, mDay);
+      prevReported = p.value;
+      upper[i].value = acc;
+      central[i].value = (p.value + acc) / 2;
+    }
+  }
+  return { upper, central };
 }
 
 // ─── Fit-grid resolution ─────────────────────────────────────────────────────

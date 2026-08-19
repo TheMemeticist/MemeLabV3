@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Engine } from '../src/sim';
 import type { SimConfig, StrainGenes } from '../src/types';
-import { runTrials } from '../src/lib/fit-sim';
+import { runTrialEnsemble, runTrials } from '../src/lib/fit-sim';
 import {
   FIT_PARAMS,
   analyticR0,
@@ -11,10 +11,14 @@ import {
   mse,
   optimize,
   parseObservedCSV,
+  multiplierAt,
+  percentileBands,
   poissonNLL,
+  quantileSorted,
   resolutionFitSize,
   revisionEnvelope,
   runFit,
+  vintagedAdjust,
 } from '../src/lib/fit';
 import type { ObservedPoint, SimCurves, SimResult } from '../src/lib/fit';
 
@@ -417,5 +421,91 @@ describe('revised-cumulative envelope + fit-grid resolution', () => {
     // Degenerate inputs fall back to the live size (min 8).
     expect(resolutionFitSize(40, 1_000_000, Number.NaN, 128)).toBe(40);
     expect(resolutionFitSize(2, 0, 0, 128)).toBe(8);
+  });
+});
+
+describe('percentile bands (fan chart)', () => {
+  it('quantileSorted interpolates linearly and handles edges', () => {
+    expect(quantileSorted([10], 50)).toBe(10);
+    expect(quantileSorted([0, 10], 50)).toBe(5);
+    expect(quantileSorted([0, 10, 20, 30, 40], 25)).toBe(10);
+    expect(quantileSorted([0, 10, 20, 30, 40], 37.5)).toBe(15);
+    expect(quantileSorted([0, 10, 20, 30, 40], 0)).toBe(0);
+    expect(quantileSorted([0, 10, 20, 30, 40], 100)).toBe(40);
+  });
+
+  it('percentileBands aggregates per day and per category', () => {
+    const trial = (a: number, b: number): SimCurves => ({
+      cumulative_infections: [a, b],
+      cumulative_deaths: [0, a],
+      active_infections: [a, 0],
+    });
+    const bands = percentileBands([trial(0, 0), trial(10, 20), trial(20, 40)], [50, 100]);
+    expect(bands.cumulative_infections[0]).toEqual([10, 20]); // day-wise medians
+    expect(bands.cumulative_infections[1]).toEqual([20, 40]); // day-wise maxima
+    expect(bands.cumulative_deaths[0]).toEqual([0, 10]);
+  });
+
+  it('ensemble: deterministic, N=1 equals the plain trial-0 curve, index cases differ', () => {
+    const cfg = baseConfig({ size: 24, strain: { ...baseConfig().strain, attackRate: 0.25, ifr: 0.2 } });
+    const a = runTrialEnsemble(cfg, 30, 4, cfg.seed);
+    const b = runTrialEnsemble(cfg, 30, 4, cfg.seed);
+    expect(a).toEqual(b); // same seed + N → identical bands input
+    // N=1 → exactly the deterministic single trial (default center index case),
+    // which is also runTrials' trial 0: the K=1 mean IS trial 0.
+    const single = runTrialEnsemble(cfg, 30, 1, cfg.seed);
+    expect(single.perTrial).toHaveLength(1);
+    expect(single.perTrial[0]).toEqual(runTrials(cfg, 30, 1, cfg.seed).curves);
+    // Different index cases genuinely vary the trajectories.
+    const t1 = a.perTrial[1].cumulative_infections;
+    const t2 = a.perTrial[2].cumulative_infections;
+    expect(t1).not.toEqual(t2);
+  });
+});
+
+describe('keyframe multipliers + vintaged accumulation', () => {
+  const frames = [{ day: 0, m: 5.0 }, { day: 42, m: 3.8 }]; // the pseudocode ramp
+
+  it('multiplierAt: linear between keyframes, clamped outside (incl. before t0 / after data)', () => {
+    expect(multiplierAt(frames, -30)).toBe(5.0); // before t0 → clamp to m0
+    expect(multiplierAt(frames, 0)).toBe(5.0);
+    expect(multiplierAt(frames, 7)).toBeCloseTo(4.8, 12); // 1 week into the 6-week ramp
+    expect(multiplierAt(frames, 21)).toBeCloseTo(4.4, 12); // halfway
+    expect(multiplierAt(frames, 42)).toBeCloseTo(3.8, 12);
+    expect(multiplierAt(frames, 500)).toBeCloseTo(3.8, 12); // far past the data → clamp to m6
+    // Multi-keyframe interpolation works too.
+    const multi = [{ day: 0, m: 4 }, { day: 10, m: 2 }, { day: 20, m: 1 }];
+    expect(multiplierAt(multi, 5)).toBe(3);
+    expect(multiplierAt(multi, 15)).toBe(1.5);
+  });
+
+  it('vintaged accumulation applies multipliers to INCREMENTS at their report date', () => {
+    // Hand-checked: upper(0)=100·5=500; Δ(7)=100 at m(7)=4.8 → upper(7)=980;
+    // Δ(50)=60 at clamped m=3.8 → upper(50)=1208. central(7)=(200+980)/2=590.
+    const pts = (pairs: [number, number][]): ObservedPoint[] =>
+      pairs.map(([day, value]) => ({ day, value, category: 'cumulative_infections' as const }));
+    const observed = pts([[0, 100], [7, 200], [50, 260]]);
+    const { upper, central } = vintagedAdjust(observed, { cumulative_infections: frames }, 0);
+    expect(upper.map((p) => p.value)).toEqual([500, 980, 1208]);
+    expect(central.map((p) => p.value)).toEqual([300, 590, 734]);
+    // floor ≤ central ≤ upper at every point (multipliers ≥ 1).
+    observed.forEach((p, i) => {
+      expect(central[i].value).toBeGreaterThanOrEqual(p.value);
+      expect(upper[i].value).toBeGreaterThanOrEqual(central[i].value);
+    });
+    // NOT the naive cumulative×multiplier: 200·4.8=960 ≠ 980 — vintaging matters.
+    expect(upper[1].value).not.toBe(200 * 4.8);
+  });
+
+  it('initial stock uses the multiplier at the midpoint of [t0, t_first]', () => {
+    const pts: ObservedPoint[] = [{ day: 21, value: 100, category: 'cumulative_infections' }];
+    // t0 = 0, first obs day 21 → midpoint 10.5 → m = 5 + (3.8-5)·(10.5/42) = 4.7
+    const { upper } = vintagedAdjust(pts, { cumulative_infections: frames }, 0);
+    expect(upper[0].value).toBeCloseTo(470, 9);
+    // Categories without frames pass through untouched.
+    const death: ObservedPoint[] = [{ day: 21, value: 50, category: 'cumulative_deaths' }];
+    const out = vintagedAdjust(death, { cumulative_infections: frames }, 0);
+    expect(out.upper[0].value).toBe(50);
+    expect(out.central[0].value).toBe(50);
   });
 });

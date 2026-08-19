@@ -5,13 +5,20 @@
 // fully isolated from the live `sim.worker.ts` engine — separate instances,
 // separate RNG, no shared state — so it cannot perturb a running simulation.
 
-import { runTrials } from '../lib/fit-sim';
+import { runTrialEnsemble, runTrials } from '../lib/fit-sim';
 import type { FitWorkerCommand, FitWorkerResult } from '../types';
 
 declare const self: DedicatedWorkerGlobalScope;
 
 self.onmessage = (ev: MessageEvent<FitWorkerCommand>) => {
-  const { id, config, days, K, seed } = ev.data;
+  const { id, config, days, K, seed, ensemble } = ev.data;
+  if (ensemble) {
+    // Fan-chart pass: per-trial curves, each trial from a different index case.
+    const { perTrial, rNaught } = runTrialEnsemble(config, days, K, seed);
+    const result: FitWorkerResult = { id, curves: perTrial[0], rNaught, perTrial };
+    self.postMessage(result);
+    return;
+  }
   const { curves, rNaught } = runTrials(config, days, K, seed);
   const result: FitWorkerResult = { id, curves, rNaught };
   self.postMessage(result);

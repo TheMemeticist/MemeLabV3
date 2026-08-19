@@ -113,3 +113,78 @@ export function runTrials(config: SimConfig, days: number, K: number, seed: numb
   };
   return { curves, rNaught };
 }
+
+/** Run N stochastic trials of `config`, each starting from a DIFFERENT index
+ *  case, and return the per-trial per-capita curves (for percentile/fan-chart
+ *  aggregation) instead of the mean.
+ *
+ *  Trial 0 keeps the default center patient zero, so an N=1 ensemble is exactly
+ *  the deterministic single-trial curve. Trials k > 0 place patient zero at a
+ *  cell drawn deterministically from the trial seed (a separate Rng — the
+ *  engine's own PRNG trajectory is untouched), which both samples index-case
+ *  location spread and desynchronizes the incubation generation waves.
+ *  Deterministic: a pure function of (config, days, N, seed). */
+export function runTrialEnsemble(
+  config: SimConfig,
+  days: number,
+  N: number,
+  seed: number,
+): { perTrial: SimCurves[]; rNaught: number | null } {
+  const cells = config.size * config.size;
+  const len = days + 1;
+  const topo = topologyFor(config, seed);
+  const canReseed = config.reseedOnExtinction === true;
+  let rNaught: number | null = null;
+  const perTrial: SimCurves[] = [];
+
+  for (let k = 0; k < N; k++) {
+    const trialSeed = (seed ^ ((k * SEED_STRIDE) >>> 0)) >>> 0;
+    // k = 0 → default center index case (matches runTrials trial 0 exactly);
+    // k > 0 → a deterministic per-trial cell from a dedicated Rng.
+    const indexCell = k === 0
+      ? undefined
+      : new Rng((trialSeed ^ 0x1dcae511) >>> 0).intRange(cells);
+    const engine: Engine = new Engine(
+      { ...config, seed: trialSeed },
+      topo,
+      k === 0 ? { indexCell } : { rNaught, indexCell },
+    );
+    if (k === 0) rNaught = engine.rNaught;
+
+    const inf = new Float64Array(len);
+    const death = new Float64Array(len);
+    const active = new Float64Array(len);
+    const { state } = engine.buffers();
+    let cumInf = 0;
+    let act = 0;
+    for (let i = 0; i < state.length; i++) {
+      const s = state[i];
+      if (s === CellState.Exposed) cumInf++;
+      else if (s === CellState.Infectious) { cumInf++; act++; }
+    }
+    let cumDeath = 0;
+    inf[0] = cumInf;
+    active[0] = act;
+
+    for (let d = 1; d <= days; d++) {
+      const stats = engine.step();
+      cumInf += stats.newInfections;
+      cumDeath += stats.newDeaths;
+      inf[d] = cumInf;
+      death[d] = cumDeath;
+      active[d] = stats.i;
+      if (!canReseed && stats.e + stats.i === 0) {
+        for (let f = d + 1; f <= days; f++) { inf[f] = cumInf; death[f] = cumDeath; }
+        break;
+      }
+    }
+
+    const inv = 1 / cells;
+    perTrial.push({
+      cumulative_infections: Array.from(inf, (v) => v * inv),
+      cumulative_deaths: Array.from(death, (v) => v * inv),
+      active_infections: Array.from(active, (v) => v * inv),
+    });
+  }
+  return { perTrial, rNaught };
+}

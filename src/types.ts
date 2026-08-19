@@ -315,6 +315,10 @@ export interface FitWorkerCommand {
   K: number;
   /** Base seed; trial k uses a decorrelated derivative of it. */
   seed: number;
+  /** When true, run K trials each from a DIFFERENT index case and return the
+   *  per-trial curves (for percentile bands) alongside nothing else — the
+   *  `curves` field then carries trial 0 for convenience. */
+  ensemble?: boolean;
 }
 
 export interface FitWorkerResult {
@@ -328,4 +332,10 @@ export interface FitWorkerResult {
   /** The engine's analytic R₀ for this candidate (any geometry, incl. voronoi).
    *  Null only for degenerate configs (e.g. grid < 8). */
   rNaught: number | null;
+  /** Per-trial curves — present only for ensemble commands. */
+  perTrial?: Array<{
+    cumulative_infections: number[];
+    cumulative_deaths: number[];
+    active_infections: number[];
+  }>;
 }

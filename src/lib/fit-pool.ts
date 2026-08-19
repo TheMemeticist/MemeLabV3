@@ -29,6 +29,7 @@ function toResult(r: FitWorkerResult): SimResult {
       active_infections: r.curves.active_infections,
     },
     rNaught: r.rNaught,
+    perTrial: r.perTrial,
   };
 }
 
@@ -39,6 +40,7 @@ function cacheKey(cmd: FitWorkerCommand): string {
   const g = cmd.config.strain;
   const q = (x: number, p = 1e4) => Math.round(x * p) / p;
   return [
+    cmd.ensemble ? 'E' : 'M', // ensemble and mean results must never collide
     cmd.days,
     cmd.K,
     cmd.seed,
@@ -73,7 +75,16 @@ export class FitPool {
   /** Run K trials of `config` for `days` days; resolves to mean per-capita curves
    *  plus the candidate's analytic R₀. */
   simulate(config: SimConfig, days: number, K: number, seed: number): Promise<SimResult> {
-    const cmd: FitWorkerCommand = { id: this.nextId++, config, days, K, seed };
+    return this.enqueue({ id: this.nextId++, config, days, K, seed });
+  }
+
+  /** Run N trials each from a different index case; resolves with `perTrial`
+   *  populated (for percentile/fan-chart aggregation). */
+  simulateEnsemble(config: SimConfig, days: number, N: number, seed: number): Promise<SimResult> {
+    return this.enqueue({ id: this.nextId++, config, days, K: N, seed, ensemble: true });
+  }
+
+  private enqueue(cmd: FitWorkerCommand): Promise<SimResult> {
     const key = cacheKey(cmd);
     const cached = this.cache.get(key);
     if (cached) return Promise.resolve(cached);

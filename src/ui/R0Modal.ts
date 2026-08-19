@@ -20,9 +20,11 @@ import {
   FIT_PARAMS,
   hasDownwardRevisions,
   parseObservedCSV,
+  percentileBands,
   resolutionFitSize,
   revisionEnvelope,
   runFit,
+  vintagedAdjust,
 } from '../lib/fit';
 import type {
   FitCategory,
@@ -30,6 +32,7 @@ import type {
   FitParamName,
   FitProgress,
   FitResult,
+  Keyframe,
   LossType,
   ObservedPoint,
   SimCurves,
@@ -51,6 +54,11 @@ const CAT_COLOR: Record<FitCategory, string> = {
 
 // Greyed ink for raw points superseded by the revision cleaning.
 const RAW_INK = 'rgba(148, 163, 184, 0.55)';
+
+/** 'rgb(r, g, b)' → 'rgba(r, g, b, a)' for the canvas-painted overlays. */
+function withAlpha(rgb: string, a: number): string {
+  return rgb.replace('rgb(', 'rgba(').replace(')', `, ${a})`);
+}
 
 // Short legend labels — the full CATEGORY_LABELS ("Cumulative infections") make the
 // legend pills overflow and hide the value readout, so the chart uses these instead.
@@ -247,6 +255,26 @@ function datasetHash(points: ObservedPoint[], population: number): string {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
+/** Case/death underreporting adjustment (keyframe multipliers + vintaged
+ *  accumulation). Frames are in raw data-day coordinates; null frames = build
+ *  the pseudocode defaults from the data when first enabled. */
+interface AdjustSettings {
+  enabled: boolean;
+  /** true → the fit targets the adjusted central; false → overlay only. */
+  asTarget: boolean;
+  /** Date of first confirmed case (initial-stock midpoint rule); null = first data day. */
+  t0: number | null;
+  cases: Keyframe[] | null;
+  deaths: Keyframe[] | null;
+}
+const DEFAULT_ADJUST: AdjustSettings = { enabled: false, asTarget: true, t0: null, cases: null, deaths: null };
+// Pseudocode defaults: 6-week linear ramp, cases 5.0 → 3.8, deaths 3.0 → 2.5.
+const RAMP_DAYS = 42;
+const ADJ_DEFAULTS: Record<'cases' | 'deaths', [number, number]> = { cases: [5.0, 3.8], deaths: [3.0, 2.5] };
+
+// Fan-chart percentiles: median + 25% band (37.5–62.5), 50% band (25–75), 90% band (5–95).
+const FAN_PROBS = [5, 25, 37.5, 50, 62.5, 75, 95];
+
 interface R0Snapshot {
   population: number;
   selected: FitParamName[];
@@ -260,6 +288,8 @@ interface R0Snapshot {
   indexOffset?: number;
   honorRevisions?: boolean;
   history?: FitHistoryEntry[];
+  fanTrials?: number;
+  adjust?: AdjustSettings;
 }
 
 export class R0Modal {
@@ -288,12 +318,20 @@ export class R0Modal {
   // data has downward revisions. A no-op on monotone data, so on by default.
   private honorRevisions = true;
   private history: FitHistoryEntry[] = [];
+  // Fan-chart ensemble size: trials of the best-fit config, each from a
+  // different index case, aggregated into percentile bands. 1 = single line.
+  private fanTrials = 30;
+  private adjust: AdjustSettings = { ...DEFAULT_ADJUST };
   private running = false;
   private signal = { aborted: false };
   private skipPersist = false;
   private result: FitResult | null = null;
   // Raw (pre-cleaning) points for the greyed preview overlay of the last fit.
   private lastRaw: ObservedPoint[] | null = null;
+  // Floor/central/upper adjustment series of the last fit (chart overlay).
+  private lastAdjust: { floor: ObservedPoint[]; central: ObservedPoint[]; upper: ObservedPoint[] } | null = null;
+  // Percentile fan of the last fit's best config (transient — not persisted).
+  private lastFan: Record<FitCategory, number[][]> | null = null;
 
   // Live-chart state (set by createChart, read by updateChartData) + an rAF
   // throttle so a burst of optimizer improvements coalesces into one redraw.
@@ -302,6 +340,13 @@ export class R0Modal {
   // Per-category greyed raw-overlay columns (null = category has no revisions);
   // parallel to liveCats, cached so live frames rebuild the same data shape.
   private liveRawCols: ((number | null)[] | null)[] = [];
+  // Fan-chart percentile rows (people-scaled, FAN_PROBS order) per category, and
+  // sparse floor/central/upper vertices for the adjustment envelope — painted by
+  // a custom uPlot draw hook so the chart's data columns / legend stay untouched.
+  private liveFanCols: Partial<Record<FitCategory, number[][]>> | null = null;
+  private liveAdjustPts: Partial<Record<FitCategory, { floor: [number, number][]; central: [number, number][]; upper: [number, number][] }>> | null = null;
+  // Highest overlay value (people) so y-autoscale includes bands above the data.
+  private overlayMax = 0;
   private liveDays = 0;
   private livePop = 0;
   private pendingSnapshot: FitProgress | null = null;
@@ -385,6 +430,8 @@ export class R0Modal {
       indexOffset: this.indexOffset,
       honorRevisions: this.honorRevisions,
       history: this.history,
+      fanTrials: this.fanTrials,
+      adjust: { ...this.adjust },
     });
   }
 
@@ -407,6 +454,8 @@ export class R0Modal {
     if (Number.isFinite(s.indexOffset)) this.indexOffset = Math.max(0, Math.round(s.indexOffset!));
     if (typeof s.honorRevisions === 'boolean') this.honorRevisions = s.honorRevisions;
     if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
+    if (Number.isFinite(s.fanTrials)) this.fanTrials = Math.min(100, Math.max(1, Math.round(s.fanTrials!)));
+    if (s.adjust && typeof s.adjust === 'object') this.adjust = { ...DEFAULT_ADJUST, ...s.adjust };
   }
 
   // ── Restored-session banner + reset ──
@@ -443,7 +492,11 @@ export class R0Modal {
     this.result = null;
     this.honorRevisions = true;
     this.history = [];
+    this.fanTrials = 30;
+    this.adjust = { ...DEFAULT_ADJUST };
     this.lastRaw = null;
+    this.lastAdjust = null;
+    this.lastFan = null;
     // close() persists by default — that would immediately re-save the state we
     // just wiped, so gate it off for this teardown, then reopen after the 200ms
     // exit animation clears the old DOM.
@@ -534,6 +587,45 @@ export class R0Modal {
         ? 'Downward revisions will be cleaned (running-min envelope) before fitting.'
         : 'Fitting the raw series — downward revisions left as-is.');
     });
+
+    // Fan-chart trials (percentile bands around the best fit).
+    const fanInput = q<HTMLInputElement>('[data-r0="fan"]');
+    fanInput.value = String(this.fanTrials);
+    fanInput.addEventListener('change', () => {
+      const v = Number(fanInput.value);
+      this.fanTrials = Number.isFinite(v) ? Math.min(100, Math.max(1, Math.round(v))) : 30;
+      fanInput.value = String(this.fanTrials);
+      this.persist();
+    });
+
+    // Underreporting adjustment controls.
+    const adjEnabled = q<HTMLInputElement>('[data-adj="enabled"]');
+    const adjTarget = q<HTMLInputElement>('[data-adj="astarget"]');
+    const adjT0 = q<HTMLInputElement>('[data-adj="t0"]');
+    adjEnabled.checked = this.adjust.enabled;
+    adjTarget.checked = this.adjust.asTarget;
+    adjT0.value = this.adjust.t0 == null ? '' : String(this.adjust.t0);
+    adjEnabled.addEventListener('change', () => {
+      this.adjust.enabled = adjEnabled.checked;
+      if (this.adjust.enabled && (!this.adjust.cases || !this.adjust.deaths)) {
+        // Materialize the pseudocode defaults so the editor shows real rows.
+        const f = this.adjustFrames();
+        this.adjust.cases = f.cases;
+        this.adjust.deaths = f.deaths;
+        this.renderAdjust();
+      }
+      this.persist();
+      this.note(this.adjust.enabled
+        ? 'Underreporting adjustment enabled — floor/central/upper will overlay the chart on the next fit.'
+        : 'Underreporting adjustment disabled.');
+    });
+    adjTarget.addEventListener('change', () => { this.adjust.asTarget = adjTarget.checked; this.persist(); });
+    adjT0.addEventListener('change', () => {
+      const v = Number(adjT0.value);
+      this.adjust.t0 = adjT0.value.trim() === '' || !Number.isFinite(v) ? null : Math.round(v);
+      this.persist();
+    });
+    this.renderAdjust();
 
     const kInput = q<HTMLInputElement>('[data-r0="k"]');
     const kLabel = q<HTMLElement>('[data-r0="k-label"]');
@@ -683,20 +775,120 @@ export class R0Modal {
     }
   }
 
-  /** The dataset the loss actually sees: finite points, day-shifted by the
-   *  index-case offset, and — when downward revisions exist and the toggle is
-   *  on — cleaned to the right-to-left running-min envelope. `raw` carries the
-   *  pre-cleaning (shifted) points for the preview overlay, or null when
-   *  cleaning is off / a no-op. Shared by run() and the history grouping. */
-  private effectiveObserved(): { observed: ObservedPoint[]; raw: ObservedPoint[] | null } {
-    const off = this.indexOffset || 0;
-    const shifted = this.observed
-      .filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value))
-      .map((p) => (off ? { ...p, day: p.day + off } : { ...p }));
-    if (this.honorRevisions && hasDownwardRevisions(shifted)) {
-      return { observed: revisionEnvelope(shifted), raw: shifted };
+  /** Keyframe editor for the underreporting multipliers: per category, one row
+   *  per keyframe (day + multiplier ≥ 1, so floor ≤ central ≤ upper always
+   *  holds), add/remove, any day allowed including outside the data bounds.
+   *  Edits materialize onto this.adjust so they persist. */
+  private renderAdjust(): void {
+    const host = this.el?.querySelector<HTMLElement>('[data-r0="adjust-frames"]');
+    if (!host) return;
+    host.innerHTML = '';
+    const defaults = this.adjustFrames();
+    const groups: ['cases' | 'deaths', string][] = [['cases', 'Cases (infections) ×'], ['deaths', 'Deaths ×']];
+    for (const [key, label] of groups) {
+      const frames = (this.adjust[key] ?? defaults[key]).slice().sort((a, b) => a.day - b.day);
+      const block = document.createElement('div');
+      block.className = 'r0-adjust-block';
+      const title = document.createElement('div');
+      title.className = 'r0-history-group';
+      title.textContent = label;
+      block.appendChild(title);
+      const write = (): void => { this.adjust[key] = frames; this.persist(); };
+      frames.forEach((f, i) => {
+        const row = document.createElement('div');
+        row.className = 'r0-adjust-row';
+        row.innerHTML = `
+          <label>day <input class="r0-in tiny" type="number" step="1" value="${f.day}" data-kf="day" aria-label="${label} keyframe day" /></label>
+          <label>× <input class="r0-in tiny" type="number" step="0.1" min="1" value="${f.m}" data-kf="m" aria-label="${label} keyframe multiplier" /></label>
+          <button class="r0-del" type="button" aria-label="Delete keyframe" ${frames.length <= 1 ? 'disabled' : ''}>×</button>
+        `;
+        row.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
+          f.day = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
+          write();
+        });
+        row.querySelector<HTMLInputElement>('[data-kf="m"]')!.addEventListener('change', (e) => {
+          f.m = Math.max(1, Number((e.target as HTMLInputElement).value) || 1);
+          (e.target as HTMLInputElement).value = String(f.m);
+          write();
+        });
+        row.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
+          frames.splice(i, 1);
+          write();
+          this.renderAdjust();
+        });
+        block.appendChild(row);
+      });
+      const add = document.createElement('button');
+      add.className = 'btn ghost';
+      add.type = 'button';
+      add.textContent = '+ keyframe';
+      add.addEventListener('click', () => {
+        const last = frames[frames.length - 1];
+        frames.push({ day: (last?.day ?? 0) + 14, m: last?.m ?? 1.5 });
+        write();
+        this.renderAdjust();
+      });
+      block.appendChild(add);
+      host.appendChild(block);
     }
-    return { observed: shifted, raw: null };
+  }
+
+  /** The adjustment keyframes in raw data-day coordinates — the user's frames
+   *  when set, otherwise the pseudocode defaults anchored at t0 (first data day
+   *  unless overridden): cases 5.0 → 3.8 and deaths 3.0 → 2.5 over a 6-week ramp. */
+  private adjustFrames(): { cases: Keyframe[]; deaths: Keyframe[]; t0: number } {
+    const days = this.observed.filter((p) => Number.isFinite(p.day)).map((p) => p.day);
+    const first = days.length ? Math.min(...days) : 0;
+    const t0 = this.adjust.t0 ?? first;
+    const mk = (key: 'cases' | 'deaths'): Keyframe[] =>
+      this.adjust[key]?.length
+        ? this.adjust[key]!.map((f) => ({ ...f }))
+        : [{ day: t0, m: ADJ_DEFAULTS[key][0] }, { day: t0 + RAMP_DAYS, m: ADJ_DEFAULTS[key][1] }];
+    return { cases: mk('cases'), deaths: mk('deaths'), t0 };
+  }
+
+  /** The dataset the loss actually sees. Pipeline (raw day coords, then the
+   *  index-offset shift is applied to every output series):
+   *    finite points → revision envelope (when downward revisions + toggle on)
+   *    → keyframe/vintaged adjustment (when enabled; central replaces the
+   *      target only in fit-target mode).
+   *  `raw` = pre-cleaning points for the greyed overlay; `adjustBands` =
+   *  floor/central/upper for the envelope overlay. Shared by run() and the
+   *  history grouping. */
+  private effectiveObserved(): {
+    observed: ObservedPoint[];
+    raw: ObservedPoint[] | null;
+    adjustBands: { floor: ObservedPoint[]; central: ObservedPoint[]; upper: ObservedPoint[] } | null;
+  } {
+    const off = this.indexOffset || 0;
+    const finite = this.observed
+      .filter((p) => Number.isFinite(p.day) && Number.isFinite(p.value))
+      .map((p) => ({ ...p }));
+    const revise = this.honorRevisions && hasDownwardRevisions(finite);
+    const cleaned = revise ? revisionEnvelope(finite) : finite;
+
+    let observed = cleaned;
+    let bands: { floor: ObservedPoint[]; central: ObservedPoint[]; upper: ObservedPoint[] } | null = null;
+    if (this.adjust.enabled) {
+      const { cases, deaths, t0 } = this.adjustFrames();
+      const { upper, central } = vintagedAdjust(
+        cleaned,
+        { cumulative_infections: cases, cumulative_deaths: deaths },
+        t0,
+      );
+      bands = { floor: cleaned, central, upper };
+      if (this.adjust.asTarget) observed = central;
+    }
+
+    const shift = (pts: ObservedPoint[]): ObservedPoint[] =>
+      off ? pts.map((p) => ({ ...p, day: p.day + off })) : pts;
+    return {
+      observed: shift(observed),
+      raw: revise ? shift(finite) : null,
+      adjustBands: bands
+        ? { floor: shift(bands.floor), central: shift(bands.central), upper: shift(bands.upper) }
+        : null,
+    };
   }
 
   // ── Run the fit ──
@@ -708,7 +900,7 @@ export class R0Modal {
     // data carries downward revisions (and the toggle is on), cleaned to the
     // running-min envelope. `raw` keeps the pre-cleaning points for the greyed
     // chart overlay; null when cleaning changed nothing.
-    const { observed, raw } = this.effectiveObserved();
+    const { observed, raw, adjustBands } = this.effectiveObserved();
     // Curve timing (incubation, infectious) is what fits the rise + peak shape; if
     // the data clearly spans a peak/plateau and the user hasn't enabled those genes,
     // add them so R² isn't capped by attack-rate + range alone.
@@ -723,6 +915,8 @@ export class R0Modal {
     bar.style.width = '0%';
 
     this.lastRaw = raw;
+    this.lastAdjust = adjustBands;
+    this.lastFan = null; // computed after the fit lands
     this.renderLive(observed, raw); // persistent chart + provisional metrics, updated live
     if (expanded) this.note('Timing params added (your data spans the peak) — fitting…');
 
@@ -738,6 +932,11 @@ export class R0Modal {
 
     const warnings: string[] = [];
     if (raw) warnings.push('downward revisions detected — fitting the cleaned (running-min) series; raw points shown greyed');
+    if (this.adjust.enabled) {
+      warnings.push(this.adjust.asTarget
+        ? 'underreporting adjustment ON — fitting the adjusted central estimate (floor/upper shown as envelope)'
+        : 'underreporting adjustment shown as overlay only (fit targets the reported counts)');
+    }
     if (base.size > liveSize) {
       warnings.push(`fit ran at ${base.size}×${base.size} for resolution — enlarge the live grid before Apply to reproduce`);
     }
@@ -765,7 +964,12 @@ export class R0Modal {
         gaTournament: this.ga.tournament,
         simulate: (cfg, days, K, seed) => this.pool!.simulate(cfg, days, K, seed),
         signal: this.signal,
-        onProgress: (frac) => { bar.style.width = `${Math.round(frac * 100)}%`; },
+        onProgress: (frac) => {
+          const pct = Math.round(frac * 100);
+          bar.style.width = `${pct}%`;
+          const pctEl = this.el?.querySelector<HTMLElement>('[data-r0="progress-pct"]');
+          if (pctEl) pctEl.textContent = `${pct}%`;
+        },
         onImprove: (p) => this.onImprove(p),
       });
       if (this.signal.aborted) { this.note('Fit cancelled.'); }
@@ -775,6 +979,19 @@ export class R0Modal {
         // the live sim shows after Apply. Recompute it on the user's real grid.
         this.note('Refining R₀ for your grid…');
         this.result = await this.reconcileR0(result);
+        // Fan chart: re-run the best config as an ensemble (each trial from a
+        // different index case) and aggregate into percentile bands. Display
+        // only — the fit result above is already final. Deterministic in
+        // (config, days, N, seed).
+        if (this.fanTrials > 1 && this.pool) {
+          this.note(`Computing confidence bands (${this.fanTrials} trials)…`);
+          try {
+            const ens = await this.pool.simulateEnsemble(
+              this.result.config, this.result.days, this.fanTrials, base.seed,
+            );
+            if (ens.perTrial?.length) this.lastFan = percentileBands(ens.perTrial, FAN_PROBS);
+          } catch { /* bands are optional — the fit result stands without them */ }
+        }
         // Record the fit in the history, keyed by the effective dataset it ran
         // against, so the table only ranks like-for-like.
         this.history.unshift({
@@ -846,7 +1063,11 @@ export class R0Modal {
       const r0El = this.el?.querySelector<HTMLElement>('[data-r0="live-r0"]');
       if (r0El) r0El.textContent = `R₀ = ${s.r0 == null ? '—' : s.r0.toFixed(2)}`;
       const lossEl = this.el?.querySelector<HTMLElement>('[data-r0="live-loss"]');
-      if (lossEl) lossEl.textContent = fmtLoss(s.loss);
+      // '~' marks provisional (low-fidelity screening) frames — they animate the
+      // search but their losses are noisier than full-fidelity ones.
+      if (lossEl) lossEl.textContent = `${s.provisional ? '~' : ''}${fmtLoss(s.loss)}`;
+      const subEl = this.el?.querySelector<HTMLElement>('[data-r0="live-sub"]');
+      if (subEl) subEl.textContent = s.provisional ? 'screening (low fidelity)' : 'best full-fidelity fit';
     });
   }
 
@@ -1000,12 +1221,12 @@ export class R0Modal {
         <div class="r0-metric">
           <span class="r0-metric-label">Best fit so far</span>
           <span class="r0-metric-value" data-r0="live-loss">…</span>
-          <span class="r0-metric-sub">loss — lower is better</span>
+          <span class="r0-metric-sub" data-r0="live-sub">loss — lower is better</span>
         </div>
       </div>
       <div class="r0-chart" data-r0="chart"></div>
     `;
-    this.createChart(observed, days, this.population, raw);
+    this.createChart(observed, days, this.population, raw, this.lastAdjust);
   }
 
   private renderOutput(): void {
@@ -1052,7 +1273,7 @@ export class R0Modal {
       </div>
       <div class="r0-chart" data-r0="chart"></div>
     `;
-    this.createChart(r.observed, r.days, r.population, this.lastRaw);
+    this.createChart(r.observed, r.days, r.population, this.lastRaw, this.lastAdjust, this.lastFan);
     this.updateChartData(r.simulated);
   }
 
@@ -1112,7 +1333,11 @@ export class R0Modal {
         `;
         row.querySelector<HTMLButtonElement>('[data-act="load"]')!.addEventListener('click', () => {
           this.result = e.result;
-          this.lastRaw = null; // stored results carry only the cleaned points
+          // Stored results carry only the effective fitted points — the raw
+          // overlay, adjustment envelope, and fan bands are transient.
+          this.lastRaw = null;
+          this.lastAdjust = null;
+          this.lastFan = null;
           this.renderOutput();
           this.note('Loaded fit from history.');
         });
@@ -1134,6 +1359,8 @@ export class R0Modal {
     days: number,
     population: number,
     raw: ObservedPoint[] | null = null,
+    adjustBands: { floor: ObservedPoint[]; central: ObservedPoint[]; upper: ObservedPoint[] } | null = null,
+    fan: Record<FitCategory, number[][]> | null = null,
   ): void {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="chart"]')!;
     this.plot?.destroy();
@@ -1142,6 +1369,36 @@ export class R0Modal {
     this.liveDays = days;
     this.livePop = population;
     this.liveCats = FIT_CATEGORIES.filter((c) => observed.some((p) => p.category === c));
+
+    // Cache the hook-painted overlays (people-scaled) + the y-range they need.
+    this.liveFanCols = null;
+    this.liveAdjustPts = null;
+    this.overlayMax = 0;
+    if (fan) {
+      this.liveFanCols = {};
+      for (const cat of this.liveCats) {
+        const rows = fan[cat]?.map((row) => row.map((v) => v * population));
+        if (!rows?.length) continue;
+        this.liveFanCols[cat] = rows;
+        const top = rows[rows.length - 1]; // highest percentile row
+        for (const v of top) if (v > this.overlayMax) this.overlayMax = v;
+      }
+    }
+    if (adjustBands) {
+      this.liveAdjustPts = {};
+      const verts = (pts: ObservedPoint[], cat: FitCategory): [number, number][] =>
+        pts.filter((p) => p.category === cat).sort((a, b) => a.day - b.day).map((p) => [p.day, p.value]);
+      for (const cat of this.liveCats) {
+        const upper = verts(adjustBands.upper, cat);
+        if (upper.length === 0) continue;
+        this.liveAdjustPts[cat] = {
+          floor: verts(adjustBands.floor, cat),
+          central: verts(adjustBands.central, cat),
+          upper,
+        };
+        for (const [, v] of upper) if (v > this.overlayMax) this.overlayMax = v;
+      }
+    }
 
     // Greyed overlay of raw points superseded by the revision cleaning: one extra
     // dots-only column per category that has any point differing from the cleaned
@@ -1227,7 +1484,21 @@ export class R0Modal {
         // Extra left padding so the widened y-axis gutter + label clear the card edge.
         padding: [12, 12, 0, 6],
         legend: { show: true },
-        scales: { x: { time: false } },
+        scales: {
+          x: { time: false },
+          // Let the hook-painted overlays (fan bands / adjustment upper bound)
+          // extend the y-range past the series data so they never clip.
+          y: {
+            range: (_u, min, max) => [
+              Math.min(0, min),
+              Math.max(max, this.overlayMax) * 1.03 || 1,
+            ] as [number, number],
+          },
+        },
+        // Percentile fan + floor/central/upper envelope are painted directly on
+        // the canvas (below the series, which redraw after this hook) so the
+        // data columns and legend stay exactly as before.
+        hooks: { draw: [(u) => this.paintOverlays(u)] },
         axes: [
           axisOpts('Day', { space: 56, values: (_u, splits) => splits.map((v) => String(Math.round(v))) }),
           // fmtNum keeps big counts compact (12k, 1.2M) so ticks stay inside the
@@ -1249,8 +1520,13 @@ export class R0Modal {
     const xs = this.chartXs(this.liveDays);
     const data: (number | null)[][] = [xs];
     this.liveCats.forEach((cat, ci) => {
-      const arr = curves[cat] ?? [];
-      const sim = xs.map((d) => (arr[Math.min(d, arr.length - 1)] ?? 0) * this.livePop);
+      // When a percentile fan is cached, the central line is the MEDIAN (p50)
+      // of the ensemble — for N=1 that is exactly the single trial — instead
+      // of the fit's mean curve, so the line always sits inside its bands.
+      const p50 = this.liveFanCols?.[cat]?.[FAN_PROBS.indexOf(50)];
+      const arr = p50 ?? curves[cat] ?? [];
+      const scale = p50 ? 1 : this.livePop; // fan rows are already people-scaled
+      const sim = xs.map((d) => (arr[Math.min(d, arr.length - 1)] ?? 0) * scale);
       const obs: (number | null)[] = xs.map(() => null);
       for (const pt of this.liveObserved) {
         if (pt.category !== cat) continue;
@@ -1262,6 +1538,64 @@ export class R0Modal {
       if (rawCol) data.push(rawCol);
     });
     this.plot.setData(data as uPlot.AlignedData);
+  }
+
+  /** Canvas-paint the percentile fan (25% / 50% / 90% bands around the median)
+   *  and the adjustment envelope (floor / central / upper) for each category.
+   *  Runs as a uPlot draw hook; series redraw on top. */
+  private paintOverlays(u: uPlot): void {
+    const fan = this.liveFanCols;
+    const adj = this.liveAdjustPts;
+    if (!fan && !adj) return;
+    const ctx = u.ctx;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+    ctx.clip();
+    const X = (d: number): number => u.valToPos(d, 'x', true);
+    const Y = (v: number): number => u.valToPos(v, 'y', true);
+    for (const cat of this.liveCats) {
+      const color = CAT_COLOR[cat];
+      const rows = fan?.[cat];
+      if (rows) {
+        // FAN_PROBS = [5, 25, 37.5, 50, 62.5, 75, 95] → (lo, hi, alpha) pairs.
+        const pairs: [number, number, number][] = [[0, 6, 0.07], [1, 5, 0.13], [2, 4, 0.2]];
+        for (const [lo, hi, alpha] of pairs) {
+          ctx.beginPath();
+          rows[hi].forEach((v, d) => { if (d === 0) ctx.moveTo(X(0), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+          for (let d = rows[lo].length - 1; d >= 0; d--) ctx.lineTo(X(d), Y(rows[lo][d]));
+          ctx.closePath();
+          ctx.fillStyle = withAlpha(color, alpha);
+          ctx.fill();
+        }
+      }
+      const a = adj?.[cat];
+      if (a && a.upper.length > 1) {
+        ctx.beginPath();
+        a.upper.forEach(([d, v], i) => { if (i === 0) ctx.moveTo(X(d), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+        for (let i = a.floor.length - 1; i >= 0; i--) ctx.lineTo(X(a.floor[i][0]), Y(a.floor[i][1]));
+        ctx.closePath();
+        ctx.fillStyle = withAlpha(color, 0.08);
+        ctx.fill();
+        const stroke = (pts: [number, number][], alpha: number, dash: number[]): void => {
+          if (pts.length < 2) return;
+          ctx.beginPath();
+          pts.forEach(([d, v], i) => { if (i === 0) ctx.moveTo(X(d), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+          ctx.strokeStyle = withAlpha(color, alpha);
+          ctx.lineWidth = 1;
+          ctx.setLineDash(dash);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        };
+        stroke(a.upper, 0.55, [5, 4]);  // vintaged upper bound
+        stroke(a.floor, 0.55, [2, 3]);  // reported floor
+        // In overlay-only mode the dots are the reported counts, so draw the
+        // central estimate as its own dashed line; in fit-target mode the dots
+        // ARE the central, so an extra line would just double-ink them.
+        if (!this.adjust.asTarget) stroke(a.central, 0.85, [7, 3]);
+      }
+    }
+    ctx.restore();
   }
 
   private chartXs(days: number): number[] {
@@ -1354,6 +1688,25 @@ const TEMPLATE = `
         <div data-r0="rows"></div>
       </div>
     </details>
+    <details class="r0-details" data-r0="adjust-details">
+      <summary>Case/death adjustment (underreporting multipliers)</summary>
+      <p class="r0-blurb">Reported counts are a floor on the true burden. Keyframe multipliers — linearly
+        interpolated by report day, clamped past the end keyframes (days before t₀ / after the data are
+        fine) — scale each day's NEW counts at their report date ("vintaged" accumulation):
+        upper(tᵢ) = Σ Δreported(tⱼ)·m(tⱼ), central = (reported + upper) / 2. The initial stock uses m at
+        the midpoint of [t₀, first observation]. Defaults: cases 5.0 → 3.8 and deaths 3.0 → 2.5 over a
+        6-week ramp from t₀.</p>
+      <div class="r0-actions">
+        <label class="r0-check"><input type="checkbox" data-adj="enabled" /> enable</label>
+        <label class="r0-check" title="On: the loss fits the adjusted central estimate (floor and upper drawn as an envelope). Off: the adjustment is a chart overlay only — the fit targets the reported counts.">
+          <input type="checkbox" data-adj="astarget" /> fit the adjusted central
+        </label>
+        <label class="r0-field r0-field-inline"><span>t₀ (first-case day)</span>
+          <input class="r0-in tiny" type="number" step="1" data-adj="t0" placeholder="auto" />
+        </label>
+      </div>
+      <div class="r0-adjust-frames" data-r0="adjust-frames"></div>
+    </details>
     <details class="r0-details">
       <summary>Paste CSV / TSV</summary>
       <textarea class="r0-paste" data-r0="paste" rows="4"
@@ -1386,6 +1739,10 @@ const TEMPLATE = `
         <span>Max trials per candidate: <b data-r0="k-label">30</b></span>
         <input type="range" min="10" max="100" step="5" data-r0="k" />
       </label>
+      <label class="r0-field r0-field-inline" title="After the fit, re-run the best-fit disease this many times — each run starting from a DIFFERENT index case on the board — and shade the spread as percentile bands (25% / 50% / 90%) around the median. Caveat: trials are deterministic seeded realizations, so the bands quantify stochastic-path + index-case-location spread, not a Bayesian posterior over parameters. 1 = single line.">
+        <span>Fan-chart trials</span>
+        <input class="r0-in tiny" type="number" min="1" max="100" step="1" data-r0="fan" />
+      </label>
     </div>
     <div class="r0-ga" data-r0="ga-controls">
       <p class="r0-blurb">Evolves a population of disease genomes — selection, crossover, and Gaussian mutation — like the simulation's own strain mutation. Larger population / more generations search harder.</p>
@@ -1402,6 +1759,7 @@ const TEMPLATE = `
       <button class="btn primary" type="button" data-r0="run">Run fit</button>
       <button class="btn ghost" type="button" data-r0="cancel" disabled>Cancel</button>
       <div class="r0-progress" data-r0="progress"><div class="r0-progress-fill" data-r0="progress-fill"></div></div>
+      <span class="r0-progress-pct" data-r0="progress-pct"></span>
     </div>
     <p class="r0-note" data-r0="note" role="status" aria-live="polite"></p>
   </section>

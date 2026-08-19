@@ -45,6 +45,13 @@ export interface EngineOptions {
    * (the degenerate `size < 8` case) rather than meaning "unset".
    */
   rNaught?: number | null;
+  /**
+   * Cell index for patient zero (defaults to the grid center). Used by the fit
+   * ensemble to start each trial from a different index case. Placement draws
+   * no randomness, so engines with and without the override step identically
+   * apart from the seeding location itself.
+   */
+  indexCell?: number;
 }
 
 export class Engine {
@@ -113,6 +120,7 @@ export class Engine {
       vaccineUptake: this.defenses.uptake[1],
       lockdownCompliance: config.lockdown.enabled ? config.lockdown.compliance : 0,
       patientZero: true,
+      indexCell: opts?.indexCell,
     });
     this.tick = 0;
     this.newInfectionsHistory = [];
