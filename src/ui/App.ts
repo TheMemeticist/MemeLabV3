@@ -1,4 +1,4 @@
-import type { CostConfig, FrameMessage, InterventionEvent, InterventionKey, SimConfig, TopologyMessage, WorkerCommand } from '../types';
+import type { CostConfig, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { findPreset, baseSimConfig, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
 import { Petri } from './Petri';
 import { Chart, type ChartView, type CostChartData } from './Chart';
@@ -11,6 +11,7 @@ import { R0Modal } from './R0Modal';
 import { ShareMenu } from './ShareMenu';
 import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
+import { syncSpecsWithToggle } from '../lib/fit';
 import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
 import { computeLedger, costConfigFromProfile, findCurrency, formatMoney } from '../lib/cost';
 import { appendLongDelta, emptyLongStats } from '../sim/long-history';
@@ -52,6 +53,11 @@ export class App {
   private renderScheduled = false;
   private persistTimer = 0;
   private interventionEvents: InterventionEvent[] = [];
+  // THE shared intervention store (InterventionSpec, types.ts): the R0
+  // Estimator and the main sim read/write the SAME array — an intervention
+  // added/edited/toggled in one place is the same object in the other. App
+  // owns persistence (its own storage key, independent of the fit snapshot).
+  private interventions: InterventionSpec[] = read<InterventionSpec[]>('interventions', []);
   private prevConfig: SimConfig | null = null;
   private epidemicStarted = false;
   private epidemicEnded = false;
@@ -361,6 +367,10 @@ export class App {
     this.r0Modal = new R0Modal({
       getConfig: () => this.controls.config(),
       onApply: (fitted) => this.applyFit(fitted),
+      // Shared intervention store: hand out the live array (same objects both
+      // sides); the modal notifies on every mutation so App persists it.
+      getInterventions: () => this.interventions,
+      onInterventionsChange: () => write('interventions', this.interventions),
     });
     (this.root.querySelector('[data-act="reset-defaults"]') as HTMLButtonElement)
       .addEventListener('click', () => { localStorage.clear(); location.reload(); });
@@ -673,6 +683,12 @@ export class App {
   }
 
   private recordInterventionToggle(key: InterventionKey, on: boolean): void {
+    // Crossover main-sim → fit: toggling mask/vaccine/lockdown/quarantine here
+    // flips `enabled` on the shared store's specs of that taxonomy, live.
+    if (syncSpecsWithToggle(this.interventions, key, on)) {
+      write('interventions', this.interventions);
+      this.r0Modal.refreshInterventions();
+    }
     const tick = this.lastFrame?.tick ?? 0;
     this.interventionEvents.push({ tick, intervention: key, on });
     this.chart.setMarkers(this.interventionEvents);

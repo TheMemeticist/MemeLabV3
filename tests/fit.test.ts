@@ -23,6 +23,7 @@ import {
   revisionEnvelope,
   runFit,
   specFromEvents,
+  syncSpecsWithToggle,
   transmissionSchedule,
   vintagedAdjust,
 } from '../src/lib/fit';
@@ -869,5 +870,100 @@ describe('shared intervention shape + instant cancel', () => {
       expect(post).toBe(0);       // not one simulation issued after the abort
       expect(ms).toBeLessThan(100); // settles within a few frames
     }
+  }, 30_000);
+});
+
+describe('crossover store, future persistence, future Bayes band, full progress', () => {
+  const spec = (over: Partial<InterventionSpec> = {}): InterventionSpec => ({
+    id: 'iv-x', intervention: 'custom', label: 'x', enabled: true,
+    transmissionReduction: 0.5, events: [{ tick: 10, intensity: 0 }, { tick: 20, intensity: 1 }],
+    ...over,
+  });
+  const obs3: ObservedPoint[] = [[0, 5], [10, 60], [20, 200]].map(([day, value]) =>
+    ({ day, value, category: 'cumulative_infections' as const }));
+
+  it('crossover: a main-sim toggle flips enabled on the SAME shared-store objects', () => {
+    const store = [
+      spec({ id: 'a', intervention: 'lockdown' }),
+      spec({ id: 'b', intervention: 'lockdown', enabled: false }),
+      spec({ id: 'c', intervention: 'quarantine' }),
+    ];
+    const a = store[0]; // same object identity, not a copy
+    expect(syncSpecsWithToggle(store, 'lockdown', false)).toBe(true);
+    expect(a.enabled).toBe(false);          // mutated in place — one store
+    expect(store[1].enabled).toBe(false);
+    expect(store[2].enabled).toBe(true);    // other taxonomy untouched
+    expect(syncSpecsWithToggle(store, 'lockdown', false)).toBe(false); // idempotent
+    expect(syncSpecsWithToggle(store, 'quarantine', false)).toBe(true);
+    expect(store[2].enabled).toBe(false);
+  });
+
+  it('interventions PERSIST into the future: last intensity holds unless explicitly zeroed', () => {
+    const cfg = baseConfig({ size: 24, strain: { ...baseConfig().strain, attackRate: 0.35 } });
+    const horizon = 80; // well past the "data" — the prediction region
+    const hold = transmissionSchedule([spec({ transmissionReduction: 0.8 })], horizon + 1)!;
+    expect(hold[horizon]).toBeCloseTo(0.2, 12); // still fully active at the horizon
+    const stopped = transmissionSchedule(
+      [spec({ transmissionReduction: 0.8, events: [
+        { tick: 10, intensity: 0 }, { tick: 20, intensity: 1 },
+        { tick: 40, intensity: 1 }, { tick: 41, intensity: 0 }, // explicit stop
+      ] })], horizon + 1)!;
+    expect(stopped[horizon]).toBeCloseTo(1, 12); // released after the stop
+    // Behavioral: the held intervention suppresses future growth; the stopped
+    // one lets the epidemic resume — strictly more cumulative infections.
+    const held = runTrials(cfg, horizon, 4, cfg.seed, hold);
+    const released = runTrials(cfg, horizon, 4, cfg.seed, stopped);
+    expect(released.curves.cumulative_infections[horizon])
+      .toBeGreaterThan(held.curves.cumulative_infections[horizon]);
+  });
+
+  it('Bayes band extends across the future prediction region, ordered, and widens', async () => {
+    const extraDays = 20;
+    const r = await runFit({
+      observed: obs3,
+      baseConfig: baseConfig({ size: 16 }),
+      params: [findFitParam('attackRate')],
+      extraDays,
+      posterior: { draws: 24 },
+      population: 1_000,
+      K: 3,
+      loss: 'poisson',
+      simulate,
+      budget: 8,
+      nmIters: 3,
+    });
+    const rows = r.bayes!.cumulative_infections;
+    expect(rows[0]).toHaveLength(r.days + 1); // covers data + the full future horizon
+    expect(r.days).toBe(20 + extraDays);
+    for (let d = 0; d <= r.days; d++) {
+      expect(rows[0][d]).toBeLessThanOrEqual(rows[1][d] + 1e-12);
+      expect(rows[1][d]).toBeLessThanOrEqual(rows[2][d] + 1e-12);
+    }
+    const width = (d: number): number => rows[2][d] - rows[0][d];
+    expect(rows[1][r.days]).toBeGreaterThan(0);           // central projects into the future
+    expect(width(r.days)).toBeGreaterThanOrEqual(width(20)); // plausible range widens (or holds)
+  }, 30_000);
+
+  it('progress reaches 100% through ALL stages, monotonically (no 32% stall)', async () => {
+    const fracs: number[] = [];
+    await runFit({
+      observed: obs3,
+      baseConfig: baseConfig({ size: 16 }),
+      params: [findFitParam('attackRate')],
+      offset: { bounds: [0, 8] },
+      posterior: { draws: 16 },
+      population: 1_000,
+      K: 3,
+      loss: 'poisson',
+      simulate,
+      optimizer: 'genetic',
+      gaPopulation: 10,
+      gaGenerations: 20, // patience will stop the GA early — the old 32% trap
+      onProgress: (f) => fracs.push(f),
+    });
+    for (let i = 1; i < fracs.length; i++) expect(fracs[i]).toBeGreaterThanOrEqual(fracs[i - 1]);
+    expect(fracs[fracs.length - 1]).toBeGreaterThanOrEqual(0.999);
+    // The post stages actually tick (more reports than the optimizer alone).
+    expect(fracs.length).toBeGreaterThan(20);
   }, 30_000);
 });

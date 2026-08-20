@@ -13,6 +13,7 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { SimConfig } from '../types';
 import { FitPool } from '../lib/fit-pool';
+import { Slider } from './Slider';
 import { read, remove, write } from '../lib/storage';
 import {
   CATEGORY_LABELS,
@@ -46,6 +47,11 @@ interface R0ModalEvents {
   getConfig: () => SimConfig;
   /** Push the fitted config back into the simulation. */
   onApply: (config: SimConfig) => void;
+  /** The SHARED intervention store (owned by App; same array/objects as the
+   *  main sim). Optional so the modal still works standalone (local fallback). */
+  getInterventions?: () => InterventionSpec[];
+  /** Notify the owner after any mutation of the shared store (it persists). */
+  onInterventionsChange?: () => void;
 }
 
 // Per-category overlay colors (line = simulated, dots = observed).
@@ -348,8 +354,21 @@ export class R0Modal {
   // Days to project the model beyond the data's last day.
   private predictionDays = 0;
   // Interventions: time-varying transmission R(t) — the MODEL dimension,
-  // separate from the case/death DATA adjustment.
-  private interventions: InterventionSpec[] = [];
+  // separate from the case/death DATA adjustment. The store is SHARED with the
+  // main sim (App owns it + persistence); this getter always reads the live
+  // array so both UIs act on the same objects. Local fallback for standalone use.
+  private localInterventions: InterventionSpec[] = [];
+  private get interventions(): InterventionSpec[] {
+    return this.events.getInterventions?.() ?? this.localInterventions;
+  }
+  private notifyInterventions(): void {
+    this.events.onInterventionsChange?.();
+  }
+  /** Re-render the interventions editor (main sim calls this after it mutates
+   *  the shared store, e.g. an intervention toggle). No-op when closed. */
+  refreshInterventions(): void {
+    if (this.el) this.renderInterventions();
+  }
   private itvSeq = 0; // display-only id counter (never feeds the sim)
   private adjust: AdjustSettings = { ...DEFAULT_ADJUST };
   private running = false;
@@ -470,7 +489,6 @@ export class R0Modal {
       history: this.history,
       bayesDraws: this.bayesDraws,
       predictionDays: this.predictionDays,
-      interventions: this.interventions.map((iv) => ({ ...iv, events: iv.events.map((f) => ({ ...f })) })),
       adjust: { ...this.adjust },
       offsetEvolve: this.offsetEvolve,
       offsetBounds: [...this.offsetBounds] as [number, number],
@@ -498,12 +516,13 @@ export class R0Modal {
     if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
     if (Number.isFinite(s.bayesDraws)) this.bayesDraws = Math.min(500, Math.max(0, Math.round(s.bayesDraws!)));
     if (Number.isFinite(s.predictionDays)) this.predictionDays = Math.min(365, Math.max(0, Math.round(s.predictionDays!)));
-    if (Array.isArray(s.interventions)) {
-      // Migrate pre-shared-shape snapshots ({effect, intensity:[{day,m}]}) to
-      // the live-sim-aligned InterventionSpec.
-      this.interventions = s.interventions.map((iv) => {
+    if (Array.isArray(s.interventions) && this.interventions.length === 0) {
+      // Migration: interventions used to live in this snapshot (and before
+      // that in a pre-shared shape). Seed the now-App-owned shared store once.
+      const store = this.interventions;
+      for (const iv of s.interventions) {
         const legacy = iv as unknown as { effect?: number; intensity?: { day: number; m: number }[] };
-        return {
+        store.push({
           id: iv.id,
           intervention: iv.intervention ?? 'custom',
           label: iv.label,
@@ -511,14 +530,9 @@ export class R0Modal {
           transmissionReduction: iv.transmissionReduction ?? legacy.effect ?? 0.3,
           events: (iv.events ?? (legacy.intensity ?? []).map((f) => ({ tick: f.day, intensity: f.m })))
             .map((f) => ({ ...f })),
-        };
-      });
-    }
-    if (s.adjust && typeof s.adjust === 'object') this.adjust = { ...DEFAULT_ADJUST, ...s.adjust };
-    if (typeof s.offsetEvolve === 'boolean') this.offsetEvolve = s.offsetEvolve;
-    if (Array.isArray(s.offsetBounds) && s.offsetBounds.length === 2) {
-      const lo = Math.max(0, Math.round(s.offsetBounds[0]));
-      this.offsetBounds = [lo, Math.max(lo, Math.round(s.offsetBounds[1]))];
+        });
+      }
+      this.notifyInterventions();
     }
   }
 
@@ -558,7 +572,8 @@ export class R0Modal {
     this.history = [];
     this.bayesDraws = 120;
     this.predictionDays = 0;
-    this.interventions = [];
+    this.interventions.length = 0; // shared store: clear contents in place
+    this.notifyInterventions();
     this.adjust = { ...DEFAULT_ADJUST };
     this.offsetEvolve = true;
     this.offsetBounds = [0, 28];
@@ -740,7 +755,7 @@ export class R0Modal {
       });
       const details = this.el?.querySelector<HTMLDetailsElement>('[data-r0="itv-details"]');
       if (details) details.open = true;
-      this.persist();
+      this.notifyInterventions();
       this.renderInterventions();
     });
     this.renderInterventions();
@@ -902,6 +917,69 @@ export class R0Modal {
     }
   }
 
+  /** Keyframe click-through: the main sim's own Slider controls for the
+   *  clicked intervention + keyframe (transmission reduction exactly as the
+   *  lockdown panel presents it, plus this keyframe's intensity and the
+   *  live-sim taxonomy bucket) — one shared object, same sliders both places. */
+  private openItvSliders(
+    card: HTMLElement,
+    iv: InterventionSpec,
+    frame: { tick: number; intensity: number },
+    persist: () => void,
+  ): void {
+    const existing = card.querySelector('.r0-itv-sliders');
+    if (existing) { existing.remove(); return; } // toggle closed
+    const host = document.createElement('div');
+    host.className = 'r0-itv-sliders';
+    const effectSlider = new Slider({
+      id: `itv-eff-${iv.id}`,
+      label: 'Transmission reduction',
+      min: 0, max: 95, step: 5,
+      value: Math.round(iv.transmissionReduction * 100),
+      unit: '%',
+      hint: 'Same control as the main sim (LockdownSpec.transmissionReduction): the multiplicative cut to transmission at full (100%) intensity.',
+      onChange: (v) => {
+        iv.transmissionReduction = Math.min(0.95, Math.max(0, v / 100));
+        const eff = card.querySelector<HTMLInputElement>('[data-iv="effect"]');
+        if (eff) eff.value = String(Math.round(iv.transmissionReduction * 100));
+        persist();
+      },
+    });
+    const intensitySlider = new Slider({
+      id: `itv-int-${iv.id}-${frame.tick}`,
+      label: `Intensity @ day ${frame.tick}`,
+      min: 0, max: 100, step: 5,
+      value: Math.round(frame.intensity * 100),
+      unit: '%',
+      hint: 'Coverage/strength of the intervention at this keyframe day. Holds past the last keyframe (interventions persist indefinitely unless a later keyframe sets 0).',
+      onChange: (v) => {
+        frame.intensity = Math.min(1, Math.max(0, v / 100));
+        persist();
+        // Sync the inline % box without a full re-render (slider keeps focus).
+        card.querySelectorAll<HTMLInputElement>('[data-kf="m"]').forEach((inp) => {
+          if (Number(inp.closest('.r0-adjust-row')?.querySelector<HTMLInputElement>('[data-kf="day"]')?.value) === frame.tick) {
+            inp.value = String(Math.round(frame.intensity * 100));
+          }
+        });
+      },
+    });
+    const tax = document.createElement('label');
+    tax.className = 'r0-check';
+    tax.title = "The live sim's intervention taxonomy (InterventionKey) — main-sim toggles of this key sync this intervention's enabled state.";
+    tax.innerHTML = `type <select class="r0-in" data-iv="tax">
+      ${['custom', 'mask', 'vaccine', 'lockdown', 'quarantine']
+        .map((k) => `<option value="${k}"${iv.intervention === k ? ' selected' : ''}>${k}</option>`).join('')}
+    </select>`;
+    tax.querySelector('select')!.addEventListener('change', (e) => {
+      iv.intervention = (e.target as HTMLSelectElement).value as InterventionSpec['intervention'];
+      persist();
+    });
+    host.appendChild(effectSlider.el);
+    host.appendChild(intensitySlider.el);
+    host.appendChild(tax);
+    card.appendChild(host);
+  }
+
   /** Active interventions' ramp windows (first → last intensity keyframe) in
    *  chart-day coordinates (data day + the given offset shift). */
   private itvWindows(offset: number): { from: number; to: number; label: string }[] {
@@ -947,7 +1025,7 @@ export class R0Modal {
         </div>
         <div class="r0-itv-frames" data-iv="frames"></div>
       `;
-      const persist = (): void => { this.persist(); };
+      const persist = (): void => { this.notifyInterventions(); };
       card.querySelector<HTMLInputElement>('[data-iv="on"]')!.addEventListener('change', (e) => {
         iv.enabled = (e.target as HTMLInputElement).checked;
         persist();
@@ -994,6 +1072,14 @@ export class R0Modal {
           frames.splice(fi, 1);
           persist();
           this.renderInterventions();
+        });
+        // Clicking a keyframe day surfaces the SAME sliders the main sim uses
+        // (the shared Slider component + LockdownSpec-style transmission
+        // reduction), editing the same shared-store object.
+        row.addEventListener('click', (ev) => {
+          const t = ev.target as HTMLElement;
+          if (t.closest('input') || t.closest('button')) return;
+          this.openItvSliders(card, iv, f, persist);
         });
         framesHost.appendChild(row);
       });
@@ -1434,7 +1520,10 @@ export class R0Modal {
     const adjT0 = this.el?.querySelector<HTMLInputElement>('[data-adj="t0"]');
     if (adjT0) adjT0.value = this.adjust.t0 == null ? '' : String(this.adjust.t0);
     this.renderAdjust();
-    this.interventions = (p.interventions ?? []).map((iv) => ({ ...iv, events: iv.events.map((f) => ({ ...f })) }));
+    const store = this.interventions; // shared with the main sim — replace contents
+    store.length = 0;
+    for (const iv of p.interventions ?? []) store.push({ ...iv, events: iv.events.map((f) => ({ ...f })) });
+    this.notifyInterventions();
     this.renderInterventions();
     this.result = null;
     this.renderTable();
@@ -2062,15 +2151,6 @@ const TEMPLATE = `
       <span>Index-case offset (days)</span>
       <input class="r0-in" type="number" step="1" min="0" max="365" data-r0="offset" />
     </label>
-    <div class="r0-actions">
-      <label class="r0-check" title="Search the index date during the fit: the offset becomes an evolved, bounded integer parameter (like the other ranges), deterministic and seeded. The fitted value is written back into the offset field above, and a profile-likelihood CI for it is reported with the result.">
-        <input type="checkbox" data-r0="offset-evolve" /> evolve index date within
-      </label>
-      <span class="r0-bound"><input class="r0-in tiny" type="number" step="1" min="0" data-r0="offset-lo" aria-label="Index-date offset lower bound" /></span>
-      <span class="r0-sep">–</span>
-      <span class="r0-bound"><input class="r0-in tiny" type="number" step="1" min="0" data-r0="offset-hi" aria-label="Index-date offset upper bound" /></span>
-      <span class="r0-muted">days head start</span>
-    </div>
     <p class="r0-blurb r0-hint">Shifts every data point this many days later in model time, giving the
       outbreak a head start before the first reported case. Early surveillance undercounts a new
       epidemic (low testing, sampling bias), so the true index case usually predates the data — raise
@@ -2130,6 +2210,15 @@ const TEMPLATE = `
     <h3>2 · Parameters to fit</h3>
     <p class="r0-blurb">Start with attack rate + range. Each fitted parameter is searched within its bounds.</p>
     <div class="r0-params" data-r0="params"></div>
+    <div class="r0-actions">
+      <label class="r0-check" title="Search the index date during the fit: the offset becomes an evolved, bounded integer parameter (like the other ranges), deterministic and seeded. The fitted value is written back into the Index-case offset field in section 1, and a profile-likelihood CI for it is reported with the result.">
+        <input type="checkbox" data-r0="offset-evolve" /> evolve index date within
+      </label>
+      <span class="r0-bound"><input class="r0-in tiny" type="number" step="1" min="0" data-r0="offset-lo" aria-label="Index-date offset lower bound" /></span>
+      <span class="r0-sep">–</span>
+      <span class="r0-bound"><input class="r0-in tiny" type="number" step="1" min="0" data-r0="offset-hi" aria-label="Index-date offset upper bound" /></span>
+      <span class="r0-muted">days head start</span>
+    </div>
     <details class="r0-details" data-r0="itv-details">
       <summary>Interventions — time-varying transmission R(t) · <span class="r0-muted" data-r0="itv-count"></span></summary>
       <p class="r0-blurb">Public-health interventions reduce the <b>MODEL's</b> transmission over time:

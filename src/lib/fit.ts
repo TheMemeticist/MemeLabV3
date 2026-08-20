@@ -790,7 +790,29 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     return loss;
   };
 
-  const onProgress = (d: number, t: number): void => { req.onProgress?.(d / t); };
+  // ── Unified, monotonic fit-wide progress (fixes the bar freezing at ~32%) ──
+  // The optimizer reports its own (done, total), but GA patience can stop early
+  // (done ≪ total) and the post-fit stages (profile-CI grid, MCMC chain, Bayes
+  // draws, final re-eval) previously never ticked at all. Track one fraction:
+  // optimizer stage + exactly-counted post stages; when a stage ends early its
+  // allocation completes (an honest "stage done" jump), never regresses.
+  const postDraws = req.posterior ? Math.max(10, Math.round(req.posterior.draws ?? 120)) : 0;
+  const postBurn = req.posterior ? Math.max(30, Math.round(req.posterior.burn ?? Math.ceil(postDraws * 0.25))) : 0;
+  const postTotal = (offsetDef ? offHi - offLo + 1 : 0) + (postDraws + postBurn) + postDraws + 1;
+  let optT = 0;
+  let optDone = 0;
+  let postDone = 0;
+  let lastFrac = 0;
+  const report = (): void => {
+    const frac = (optDone + postDone) / ((optT || 1) + postTotal);
+    if (frac > lastFrac) { lastFrac = frac; req.onProgress?.(Math.min(1, frac)); }
+  };
+  const postTick = (): void => { postDone = Math.min(postDone + 1, postTotal); report(); };
+  const onProgress = (d: number, t: number): void => {
+    optT = Math.max(optT, t);
+    optDone = Math.min(Math.max(optDone, d), optT);
+    report();
+  };
   const opt = req.optimizer === 'genetic'
     ? await runGA({
         params: allParams,
@@ -821,6 +843,11 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
         onProgress,
       });
 
+  // Optimizer stage complete (possibly early via GA patience) — fill its bar
+  // allocation so the post stages continue from there instead of ~32%.
+  optDone = optT;
+  report();
+
   const bestValues = opt.best.values.slice();
   let bestLossFinal = opt.best.loss;
 
@@ -837,6 +864,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
       v[req.params.length] = o;
       const { loss } = await evalAt(v, req.K);
       profile.push({ offset: o, loss });
+      postTick();
     }
     if (req.signal?.aborted || profile.length === 0) {
       // Cancelled mid-grid — skip the CI rather than reading a partial profile.
@@ -863,32 +891,34 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   // streaming path stays the cheap one.
   let bayes: Record<FitCategory, number[][]> | null = null;
   if (req.posterior && !req.signal?.aborted) {
-    const draws = Math.max(10, Math.round(req.posterior.draws ?? 120));
-    // Burn-in doubles as the step-adaptation phase — needs a few adaptation
-    // windows to find the posterior's scale on sharp likelihoods.
-    const burn = Math.max(30, Math.round(req.posterior.burn ?? Math.ceil(draws * 0.25)));
+    // (postDraws/postBurn hoisted above for the progress accounting; burn-in
+    // doubles as the step-adaptation phase.)
     const chain = await metropolisChain(
       async (v) => (await evalAt(v, req.K)).loss,
       bestValues,
       allParams,
       (baseSeed ^ 0x0ba7e5ea) >>> 0,
-      draws + burn,
-      burn,
+      postDraws + postBurn,
+      postBurn,
       req.loss,
       req.observed.length,
       req.signal,
+      postTick,
     );
     const drawCurves: SimCurves[] = [];
     for (const v of chain) {
       if (req.signal?.aborted) break;
       const { result } = await evalAt(v, req.K);
       if (result.curves.cumulative_infections.length) drawCurves.push(result.curves);
+      postTick();
     }
     if (drawCurves.length && !req.signal?.aborted) bayes = percentileBands(drawCurves, BAND_PROBS);
   }
 
   const bestConfig = configFor(bestValues);
   const best = await evalAt(bestValues, req.K); // cache hit
+  postDone = postTotal; // final re-eval — the bar completes at 100%
+  report();
   const bestOffset = offsetOf(bestValues);
   const shiftedObserved = shiftPts(req.observed, bestOffset);
   const ciEval = (values: number[]) => evalAt(values, req.K).then((r) => ({ loss: r.loss, r0: r.r0 }));
@@ -935,6 +965,7 @@ export async function metropolisChain(
   lossType: LossType = 'poisson',
   nObs = 1,
   signal?: { aborted: boolean },
+  onStep?: () => void,
 ): Promise<number[][]> {
   const rng = new Rng((seed ^ 0x6d636d63) >>> 0);
   const lo = params.map((p) => p.bounds[0]);
@@ -974,6 +1005,7 @@ export async function metropolisChain(
       window = 0;
     }
     if (it >= burn) draws.push(cur.slice());
+    onStep?.();
   }
   return draws;
 }
@@ -1375,6 +1407,25 @@ export function specFromEvents(
     transmissionReduction: clamp(transmissionReduction, 0, 0.95),
     events: pts,
   };
+}
+
+/** Crossover sync: a main-sim intervention toggle (mask/vaccine/lockdown/
+ *  quarantine on/off) flips `enabled` on every shared-store spec of that
+ *  taxonomy, so the live sim and the fit modal act on the SAME objects.
+ *  Returns true when anything changed (callers persist + refresh then). */
+export function syncSpecsWithToggle(
+  specs: InterventionSpec[],
+  key: InterventionKey,
+  on: boolean,
+): boolean {
+  let changed = false;
+  for (const iv of specs) {
+    if (iv.intervention === key && iv.enabled !== on) {
+      iv.enabled = on;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 /** Per-model-tick transmission multiplier for the engine: tick t maps to data
