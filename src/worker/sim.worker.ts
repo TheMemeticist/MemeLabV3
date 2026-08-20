@@ -138,6 +138,39 @@ function disposeGpu(): void {
   if (g) gpuChain = gpuChain.then(() => g.dispose()).catch(() => {});
 }
 
+/** Why this config can't run on the wasm engine — names the feature AND the
+ *  fix, because a bare "CPU" label reads as a broken toggle. */
+function wasmBlockReason(config: SimConfig): string {
+  if (config.mutate === true) return '🧬 natural selection is multi-strain — CPU engine only. Turn 🧬 off to use WASM/GPU';
+  return 'Voronoi geometry runs on the CPU engine — switch lattice geometry to use WASM/GPU';
+}
+
+function gpuBlockReason(config: SimConfig): string {
+  if (config.mutate === true || (config.geometry ?? 'square') === 'voronoi') return wasmBlockReason(config);
+  return 'extinction reseed runs on the CPU engines — disable it to use GPU';
+}
+
+function gpuInitFailReason(err: unknown): string {
+  const msg = String((err as Error)?.message ?? err ?? '');
+  if (/adapter/i.test(msg)) {
+    return 'no GPU adapter — on Linux Chrome enable chrome://flags/#enable-unsafe-webgpu and relaunch';
+  }
+  return `WebGPU init failed (${msg || 'unknown error'})`;
+}
+
+/** After a (re)build, resume the right loop if the user was playing. */
+function resumeIfPlaying(): void {
+  if (!playing) return;
+  lastFrame = performance.now();
+  lastPost = 0;
+  if (gpu) {
+    scheduleGpuLoop(0);
+  } else if (engine && !scheduled) {
+    scheduled = true;
+    setTimeout(loop, 0);
+  }
+}
+
 /** (Re)build the simulation for `config` under the requested backend, with
  *  automatic fallback gpu → wasm → cpu. */
 function rebuild(config: SimConfig): void {
@@ -155,7 +188,7 @@ function rebuild(config: SimConfig): void {
       return;
     }
     if (!gpuCompatible(config)) {
-      buildCpuEngine(config, topo, 'voronoi / mutation / reseed configs run on the CPU engines');
+      buildCpuEngine(config, topo, gpuBlockReason(config));
       return;
     }
     gpuChain = gpuChain
@@ -166,12 +199,13 @@ function rebuild(config: SimConfig): void {
           gpu = g;
           postBackend('gpu');
           postFrame();
+          resumeIfPlaying();
         } else {
           g.dispose();
         }
       })
-      .catch(() => {
-        if (currentConfig === config) buildCpuEngine(config, topo, 'WebGPU init failed');
+      .catch((err) => {
+        if (currentConfig === config) buildCpuEngine(config, topo, gpuInitFailReason(err));
       });
     return;
   }
@@ -183,13 +217,15 @@ function buildCpuEngine(config: SimConfig, topo: import('../types').VoronoiTopol
   engine = createEngine(config, topo, undefined, wantWasm);
   const active: EngineBackend = engine instanceof WasmEngine ? 'wasm' : 'cpu';
   let reason = fallbackReason;
-  if (!reason && wantWasm && active === 'cpu') {
-    reason = wasmCompatible(config) ? 'wasm unavailable in this browser' : 'voronoi / mutation configs run on the TS engine';
+  if (wantWasm && active === 'cpu') {
+    const wasmWhy = wasmCompatible(config) ? 'wasm unavailable in this browser' : wasmBlockReason(config);
+    reason = reason ? `${reason}; ${wasmWhy}` : wasmWhy;
   }
   postBackend(active, reason);
   lastStats = null;
   lastLongTick = -1;
   postFrame();
+  resumeIfPlaying();
 }
 
 // ── CPU/WASM loop (synchronous stepping, tps-paced) ──────────────────────────
@@ -273,8 +309,30 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
       break;
     }
     case 'patchConfig': {
+      const cfg = m.config;
+      // Soft params can cross a backend's compatibility boundary (the 🧬
+      // mutate toggle is a patch): an engine that can't represent the patched
+      // config MUST be rebuilt — a wasm/gpu engine would otherwise keep
+      // running silently single-strain. The reverse crossing also rebuilds,
+      // so turning the blocker off restores the requested fast backend
+      // instead of leaving the sim stuck on CPU until the next reset.
+      const downgrade =
+        (gpu !== null && !gpuCompatible(cfg)) ||
+        (engine instanceof WasmEngine && !wasmCompatible(cfg));
+      const upgrade =
+        gpu === null &&
+        engine !== null &&
+        !(engine instanceof WasmEngine) &&
+        requestedBackend !== 'cpu' &&
+        currentConfig !== null &&
+        (requestedBackend === 'gpu'
+          ? gpuSupported() && gpuCompatible(cfg) && !gpuCompatible(currentConfig)
+          : wasmAvailable() && wasmCompatible(cfg) && !wasmCompatible(currentConfig));
+      if (downgrade || upgrade) {
+        rebuild(cfg);
+        break;
+      }
       if (gpu) {
-        const cfg = m.config;
         currentConfig = cfg;
         gpuChain = gpuChain
           .then(async () => {
@@ -286,10 +344,10 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
         break;
       }
       if (!engine) {
-        rebuild(m.config);
+        rebuild(cfg);
       } else {
-        currentConfig = m.config;
-        engine.patchConfig(m.config);
+        currentConfig = cfg;
+        engine.patchConfig(cfg);
         postFrame();
       }
       break;
@@ -340,8 +398,8 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
         break;
       }
       requestedBackend = m.backend;
-      // Backend switch is a structural change: rebuild (tick resets), paused.
-      playing = false;
+      // Backend switch is a structural change: rebuild (the run restarts from
+      // tick 0) but keep playing so the toggle feels alive.
       if (currentConfig) rebuild(currentConfig);
       break;
     }

@@ -41,6 +41,7 @@ export class App {
   // to the TS engine, just faster; the worker falls back automatically.
   private requestedBackend: EngineBackend = read<EngineBackend>('backend', 'wasm');
   private activeBackend: EngineBackend | null = null;
+  private backendReason: string | null = null;
   private themeBtn!: HTMLButtonElement;
   private shareBtn!: HTMLButtonElement;
   private shareMenu!: ShareMenu;
@@ -135,9 +136,17 @@ export class App {
         this.petri.setVoronoiTopology(msg.topo);
       } else if (msg.type === 'backend') {
         this.activeBackend = msg.active;
+        this.backendReason = msg.active !== msg.requested ? (msg.reason ?? null) : null;
         this.refreshEngineLabel();
+        // A backend message always accompanies an engine rebuild: the run is
+        // starting over, so epidemic-ended tracking must restart too —
+        // otherwise the placeholder frame (E+I = 0) posted right after the
+        // rebuild trips the auto-pause and freezes the fresh run at day 0.
+        this.epidemicStarted = false;
+        this.epidemicEnded = false;
+        this.hideEndedBanner();
         if (msg.reason && msg.active !== msg.requested) {
-          this.toast(`Engine: ${msg.active.toUpperCase()} (${msg.reason})`);
+          this.toast(`Engine fell back to ${msg.active.toUpperCase()}: ${msg.reason}`);
         }
       } else {
         this.onFrame(msg);
@@ -726,17 +735,17 @@ export class App {
   }
 
   private cycleBackend(): void {
+    // No pre-flight gating here: the worker is where the engine actually runs,
+    // so it makes the call and reports honest fallback reasons (an App-side
+    // requestAdapter probe proved flaky during early page load).
     const order: EngineBackend[] = ['wasm', 'gpu', 'cpu'];
-    const gpuAvailable = typeof navigator !== 'undefined' && 'gpu' in navigator;
-    let next = order[(order.indexOf(this.requestedBackend) + 1) % order.length];
-    if (next === 'gpu' && !gpuAvailable) next = 'cpu';
+    const next = order[(order.indexOf(this.requestedBackend) + 1) % order.length];
     this.requestedBackend = next;
     write('backend', next);
-    // The worker rebuilds (and pauses) on a backend switch.
-    this.playing = false;
-    this.refreshPlayLabel();
+    // The worker rebuilds in place (run restarts from day 0, keeps playing).
     this.send({ cmd: 'setBackend', backend: next });
-    this.toast(`Engine backend: ${next.toUpperCase()} — run reset`);
+    this.toast(`Engine backend → ${next.toUpperCase()} (run restarts from day 0)`);
+    this.refreshEngineLabel();
   }
 
   private refreshEngineLabel(): void {
@@ -744,8 +753,14 @@ export class App {
     const icon = shown === 'gpu' ? '⚡' : '⚙';
     this.engineBtn.textContent = `${icon} ${shown.toUpperCase()}`;
     this.engineBtn.classList.toggle('active', shown === 'gpu');
-    const pending = this.activeBackend !== null && this.activeBackend !== this.requestedBackend;
-    this.engineBtn.classList.toggle('fallback', pending);
+    const fellBack = this.activeBackend !== null && this.activeBackend !== this.requestedBackend;
+    this.engineBtn.classList.toggle('fallback', fellBack);
+    // Persistent explanation — a transient toast is easy to miss.
+    let tip = 'Engine backend — CPU: reference engine · WASM: identical results, faster · GPU: WebGPU compute (own random stream, huge grids). Switching restarts the run.';
+    if (fellBack) {
+      tip = `Requested ${this.requestedBackend.toUpperCase()}, running ${shown.toUpperCase()}${this.backendReason ? ` — ${this.backendReason}` : ''}. ${tip}`;
+    }
+    this.engineBtn.setAttribute('data-tip', tip);
   }
 
   private handlePlay(): void {
