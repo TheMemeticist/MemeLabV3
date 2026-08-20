@@ -11,7 +11,7 @@
 
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
-import type { SimConfig } from '../types';
+import type { InterventionParamName, SimConfig } from '../types';
 import { FitPool } from '../lib/fit-pool';
 import { Slider } from './Slider';
 import { read, remove, write } from '../lib/storage';
@@ -19,12 +19,13 @@ import {
   CATEGORY_LABELS,
   FIT_CATEGORIES,
   FIT_PARAMS,
-  effectiveReduction,
+  effectiveReductionAt,
   hasDownwardRevisions,
   parseObservedCSV,
   BAND_CENTRAL,
   EBOLA_ADJUST,
   EBOLA_INTERVENTIONS,
+  migrateInterventionSpecs,
   resolutionFitSize,
   revisionEnvelope,
   runFit,
@@ -518,21 +519,10 @@ export class R0Modal {
     if (Number.isFinite(s.bayesDraws)) this.bayesDraws = Math.min(500, Math.max(0, Math.round(s.bayesDraws!)));
     if (Number.isFinite(s.predictionDays)) this.predictionDays = Math.min(365, Math.max(0, Math.round(s.predictionDays!)));
     if (Array.isArray(s.interventions) && this.interventions.length === 0) {
-      // Migration: interventions used to live in this snapshot (and before
-      // that in a pre-shared shape). Seed the now-App-owned shared store once.
+      // Migration: interventions used to live in this snapshot (older shapes
+      // incl. the removed 'intensity' scalar). Seed the App-owned store once.
       const store = this.interventions;
-      for (const iv of s.interventions) {
-        const legacy = iv as unknown as { effect?: number; intensity?: { day: number; m: number }[] };
-        store.push({
-          id: iv.id,
-          intervention: iv.intervention ?? 'custom',
-          label: iv.label,
-          enabled: iv.enabled,
-          transmissionReduction: iv.transmissionReduction ?? legacy.effect ?? 0.3,
-          events: (iv.events ?? (legacy.intensity ?? []).map((f) => ({ tick: f.day, intensity: f.m })))
-            .map((f) => ({ ...f })),
-        });
-      }
+      store.push(...migrateInterventionSpecs(s.interventions));
       this.notifyInterventions();
     }
   }
@@ -751,8 +741,12 @@ export class R0Modal {
         label: `Intervention ${this.interventions.length + 1}`,
         enabled: true,
         transmissionReduction: 0.3,
-        // Sensible default: a 2-week ramp to full intensity starting mid-data.
-        events: [{ tick: Math.round(lastObs / 2), intensity: 0 }, { tick: Math.round(lastObs / 2) + 14, intensity: 1 }],
+        // Sensible default: keyframe the REAL param — transmission reduction
+        // ramps 0 → 30% over two weeks starting mid-data, then holds.
+        timeline: { transmissionReduction: [
+          { tick: Math.round(lastObs / 2), value: 0 },
+          { tick: Math.round(lastObs / 2) + 14, value: 0.3 },
+        ] },
       });
       const details = this.el?.querySelector<HTMLDetailsElement>('[data-r0="itv-details"]');
       if (details) details.open = true;
@@ -918,59 +912,25 @@ export class R0Modal {
     }
   }
 
-  /** Keyframe click-through: this keyframe's intensity as a Slider (the rich
-   *  per-type controls live on the card itself now). */
-  private openItvSliders(
-    card: HTMLElement,
-    iv: InterventionSpec,
-    frame: { tick: number; intensity: number },
-    persist: () => void,
-  ): void {
-    const existing = card.querySelector('.r0-itv-sliders');
-    if (existing) { existing.remove(); return; } // toggle closed
-    const host = document.createElement('div');
-    host.className = 'r0-itv-sliders';
-    const intensitySlider = new Slider({
-      id: `itv-int-${iv.id}-${frame.tick}`,
-      label: `Intensity @ day ${frame.tick}`,
-      min: 0, max: 100, step: 5,
-      value: Math.round(frame.intensity * 100),
-      unit: '%',
-      hint: 'Coverage/strength of the intervention at this keyframe day. Holds past the last keyframe (interventions persist indefinitely unless a later keyframe sets 0).',
-      onChange: (v) => {
-        frame.intensity = Math.min(1, Math.max(0, v / 100));
-        persist();
-        card.querySelectorAll<HTMLInputElement>('[data-kf="m"]').forEach((inp) => {
-          if (Number(inp.closest('.r0-adjust-row')?.querySelector<HTMLInputElement>('[data-kf="day"]')?.value) === frame.tick) {
-            inp.value = String(Math.round(frame.intensity * 100));
-          }
-        });
-      },
-    });
-    host.appendChild(intensitySlider.el);
-    card.appendChild(host);
-  }
-
   /** Active interventions' ramp windows (first → last intensity keyframe) in
    *  chart-day coordinates (data day + the given offset shift). */
   private itvWindows(offset: number): { from: number; to: number; label: string }[] {
     return this.interventions
-      .filter((iv) => iv.enabled && effectiveReduction(iv) > 0 && iv.events.length > 0)
+      .filter((iv) => iv.enabled && iv.timeline && Object.values(iv.timeline).some((t) => t && t.length > 0))
       .map((iv) => {
-        const days = iv.events.map((f) => f.tick);
-        return { from: Math.min(...days) + offset, to: Math.max(...days) + offset, label: iv.label };
-      });
+        const ticks = Object.values(iv.timeline!).flatMap((t) => (t ?? []).map((f) => f.tick));
+        return { from: Math.min(...ticks) + offset, to: Math.max(...ticks) + offset, label: iv.label };
+      })
+      .filter((w) => Number.isFinite(w.from));
   }
 
-  /** Interventions editor: the SAME rich controls as the main sim's
-   *  Interventions panel — per-taxonomy Slider stacks (mask/vaccine: Rate /
-   *  Protection / Source control / Mortality reduction; lockdown: Mobility /
-   *  Transmission reduction / Compliance; quarantine: Detection rate /
-   *  Close-contacts range / Protection / Source control / Duration), plus the
-   *  fit's time dimension (the intensity ramp). Everything edits the shared
-   *  store objects directly. Param-less typed specs (e.g. the calibrated
-   *  Ebola presets) keep their flat strength until the user opts into the
-   *  full controls, so preset calibration is never silently overwritten. */
+  /** Interventions editor — the SAME rich controls as the main sim's
+   *  Interventions panel, 1:1 per type (same Slider component, labels and
+   *  ranges), ALWAYS rendered (typed specs without params are seeded from the
+   *  live sim config on sight). The time dimension is KEYFRAMING THE REAL
+   *  PARAMS: every rendered param has a ⏱ track editor of (day, value)
+   *  keyframes — linear between keyframes, held at the ends. There is no
+   *  separate "intensity" scalar. Everything edits the shared store objects. */
   private renderInterventions(): void {
     const host = this.el?.querySelector<HTMLElement>('[data-r0="itv-list"]');
     const count = this.el?.querySelector<HTMLElement>('[data-r0="itv-count"]');
@@ -987,6 +947,8 @@ export class R0Modal {
       return;
     }
     this.interventions.forEach((iv, idx) => {
+      // Typed specs must always show the full main-sim controls.
+      if (iv.intervention !== 'custom' && !iv.params) this.seedParams(iv);
       const card = document.createElement('div');
       card.className = 'r0-itv';
       card.innerHTML = `
@@ -995,26 +957,25 @@ export class R0Modal {
             <input type="checkbox" data-iv="on" ${iv.enabled ? 'checked' : ''} />
           </label>
           <input class="r0-in r0-itv-name" type="text" value="${iv.label.replace(/"/g, '&quot;')}" data-iv="label" aria-label="Intervention name" />
-          <select class="r0-in" data-iv="tax" title="The live sim's intervention taxonomy — selecting a type seeds the SAME rich controls the main sim uses (from the current sim config) and main-sim toggles of this key sync the enabled state.">
+          <select class="r0-in" data-iv="tax" title="The live sim's intervention taxonomy — selecting a type seeds the SAME rich controls the main sim uses (from the current sim config); main-sim toggles of this key sync the enabled state.">
             ${['custom', 'mask', 'vaccine', 'lockdown', 'quarantine']
               .map((k) => `<option value="${k}"${iv.intervention === k ? ' selected' : ''}>${k}</option>`).join('')}
           </select>
-          <span class="r0-itv-eff r0-muted" data-iv="eff" title="Derived max transmission reduction at full intensity — what the model applies: R(t) = R0 × (1 − this × intensity(t))."></span>
+          <span class="r0-itv-eff r0-muted" data-iv="eff" title="Derived max transmission reduction at the timeline's end state — what the model applies: R(t) = R0 × (1 − effectiveReduction(paramsAt(t)))."></span>
           <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">×</button>
         </div>
         <div class="r0-itv-params" data-iv="params"></div>
-        <div class="r0-itv-frames" data-iv="frames"></div>
       `;
       const persist = (): void => { this.notifyInterventions(); };
       const effBadge = card.querySelector<HTMLElement>('[data-iv="eff"]')!;
       const refreshEff = (): void => {
-        effBadge.textContent = `−${Math.round(effectiveReduction(iv) * 100)}% transmission`;
+        effBadge.textContent = `−${Math.round(effectiveReductionAt(iv, Number.MAX_SAFE_INTEGER) * 100)}% transmission (end state)`;
       };
       refreshEff();
       card.querySelector<HTMLInputElement>('[data-iv="on"]')!.addEventListener('change', (e) => {
         iv.enabled = (e.target as HTMLInputElement).checked;
         persist();
-        this.renderInterventions(); // refresh the active count
+        this.renderInterventions();
       });
       card.querySelector<HTMLInputElement>('[data-iv="label"]')!.addEventListener('change', (e) => {
         iv.label = (e.target as HTMLInputElement).value || 'Intervention';
@@ -1022,7 +983,7 @@ export class R0Modal {
       });
       card.querySelector<HTMLSelectElement>('[data-iv="tax"]')!.addEventListener('change', (e) => {
         iv.intervention = (e.target as HTMLSelectElement).value as InterventionSpec['intervention'];
-        this.seedParams(iv); // seed the rich fields from the live sim config
+        this.seedParams(iv);
         persist();
         this.renderInterventions();
       });
@@ -1032,104 +993,113 @@ export class R0Modal {
         this.renderInterventions();
       });
 
-      // ── Rich per-type controls (the main sim's own Slider component) ──
+      // ── One row per REAL param: the main sim's Slider + a ⏱ keyframe track ──
       const paramsHost = card.querySelector<HTMLElement>('[data-iv="params"]')!;
-      const pctSlider = (idSuffix: string, label: string, get: () => number, set: (frac: number) => void, hint?: string): void => {
-        paramsHost.appendChild(new Slider({
-          id: `r0-${iv.id}-${idSuffix}`, label, min: 0, max: 100, step: 1, unit: '%',
-          value: Math.round(get() * 100), hint,
-          onChange: (v) => { set(Math.min(1, Math.max(0, v / 100))); refreshEff(); persist(); },
-        }).el);
-      };
-      const rawSlider = (idSuffix: string, label: string, min: number, max: number, unit: '' | 'days' | 'tiles', get: () => number, set: (v: number) => void, hint?: string): void => {
-        paramsHost.appendChild(new Slider({
-          id: `r0-${iv.id}-${idSuffix}`, label, min, max, step: 1, unit,
-          value: get(), hint,
-          onChange: (v) => { set(v); refreshEff(); persist(); },
-        }).el);
-      };
-      const p = iv.params;
-      if (iv.intervention !== 'custom' && !p) {
-        // Calibrated flat-strength spec (e.g. the Ebola presets): keep the
-        // single dial until the user opts into the full typed controls.
-        pctSlider('flat', 'Transmission reduction', () => iv.transmissionReduction, (f) => { iv.transmissionReduction = Math.min(0.95, f); },
-          'Calibrated flat strength. Use the button below to switch to the full main-sim controls for this type (seeded from the current sim config).');
-        const useFull = document.createElement('button');
-        useFull.className = 'btn ghost';
-        useFull.type = 'button';
-        useFull.textContent = `use full ${iv.intervention} controls`;
-        useFull.addEventListener('click', () => {
-          this.seedParams(iv);
-          persist();
-          this.renderInterventions();
-        });
-        paramsHost.appendChild(useFull);
-      } else if (p && (iv.intervention === 'mask' || iv.intervention === 'vaccine')) {
-        pctSlider('rate', 'Rate', () => p.uptake ?? 0, (f) => { p.uptake = f; }, 'Population uptake — same control as the main sim.');
-        pctSlider('prot', 'Protection', () => p.protection ?? 0, (f) => { p.protection = f; }, 'Reduces incoming attack success against the wearer.');
-        pctSlider('src', 'Source control', () => p.sourceControl ?? 0, (f) => { p.sourceControl = f; }, 'Reduces outgoing attack success from the wearer.');
-        pctSlider('mort', 'Mortality reduction', () => p.mortalityReduction ?? 0, (f) => { p.mortalityReduction = f; }, 'Reduces IFR if infected — affects deaths in the live sim; not part of the fitted R(t).');
-      } else if (p && iv.intervention === 'lockdown') {
-        pctSlider('mob', 'Mobility reduction', () => p.mobilityReduction ?? 0, (f) => { p.mobilityReduction = f; }, 'Probabilistically skips neighbor visits for compliant cells.');
-        pctSlider('trans', 'Transmission reduction', () => iv.transmissionReduction, (f) => { iv.transmissionReduction = f; }, 'Global multiplicative reduction on transmission.');
-        pctSlider('comp', 'Compliance', () => p.compliance ?? 0, (f) => { p.compliance = f; }, 'Per-cell adherence to the lockdown.');
-      } else if (p && iv.intervention === 'quarantine') {
-        pctSlider('rate', 'Detection rate', () => p.detectionRate ?? 0, (f) => { p.detectionRate = f; }, 'Per-tick probability an infectious cell is detected.');
-        rawSlider('range', 'Close-contacts range', 1, 5, 'tiles', () => p.contactsRange ?? 1, (v) => { p.contactsRange = v; }, 'Radius of contacts isolated with a detected case (live-sim spatial dynamics; not in the fitted rate).');
-        pctSlider('prot', 'Protection', () => p.protection ?? 0, (f) => { p.protection = f; }, 'Reduces transmission INTO quarantined cells.');
-        pctSlider('src', 'Source control', () => p.sourceControl ?? 0, (f) => { p.sourceControl = f; }, 'Reduces transmission FROM quarantined cells.');
-        rawSlider('dur', 'Duration', 1, 60, 'days', () => p.duration ?? 14, (v) => { p.duration = v; }, 'Quarantine persistence (live-sim dynamics; not in the fitted rate).');
-      } else {
-        pctSlider('flat', 'Transmission reduction', () => iv.transmissionReduction, (f) => { iv.transmissionReduction = Math.min(0.95, f); },
-          'Max multiplicative cut to transmission at full (100%) intensity.');
-      }
-
-      // ── Intensity ramp (the fit's time dimension; main sim has no ramps) ──
-      const framesHost = card.querySelector<HTMLElement>('[data-iv="frames"]')!;
-      const frames = iv.events.slice().sort((a, b) => a.tick - b.tick);
-      iv.events = frames;
-      frames.forEach((f, fi) => {
+      const addParam = (
+        key: InterventionParamName,
+        label: string,
+        min: number,
+        max: number,
+        unit: '%' | 'days' | 'tiles',
+        get: () => number,
+        set: (v: number) => void,
+        hint?: string,
+      ): void => {
+        const pct = unit === '%';
         const row = document.createElement('div');
-        row.className = 'r0-adjust-row';
-        row.innerHTML = `
-          <label>day <input class="r0-in tiny" type="number" step="1" value="${f.tick}" data-kf="day" aria-label="${iv.label} ramp day" /></label>
-          <label>intensity <input class="r0-in tiny" type="number" min="0" max="100" step="5" value="${Math.round(f.intensity * 100)}" data-kf="m" aria-label="${iv.label} intensity %" />%</label>
-          <button class="r0-del" type="button" aria-label="Delete ramp point" ${frames.length <= 1 ? 'disabled' : ''}>×</button>
-        `;
-        row.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
-          f.tick = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
-          persist();
+        row.className = 'r0-itv-param';
+        const slider = new Slider({
+          id: `r0-${iv.id}-${key}`, label, min, max, step: 1, unit,
+          value: pct ? Math.round(get() * 100) : get(),
+          hint: (hint ? `${hint} ` : '') + 'Keyframes (⏱) override this dial over time.',
+          onChange: (v) => { set(pct ? Math.min(1, Math.max(0, v / 100)) : v); refreshEff(); persist(); },
         });
-        row.querySelector<HTMLInputElement>('[data-kf="m"]')!.addEventListener('change', (e) => {
-          const v = Number((e.target as HTMLInputElement).value);
-          f.intensity = Number.isFinite(v) ? Math.min(1, Math.max(0, v / 100)) : 0;
-          (e.target as HTMLInputElement).value = String(Math.round(f.intensity * 100));
-          persist();
+        row.appendChild(slider.el);
+        const track = iv.timeline?.[key];
+        const kfBtn = document.createElement('button');
+        kfBtn.type = 'button';
+        kfBtn.className = `r0-kf-btn${track?.length ? ' active' : ''}`;
+        kfBtn.title = `Keyframe "${label}" over time: (day, value) points, linear between, HELD at the ends — interventions persist indefinitely unless keyframed down.`;
+        kfBtn.textContent = `⏱${track?.length ? ` ${track.length}` : ''}`;
+        const editor = document.createElement('div');
+        editor.className = 'r0-kf-editor';
+        editor.hidden = !(track?.length);
+        const renderTrack = (): void => {
+          editor.innerHTML = '';
+          const t = iv.timeline?.[key] ?? [];
+          t.sort((a, b) => a.tick - b.tick);
+          t.forEach((f, fi) => {
+            const kfRow = document.createElement('div');
+            kfRow.className = 'r0-adjust-row';
+            kfRow.innerHTML = `
+              <label>day <input class="r0-in tiny" type="number" step="1" value="${f.tick}" data-kf="day" aria-label="${label} keyframe day" /></label>
+              <label>${label} <input class="r0-in tiny" type="number" step="${pct ? 5 : 1}" value="${pct ? Math.round(f.value * 100) : f.value}" data-kf="val" aria-label="${label} keyframe value" />${pct ? '%' : ` ${unit}`}</label>
+              <button class="r0-del" type="button" aria-label="Delete keyframe">×</button>
+            `;
+            kfRow.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
+              f.tick = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
+              refreshEff(); persist();
+            });
+            kfRow.querySelector<HTMLInputElement>('[data-kf="val"]')!.addEventListener('change', (e) => {
+              const raw = Number((e.target as HTMLInputElement).value);
+              f.value = pct ? Math.min(1, Math.max(0, (raw || 0) / 100)) : Math.max(0, raw || 0);
+              refreshEff(); persist();
+            });
+            kfRow.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
+              t.splice(fi, 1);
+              if (t.length === 0 && iv.timeline) delete iv.timeline[key];
+              refreshEff(); persist(); renderTrack();
+              kfBtn.textContent = `⏱${t.length ? ` ${t.length}` : ''}`;
+              kfBtn.classList.toggle('active', t.length > 0);
+            });
+            editor.appendChild(kfRow);
+          });
+          const addKf = document.createElement('button');
+          addKf.className = 'btn ghost';
+          addKf.type = 'button';
+          addKf.textContent = '+ keyframe';
+          addKf.addEventListener('click', () => {
+            if (!iv.timeline) iv.timeline = {};
+            if (!iv.timeline[key]) iv.timeline[key] = [];
+            const tt = iv.timeline[key]!;
+            const last = tt[tt.length - 1];
+            tt.push({ tick: (last?.tick ?? 0) + 14, value: last?.value ?? get() });
+            refreshEff(); persist(); renderTrack();
+            kfBtn.textContent = `⏱ ${tt.length}`;
+            kfBtn.classList.add('active');
+          });
+          editor.appendChild(addKf);
+        };
+        kfBtn.addEventListener('click', () => {
+          editor.hidden = !editor.hidden;
+          if (!editor.hidden) renderTrack();
         });
-        row.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
-          frames.splice(fi, 1);
-          persist();
-          this.renderInterventions();
-        });
-        // Clicking a keyframe row opens this keyframe's intensity as a slider.
-        row.addEventListener('click', (ev) => {
-          const t = ev.target as HTMLElement;
-          if (t.closest('input') || t.closest('button')) return;
-          this.openItvSliders(card, iv, f, persist);
-        });
-        framesHost.appendChild(row);
-      });
-      const add = document.createElement('button');
-      add.className = 'btn ghost';
-      add.type = 'button';
-      add.textContent = '+ ramp point';
-      add.addEventListener('click', () => {
-        const last = frames[frames.length - 1];
-        frames.push({ tick: (last?.tick ?? 0) + 14, intensity: last?.intensity ?? 1 });
-        persist();
-        this.renderInterventions();
-      });
-      framesHost.appendChild(add);
+        if (!editor.hidden) renderTrack();
+        row.appendChild(kfBtn);
+        row.appendChild(editor);
+        paramsHost.appendChild(row);
+      };
+
+      const p = iv.params;
+      if (p && (iv.intervention === 'mask' || iv.intervention === 'vaccine')) {
+        addParam('uptake', 'Rate', 0, 100, '%', () => p.uptake ?? 0, (v) => { p.uptake = v; }, 'Population uptake — same control as the main sim.');
+        addParam('protection', 'Protection', 0, 100, '%', () => p.protection ?? 0, (v) => { p.protection = v; }, 'Reduces incoming attack success against the wearer.');
+        addParam('sourceControl', 'Source control', 0, 100, '%', () => p.sourceControl ?? 0, (v) => { p.sourceControl = v; }, 'Reduces outgoing attack success from the wearer.');
+        addParam('mortalityReduction', 'Mortality reduction', 0, 100, '%', () => p.mortalityReduction ?? 0, (v) => { p.mortalityReduction = v; }, 'Reduces IFR if infected — deaths in the live sim; not part of the fitted R(t).');
+      } else if (p && iv.intervention === 'lockdown') {
+        addParam('mobilityReduction', 'Mobility reduction', 0, 100, '%', () => p.mobilityReduction ?? 0, (v) => { p.mobilityReduction = v; }, 'Probabilistically skips neighbor visits for compliant cells.');
+        addParam('transmissionReduction', 'Transmission reduction', 0, 100, '%', () => iv.transmissionReduction, (v) => { iv.transmissionReduction = v; }, 'Global multiplicative reduction on transmission.');
+        addParam('compliance', 'Compliance', 0, 100, '%', () => p.compliance ?? 0, (v) => { p.compliance = v; }, 'Per-cell adherence to the lockdown.');
+      } else if (p && iv.intervention === 'quarantine') {
+        addParam('detectionRate', 'Detection rate', 0, 100, '%', () => p.detectionRate ?? 0, (v) => { p.detectionRate = v; }, 'Per-tick probability an infectious cell is detected.');
+        addParam('contactsRange', 'Close-contacts range', 1, 5, 'tiles', () => p.contactsRange ?? 1, (v) => { p.contactsRange = v; }, 'Radius of contacts isolated with a detected case (live-sim spatial dynamics; not in the fitted rate).');
+        addParam('protection', 'Protection', 0, 100, '%', () => p.protection ?? 0, (v) => { p.protection = v; }, 'Reduces transmission INTO quarantined cells.');
+        addParam('sourceControl', 'Source control', 0, 100, '%', () => p.sourceControl ?? 0, (v) => { p.sourceControl = v; }, 'Reduces transmission FROM quarantined cells.');
+        addParam('duration', 'Duration', 1, 60, 'days', () => p.duration ?? 14, (v) => { p.duration = v; }, 'Quarantine persistence (live-sim dynamics; not in the fitted rate).');
+      } else {
+        addParam('transmissionReduction', 'Transmission reduction', 0, 95, '%', () => iv.transmissionReduction, (v) => { iv.transmissionReduction = Math.min(0.95, v); },
+          'Max multiplicative cut to transmission.');
+      }
       host.appendChild(card);
     });
   }
@@ -1592,7 +1562,15 @@ export class R0Modal {
     this.renderAdjust();
     const store = this.interventions; // shared with the main sim — replace contents
     store.length = 0;
-    for (const iv of p.interventions ?? []) store.push({ ...iv, events: iv.events.map((f) => ({ ...f })) });
+    for (const iv of p.interventions ?? []) {
+      store.push({
+        ...iv,
+        params: iv.params ? { ...iv.params } : undefined,
+        timeline: iv.timeline
+          ? Object.fromEntries(Object.entries(iv.timeline).map(([k, t]) => [k, (t ?? []).map((f) => ({ ...f }))]))
+          : undefined,
+      });
+    }
     this.notifyInterventions();
     this.renderInterventions();
     this.result = null;
@@ -2292,12 +2270,16 @@ const TEMPLATE = `
     <details class="r0-details" data-r0="itv-details">
       <summary>Interventions — time-varying transmission R(t) · <span class="r0-muted" data-r0="itv-count"></span></summary>
       <p class="r0-blurb">Public-health interventions reduce the <b>MODEL's</b> transmission over time:
-        R(t) = R₀ × Π (1 − effect × intensity(t)), applied per day inside every simulation the fit runs.
-        Each intervention has a max effect and an intensity ramp (keyframes over data days, linearly
-        interpolated, clamped — days before day 0 or beyond the data are fine). This is separate from the
-        <i>case/death adjustment</i> in section 1, which corrects the reported DATA for under-ascertainment
-        and never changes the model. Ramp windows are shaded on the chart. Deterministic; note that
-        "Apply to simulation" carries the fitted genes but not these schedules.</p>
+        R(t) = R₀ × Π (1 − effectiveReduction(params at day t)), applied per day inside every simulation
+        the fit runs. Each intervention carries the SAME parameters as the main sim's controls
+        (mask/vaccine: Rate, Protection, Source control, Mortality reduction; lockdown: Mobility,
+        Transmission reduction, Compliance; quarantine: Detection rate, Contacts range, Protection,
+        Source control, Duration), and any parameter can be KEYFRAMED over time (⏱: day → value points,
+        linear between, held at the ends — interventions persist indefinitely unless keyframed down;
+        days before day 0 or beyond the data are fine). This is separate from the <i>case/death
+        adjustment</i> in section 1, which corrects the reported DATA for under-ascertainment and never
+        changes the model. Keyframe windows are shaded on the chart. Deterministic; "Apply to simulation"
+        carries the fitted genes but not these schedules.</p>
       <div data-r0="itv-list"></div>
       <div class="r0-actions">
         <button class="btn ghost" type="button" data-r0="itv-add">+ Add intervention</button>

@@ -22,7 +22,7 @@
 // loss re-scores cached curves without re-simulating (same "pure derived
 // overlay" discipline as the cost layer).
 
-import type { GeometryType, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, StrainGenes } from '../types';
+import type { GeometryType, InterventionEvent, InterventionKey, InterventionParamName, InterventionSpec, InterventionTimelinePoint, SimConfig, StrainGenes } from '../types';
 import { makeGeometry, torus } from '../sim/neighbors';
 import { Rng } from '../sim/rng';
 import { runGA } from './ga';
@@ -1359,88 +1359,30 @@ export function vintagedAdjust(
 // correct the reported DATA for under-ascertainment and never touch the model.
 
 // The intervention shape is SHARED with the live simulation — see
-// InterventionSpec in types.ts (DefenseSpec-style id/label/enabled, the live
-// sim's InterventionKey taxonomy, LockdownSpec's transmissionReduction, and a
-// timeline that generalizes InterventionEvent's binary on/off to fractional
-// intensity). Re-exported here so fit consumers have one import surface.
+// InterventionSpec in types.ts. Time variation is expressed by KEYFRAMING THE
+// REAL PARAMS (per-param {tick, value} tracks, linearly interpolated, HELD at
+// the ends); there is no separate "intensity" scalar — time variation IS the
+// params varying. The model consumes the keyframed params:
+// R(t) = R₀ × Π(1 − effectiveReduction(paramsAt(t))).
 export type { InterventionSpec } from '../types';
 
-/** Intensity of one intervention at a (data-day) tick: linear interpolation
- *  over its timeline events, clamped outside the first/last, result in [0,1]. */
-export function intensityAt(events: { tick: number; intensity: number }[], tick: number): number {
-  return clamp(multiplierAt(events.map((e) => ({ day: e.tick, m: e.intensity })), tick), 0, 1);
+/** Value of one keyframe track at a (data-day) tick: linear interpolation,
+ *  clamped/HELD outside the first/last keyframe — interventions persist
+ *  indefinitely unless a later keyframe sets the value down. */
+export function valueAt(track: InterventionTimelinePoint[], tick: number): number {
+  return multiplierAt(track.map((e) => ({ day: e.tick, m: e.value })), tick);
 }
 
-/** Convert the live sim's binary InterventionEvent timeline into the shared
- *  spec: on → intensity 1, off → intensity 0 (step-like ramps come out of
- *  adjacent events). `transmissionReduction` must be supplied — the live sim
- *  keeps strengths in its spec objects (DefenseSpec/LockdownSpec), not on the
- *  events. */
-export function specFromEvents(
-  key: InterventionKey,
-  events: InterventionEvent[],
-  transmissionReduction: number,
-  label?: string,
-): InterventionSpec {
-  // Binary toggles are STEPS, but the shared timeline interpolates linearly and
-  // clamps to its end values — so emit hold-points that pin the previous value
-  // until the day before each change (a faithful 1-day transition), and a zero
-  // point before the first toggle-ON so pre-history is off, not clamped-on.
-  const sorted = events.slice().sort((a, b) => a.tick - b.tick);
-  const pts: { tick: number; intensity: number }[] = [];
-  let prev = 0;
-  for (const e of sorted) {
-    const v = e.on ? 1 : 0;
-    if (pts.length === 0) {
-      if (v > 0) pts.push({ tick: e.tick - 1, intensity: 0 });
-    } else if (v !== prev && e.tick - 1 > pts[pts.length - 1].tick) {
-      pts.push({ tick: e.tick - 1, intensity: prev });
-    }
-    pts.push({ tick: e.tick, intensity: v });
-    prev = v;
-  }
-  return {
-    id: key,
-    intervention: key,
-    label: label ?? sorted.find((e) => e.label)?.label ?? key,
-    enabled: true,
-    transmissionReduction: clamp(transmissionReduction, 0, 0.95),
-    events: pts,
-  };
-}
-
-/** Crossover sync: a main-sim intervention toggle (mask/vaccine/lockdown/
- *  quarantine on/off) flips `enabled` on every shared-store spec of that
- *  taxonomy, so the live sim and the fit modal act on the SAME objects.
- *  Returns true when anything changed (callers persist + refresh then). */
-export function syncSpecsWithToggle(
-  specs: InterventionSpec[],
-  key: InterventionKey,
-  on: boolean,
-): boolean {
-  let changed = false;
-  for (const iv of specs) {
-    if (iv.intervention === key && iv.enabled !== on) {
-      iv.enabled = on;
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-/** The intervention's effective max transmission reduction. Typed specs with
- *  rich `params` derive it the way the live engine composes the same fields —
- *  the model honors the FULL spec, not just a flat number:
- *  - mask/vaccine (DefenseSpec): wearers (uptake u) cut incoming success by
- *    `protection` and outgoing by `sourceControl` → population multiplier
- *    ≈ (1 − u·prot)(1 − u·src); mortalityReduction affects deaths, not R(t).
- *  - lockdown (LockdownSpec): global transmission cut × skipped visits →
- *    (1 − transmissionReduction)(1 − mobilityReduction·compliance).
- *  - quarantine (QuarantineSpec): detected infectious (detectionRate) emit at
- *    (1 − sourceControl) → reduction ≈ detectionRate·sourceControl (steady-
- *    state approximation; contactsRange/duration/protection shape the live
- *    sim's spatial dynamics but not this population-level rate).
- *  Param-less specs (custom + calibrated presets) use the flat value. */
+/** The intervention's effective max transmission reduction from its (resolved)
+ *  params — the model honors the FULL spec, composing fields the way the live
+ *  engine does:
+ *  - mask/vaccine (DefenseSpec): (1 − uptake·protection)(1 − uptake·sourceControl);
+ *    mortalityReduction affects deaths, not R(t).
+ *  - lockdown (LockdownSpec): (1 − transmissionReduction)(1 − mobility·compliance).
+ *  - quarantine (QuarantineSpec): detectionRate·sourceControl (steady-state
+ *    approximation; contactsRange/duration/protection shape live-sim spatial
+ *    dynamics, not this population-level rate).
+ *  Param-less specs ('custom') use the flat transmissionReduction. */
 export function effectiveReduction(iv: InterventionSpec): number {
   const p = iv.params;
   if (!p) return clamp(iv.transmissionReduction, 0, 0.95);
@@ -1464,81 +1406,198 @@ export function effectiveReduction(iv: InterventionSpec): number {
   }
 }
 
+/** The spec with every keyframed param resolved at data day `tick` (untracked
+ *  params keep their base values). Pure; feeds effectiveReduction. */
+export function specAtDay(iv: InterventionSpec, tick: number): InterventionSpec {
+  const tl = iv.timeline;
+  if (!tl) return iv;
+  const out: InterventionSpec = { ...iv, params: iv.params ? { ...iv.params } : undefined };
+  for (const key of Object.keys(tl) as InterventionParamName[]) {
+    const track = tl[key];
+    if (!track || track.length === 0) continue;
+    const v = valueAt(track, tick);
+    if (key === 'transmissionReduction') out.transmissionReduction = v;
+    else {
+      if (!out.params) out.params = {};
+      out.params[key] = v;
+    }
+  }
+  return out;
+}
+
+/** Effective max transmission reduction at data day `tick`, honoring the FULL
+ *  keyframed spec. */
+export function effectiveReductionAt(iv: InterventionSpec, tick: number): number {
+  return effectiveReduction(specAtDay(iv, tick));
+}
+
+/** Convert the live sim's binary InterventionEvent timeline into the shared
+ *  spec: toggles become a transmissionReduction keyframe track (on → the given
+ *  strength, off → 0) with step-preserving hold-points, so pre-history is off
+ *  and on-windows hold full value under the linear interpolation. */
+export function specFromEvents(
+  key: InterventionKey,
+  events: InterventionEvent[],
+  transmissionReduction: number,
+  label?: string,
+): InterventionSpec {
+  const tr = clamp(transmissionReduction, 0, 0.95);
+  const sorted = events.slice().sort((a, b) => a.tick - b.tick);
+  const pts: InterventionTimelinePoint[] = [];
+  let prev = 0;
+  for (const e of sorted) {
+    const v = e.on ? tr : 0;
+    if (pts.length === 0) {
+      if (v > 0) pts.push({ tick: e.tick - 1, value: 0 });
+    } else if (v !== prev && e.tick - 1 > pts[pts.length - 1].tick) {
+      pts.push({ tick: e.tick - 1, value: prev });
+    }
+    pts.push({ tick: e.tick, value: v });
+    prev = v;
+  }
+  return {
+    id: key,
+    intervention: key,
+    label: label ?? sorted.find((e) => e.label)?.label ?? key,
+    enabled: true,
+    transmissionReduction: tr,
+    timeline: { transmissionReduction: pts },
+  };
+}
+
+/** Migrate persisted interventions from earlier shapes — v1 {effect,
+ *  intensity:[{day,m}]} and v2 {events:[{tick,intensity}]} — onto keyframed
+ *  real params: the old whole-intervention intensity ramp becomes a
+ *  transmissionReduction track scaled by the flat strength, which is
+ *  schedule-equivalent by construction (old eff(t) = flat·intensity(t)).
+ *  Param-less typed legacy specs are retagged 'custom': a flat strength +
+ *  ramp IS the custom parameterization; re-typing in the UI seeds the full
+ *  controls. */
+export function migrateInterventionSpecs(list: unknown[]): InterventionSpec[] {
+  return (list as Array<InterventionSpec & {
+    effect?: number;
+    intensity?: { day: number; m: number }[];
+    events?: { tick: number; intensity: number }[];
+  }>).map((iv) => {
+    const tr = clamp(iv.transmissionReduction ?? iv.effect ?? 0.3, 0, 0.95);
+    const out: InterventionSpec = {
+      id: iv.id,
+      intervention: iv.intervention ?? 'custom',
+      label: iv.label,
+      enabled: iv.enabled,
+      transmissionReduction: tr,
+      params: iv.params ? { ...iv.params } : undefined,
+      timeline: iv.timeline
+        ? Object.fromEntries(Object.entries(iv.timeline).map(([k, t]) => [k, (t ?? []).map((f) => ({ ...f }))]))
+        : undefined,
+    };
+    const legacyRamp = iv.events ?? iv.intensity?.map((f) => ({ tick: f.day, intensity: f.m }));
+    if (!out.timeline && legacyRamp?.length) {
+      out.timeline = {
+        transmissionReduction: legacyRamp.map((f) => ({ tick: f.tick, value: clamp(f.intensity, 0, 1) * tr })),
+      };
+      if (!out.params && out.intervention !== 'custom') out.intervention = 'custom';
+    }
+    return out;
+  });
+}
+
+/** Crossover sync: a main-sim intervention toggle (mask/vaccine/lockdown/
+ *  quarantine on/off) flips `enabled` on every shared-store spec of that
+ *  taxonomy, so the live sim and the fit modal act on the SAME objects.
+ *  Returns true when anything changed (callers persist + refresh then). */
+export function syncSpecsWithToggle(
+  specs: InterventionSpec[],
+  key: InterventionKey,
+  on: boolean,
+): boolean {
+  let changed = false;
+  for (const iv of specs) {
+    if (iv.intervention === key && iv.enabled !== on) {
+      iv.enabled = on;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 /** Per-model-tick transmission multiplier for the engine: tick t maps to data
- *  day t − offsetDays (the index-date offset shifts the DATA later, so the
- *  model leads it). Undefined when nothing is active — callers can skip the
- *  scheduled path entirely, keeping unscheduled runs bit-identical. */
+ *  day t − offsetDays. Undefined when nothing is active (or every day is a
+ *  no-op) — callers skip the scheduled path, keeping unscheduled runs
+ *  bit-identical. */
 export function transmissionSchedule(
   interventions: InterventionSpec[],
   len: number,
   offsetDays = 0,
 ): number[] | undefined {
-  const active = interventions
-    .map((iv) => ({ iv, eff: effectiveReduction(iv) }))
-    .filter(({ iv, eff }) => iv.enabled && eff > 0 && iv.events.length > 0);
+  const active = interventions.filter((iv) => iv.enabled);
   if (active.length === 0) return undefined;
   const out = new Array<number>(len);
+  let any = false;
   for (let t = 0; t < len; t++) {
     const d = t - offsetDays;
     let f = 1;
-    for (const { iv, eff } of active) {
-      f *= 1 - eff * intensityAt(iv.events, d);
+    for (const iv of active) {
+      f *= 1 - effectiveReductionAt(iv, d);
     }
     out[t] = f;
+    if (f !== 1) any = true;
   }
-  return out;
+  return any ? out : undefined;
 }
 
 /** Default interventions for the current-outbreak Ebola presets, grounded in
  *  the REAL 2014 West Africa response mapped onto this dataset's day axis
- *  (day 0 = the May 18 declaration; the data spans ~96 days → mid-August).
- *  Real anchors: MSF's Kailahun treatment centre opened late June (~day 38);
- *  Sierra Leone's state of emergency was declared 31 July (day 74) with
- *  militarily enforced quarantines from 4–6 August (days 78–80); the WHO
- *  declared a PHEIC on 8 August (day 82); regional airlines began suspending
- *  flights from late July (~day 72); MSF's ELWA-3 centre in Monrovia opened
- *  17 August (day 91). Sources: WHO Disease Outbreak News (4 Aug 2014), WHO
- *  PHEIC statement (8 Aug 2014), CDC MMWR 2016 (65/Su-3) response summary.
- *  EFFECT SIZES AND COVERAGE RAMPS ARE REASONED ESTIMATES (burial practices
- *  drove a large transmission share; early tracing coverage was low) — edit
- *  freely. Ring vaccination ships DISABLED: the rVSV-ZEBOV ring trial only
- *  began in March 2015 (~day 300), outside this dataset's window. */
+ *  (day 0 = the May 18 declaration): MSF's Kailahun ETC opened late June
+ *  (~day 38); Sierra Leone's state of emergency 31 July (day 74) with enforced
+ *  quarantines 4–6 Aug (days 78–80); WHO PHEIC 8 Aug (day 82); airline
+ *  suspensions from late July (~day 72); MSF ELWA-3 17 Aug (day 91). Sources:
+ *  WHO DON 4 Aug 2014, WHO PHEIC statement 8 Aug 2014, CDC MMWR 65(Su-3).
+ *  Expressed as REAL params with keyframe tracks, factorized to be schedule-
+ *  equivalent to the original calibrated strengths (effect·coverage products
+ *  preserved exactly — verified by test). EFFECT SIZES AND COVERAGE RAMPS ARE
+ *  REASONED ESTIMATES; ring vaccination ships DISABLED (rVSV-ZEBOV ring trial
+ *  began ~day 300, outside this window). */
 export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
   {
     id: 'safe-burials',
     intervention: 'custom', // no live-sim analogue — burial-practice change
     label: 'Safe & dignified burials',
     enabled: true,
-    transmissionReduction: 0.3, // burial contact drove a major share (estimate)
-    events: [{ tick: 30, intensity: 0 }, { tick: 60, intensity: 0.4 }, { tick: 110, intensity: 0.8 }],
+    transmissionReduction: 0.3,
+    // Old eff = 0.3 × coverage(0→0.4→0.8): keyframe tr = 0 → 0.12 → 0.24.
+    timeline: { transmissionReduction: [{ tick: 30, value: 0 }, { tick: 60, value: 0.12 }, { tick: 110, value: 0.24 }] },
   },
   {
     id: 'contact-tracing',
-    intervention: 'quarantine', // closest live-sim bucket: detect + isolate
+    intervention: 'quarantine',
     label: 'Contact tracing & case isolation',
     enabled: true,
     transmissionReduction: 0.25,
-    // Tracing ran from the outbreak's confirmation but with low coverage,
-    // scaling after the emergency declarations / PHEIC (days 74–82).
-    events: [{ tick: 7, intensity: 0.1 }, { tick: 45, intensity: 0.3 }, { tick: 82, intensity: 0.5 }, { tick: 110, intensity: 0.7 }],
+    params: { detectionRate: 0.05, contactsRange: 2, protection: 0.3, sourceControl: 0.5, duration: 21 },
+    // Old eff = 0.25 × coverage(0.1→0.3→0.5→0.7) = detectionRate(t) × 0.5:
+    timeline: { detectionRate: [{ tick: 7, value: 0.05 }, { tick: 45, value: 0.15 }, { tick: 82, value: 0.25 }, { tick: 110, value: 0.35 }] },
   },
   {
     id: 'treatment-centers',
-    intervention: 'quarantine', // ETC admission ≈ case isolation
+    intervention: 'quarantine',
     label: 'Treatment centres (ETCs)',
     enabled: true,
     transmissionReduction: 0.3,
-    // Kailahun ETC ~day 38; capacity grows; ELWA-3 (day 91) at the tail.
-    events: [{ tick: 38, intensity: 0.3 }, { tick: 74, intensity: 0.5 }, { tick: 91, intensity: 0.7 }, { tick: 110, intensity: 0.8 }],
+    params: { detectionRate: 0.15, contactsRange: 1, protection: 0.4, sourceControl: 0.6, duration: 30 },
+    // Old eff = 0.3 × coverage(0.3→0.5→0.7→0.8) = detectionRate(t) × 0.6:
+    timeline: { detectionRate: [{ tick: 38, value: 0.15 }, { tick: 74, value: 0.25 }, { tick: 91, value: 0.35 }, { tick: 110, value: 0.4 }] },
   },
   {
     id: 'emergency-travel',
-    intervention: 'lockdown', // movement restrictions map onto lockdown
+    intervention: 'lockdown',
     label: 'Emergency measures & travel restrictions',
     enabled: true,
-    transmissionReduction: 0.15,
-    // Airline suspensions ~day 72; SoE day 74; quarantines 78–80; PHEIC day 82.
-    events: [{ tick: 72, intensity: 0 }, { tick: 74, intensity: 0.6 }, { tick: 82, intensity: 0.9 }, { tick: 110, intensity: 0.9 }],
+    transmissionReduction: 0,
+    params: { mobilityReduction: 0, compliance: 0 },
+    // Old eff = 0.15 × coverage(0→0.6→0.9): keyframe tr = 0 → 0.09 → 0.135
+    // (with mobility·compliance = 0, lockdown eff reduces to tr).
+    timeline: { transmissionReduction: [{ tick: 72, value: 0 }, { tick: 74, value: 0.09 }, { tick: 82, value: 0.135 }, { tick: 110, value: 0.135 }] },
   },
   {
     id: 'ring-vaccination',
@@ -1546,9 +1605,12 @@ export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
     label: 'Ring vaccination (2015 — outside this window)',
     enabled: false, // rVSV-ZEBOV ring trial began ~day 300; kept for exploration
     transmissionReduction: 0.5,
-    events: [{ tick: 300, intensity: 0 }, { tick: 330, intensity: 0.8 }],
+    params: { uptake: 0, protection: 0.5, sourceControl: 0, mortalityReduction: 0.5 },
+    // Old eff = 0.5 × coverage(0→0.8) = uptake(t)·0.5 with protection 0.5:
+    timeline: { uptake: [{ tick: 300, value: 0 }, { tick: 330, value: 0.8 }] },
   },
 ];
+
 
 // ─── Fit-grid resolution ─────────────────────────────────────────────────────
 // One grid cell represents population/size² real people — the smallest nonzero

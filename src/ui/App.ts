@@ -11,7 +11,7 @@ import { R0Modal } from './R0Modal';
 import { ShareMenu } from './ShareMenu';
 import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
-import { syncSpecsWithToggle } from '../lib/fit';
+import { migrateInterventionSpecs, syncSpecsWithToggle } from '../lib/fit';
 import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
 import { computeLedger, costConfigFromProfile, findCurrency, formatMoney } from '../lib/cost';
 import { appendLongDelta, emptyLongStats } from '../sim/long-history';
@@ -57,7 +57,9 @@ export class App {
   // Estimator and the main sim read/write the SAME array — an intervention
   // added/edited/toggled in one place is the same object in the other. App
   // owns persistence (its own storage key, independent of the fit snapshot).
-  private interventions: InterventionSpec[] = read<InterventionSpec[]>('interventions', []);
+  // Migrated on load: older persisted shapes (intensity ramps) become
+  // keyframed real params, schedule-equivalent (see migrateInterventionSpecs).
+  private interventions: InterventionSpec[] = migrateInterventionSpecs(read<unknown[]>('interventions', []));
   private prevConfig: SimConfig | null = null;
   private epidemicStarted = false;
   private epidemicEnded = false;

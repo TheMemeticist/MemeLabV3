@@ -118,16 +118,31 @@ export interface InterventionEvent {
   label?: string;
 }
 
-/** One point on an intervention's timeline: the main sim's binary
- *  `InterventionEvent.on` generalized to a fractional intensity in [0, 1]
- *  (on = 1, off = 0), linearly interpolated between events and clamped
- *  outside the first/last. `tick` follows InterventionEvent.tick — in the
- *  R₀ Estimator context ticks are DATA days (day 0 = the dataset's day 0),
- *  mapped onto model ticks by the fitted index-date offset. */
+/** One keyframe on a REAL parameter's timeline: at data day `tick` the param
+ *  equals `value` (the param's own units — fractions for rates, days/cells for
+ *  durations/ranges), linearly interpolated between keyframes and HELD at the
+ *  end values outside them (so interventions persist indefinitely unless a
+ *  later keyframe sets the param to 0). `tick` follows InterventionEvent.tick;
+ *  in the R₀ Estimator context ticks are DATA days, mapped onto model ticks by
+ *  the fitted index-date offset. */
 export interface InterventionTimelinePoint {
   tick: number;
-  intensity: number;
+  value: number;
 }
+
+/** A keyframeable parameter name: every real per-type field plus the flat
+ *  transmissionReduction (the 'custom' type's single parameter). */
+export type InterventionParamName =
+  | 'transmissionReduction'
+  | 'uptake'
+  | 'protection'
+  | 'sourceControl'
+  | 'mortalityReduction'
+  | 'mobilityReduction'
+  | 'compliance'
+  | 'detectionRate'
+  | 'contactsRange'
+  | 'duration';
 
 /** The SHARED intervention shape used by the R₀ Estimator's time-varying
  *  transmission R(t) and designed to plug into the live simulation's
@@ -167,12 +182,18 @@ export interface InterventionSpec {
   intervention: InterventionKey | 'custom';
   label: string;
   enabled: boolean;
-  /** Max transmission reduction at full intensity — LockdownSpec semantics.
-   *  Used directly for 'custom' / param-less specs; typed specs with `params`
-   *  derive their effective reduction from the rich fields instead. */
+  /** Flat transmission reduction — LockdownSpec semantics. THE parameter for
+   *  'custom' specs (and part of lockdown's composition); typed specs with
+   *  `params` derive their effective reduction from the rich fields. */
   transmissionReduction: number;
-  events: InterventionTimelinePoint[];
+  /** The main sim's own per-type parameters (DefenseSpec / LockdownSpec /
+   *  QuarantineSpec fields). Present on every typed spec. */
   params?: InterventionParams;
+  /** Time dimension: per-REAL-PARAM keyframe tracks. A tracked param takes its
+   *  interpolated timeline value at day t (held at the ends); untracked params
+   *  stay at their base value. There is no separate "intensity" scalar — time
+   *  variation IS the params varying. */
+  timeline?: Partial<Record<InterventionParamName, InterventionTimelinePoint[]>>;
 }
 
 export interface SimStats {
