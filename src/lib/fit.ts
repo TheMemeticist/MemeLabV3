@@ -22,7 +22,7 @@
 // loss re-scores cached curves without re-simulating (same "pure derived
 // overlay" discipline as the cost layer).
 
-import type { GeometryType, InterventionEvent, InterventionKey, InterventionParamName, InterventionSpec, InterventionTimelinePoint, SimConfig, StrainGenes } from '../types';
+import type { GeometryType, InterventionEvent, InterventionKey, InterventionKeyframe, InterventionParamName, InterventionParams, InterventionSpec, InterventionTimelinePoint, SimConfig, StrainGenes } from '../types';
 import { makeGeometry, torus } from '../sim/neighbors';
 import { Rng } from '../sim/rng';
 import { runGA } from './ga';
@@ -1414,23 +1414,33 @@ export function effectiveReduction(iv: InterventionSpec): number {
   }
 }
 
-/** The spec with every keyframed param resolved at data day `tick` (untracked
- *  params keep their base values). Pure; feeds effectiveReduction. */
+/** The spec with its params resolved at data day `tick` from its KEYFRAMES —
+ *  each keyframe is a day plus a full param snapshot; every field interpolates
+ *  linearly between keyframes and is HELD outside the first/last (base values
+ *  fill any field a keyframe omits). No keyframes → the base params. Pure. */
 export function specAtDay(iv: InterventionSpec, tick: number): InterventionSpec {
-  const tl = iv.timeline;
-  if (!tl) return iv;
-  const out: InterventionSpec = { ...iv, params: iv.params ? { ...iv.params } : undefined };
-  for (const key of Object.keys(tl) as InterventionParamName[]) {
-    const track = tl[key];
-    if (!track || track.length === 0) continue;
-    const v = valueAt(track, tick);
-    if (key === 'transmissionReduction') out.transmissionReduction = v;
-    else {
-      if (!out.params) out.params = {};
-      out.params[key] = v;
-    }
-  }
-  return out;
+  const kfs = iv.keyframes;
+  if (!kfs || kfs.length === 0) return iv;
+  const sorted = kfs.slice().sort((a, b) => a.tick - b.tick);
+  const field = (get: (k: InterventionKeyframe) => number | undefined, base: number): number =>
+    valueAt(sorted.map((k) => ({ tick: k.tick, value: get(k) ?? base })), tick);
+  const baseP = iv.params ?? {};
+  const params: InterventionParams = {
+    uptake: field((k) => k.params.uptake, baseP.uptake ?? 0),
+    protection: field((k) => k.params.protection, baseP.protection ?? 0),
+    sourceControl: field((k) => k.params.sourceControl, baseP.sourceControl ?? 0),
+    mortalityReduction: field((k) => k.params.mortalityReduction, baseP.mortalityReduction ?? 0),
+    mobilityReduction: field((k) => k.params.mobilityReduction, baseP.mobilityReduction ?? 0),
+    compliance: field((k) => k.params.compliance, baseP.compliance ?? 0),
+    detectionRate: field((k) => k.params.detectionRate, baseP.detectionRate ?? 0),
+    contactsRange: field((k) => k.params.contactsRange, baseP.contactsRange ?? 1),
+    duration: field((k) => k.params.duration, baseP.duration ?? 14),
+  };
+  return {
+    ...iv,
+    transmissionReduction: field((k) => k.transmissionReduction, iv.transmissionReduction),
+    params,
+  };
 }
 
 /** Effective max transmission reduction at data day `tick`, honoring the FULL
@@ -1450,18 +1460,33 @@ export function specFromEvents(
   label?: string,
 ): InterventionSpec {
   const tr = clamp(transmissionReduction, 0, 0.95);
-  const sorted = events.slice().sort((a, b) => a.tick - b.tick);
-  const pts: InterventionTimelinePoint[] = [];
-  let prev = 0;
-  for (const e of sorted) {
-    const v = e.on ? tr : 0;
-    if (pts.length === 0) {
-      if (v > 0) pts.push({ tick: e.tick - 1, value: 0 });
-    } else if (v !== prev && e.tick - 1 > pts[pts.length - 1].tick) {
-      pts.push({ tick: e.tick - 1, value: prev });
+  // Keyframe the field the taxonomy's effectiveReduction actually consumes so
+  // on/off toggles map to strength tr/0 exactly for every type:
+  //   mask/vaccine → protection (with uptake 1, sourceControl 0 ⇒ eff = protection)
+  //   lockdown     → the transmissionReduction dial (mobility·compliance = 0)
+  //   quarantine   → detectionRate (with sourceControl 1 ⇒ eff = detectionRate)
+  const snap = (on: boolean): InterventionKeyframe => {
+    const v = on ? tr : 0;
+    if (key === 'lockdown') {
+      return { tick: 0, transmissionReduction: v, params: { mobilityReduction: 0, compliance: 0 } };
     }
-    pts.push({ tick: e.tick, value: v });
-    prev = v;
+    if (key === 'quarantine') {
+      return { tick: 0, params: { detectionRate: v, sourceControl: 1, contactsRange: 1, protection: 0, duration: 14 } };
+    }
+    return { tick: 0, params: { uptake: 1, protection: v, sourceControl: 0, mortalityReduction: 0 } };
+  };
+  const at = (tick: number, on: boolean): InterventionKeyframe => ({ ...snap(on), tick });
+  const sorted = events.slice().sort((a, b) => a.tick - b.tick);
+  const kfs: InterventionKeyframe[] = [];
+  let prev = false;
+  for (const e of sorted) {
+    if (kfs.length === 0) {
+      if (e.on) kfs.push(at(e.tick - 1, false));
+    } else if (e.on !== prev && e.tick - 1 > kfs[kfs.length - 1].tick) {
+      kfs.push(at(e.tick - 1, prev));
+    }
+    kfs.push(at(e.tick, e.on));
+    prev = e.on;
   }
   return {
     id: key,
@@ -1469,7 +1494,8 @@ export function specFromEvents(
     label: label ?? sorted.find((e) => e.label)?.label ?? key,
     enabled: true,
     transmissionReduction: tr,
-    timeline: { transmissionReduction: pts },
+    params: snap(true).params,
+    keyframes: kfs,
   };
 }
 
@@ -1486,6 +1512,7 @@ export function migrateInterventionSpecs(list: unknown[]): InterventionSpec[] {
     effect?: number;
     intensity?: { day: number; m: number }[];
     events?: { tick: number; intensity: number }[];
+    timeline?: Partial<Record<InterventionParamName, InterventionTimelinePoint[]>>;
   }>).map((iv) => {
     const tr = clamp(iv.transmissionReduction ?? iv.effect ?? 0.3, 0, 0.95);
     const out: InterventionSpec = {
@@ -1495,27 +1522,50 @@ export function migrateInterventionSpecs(list: unknown[]): InterventionSpec[] {
       enabled: iv.enabled,
       transmissionReduction: tr,
       params: iv.params ? { ...iv.params } : undefined,
-      timeline: iv.timeline
-        ? Object.fromEntries(Object.entries(iv.timeline).map(([k, t]) => [k, (t ?? []).map((f) => ({ ...f }))]))
-        : undefined,
+      keyframes: iv.keyframes?.map((k) => ({ tick: k.tick, transmissionReduction: k.transmissionReduction, params: { ...k.params } })),
     };
-    const legacyRamp = iv.events ?? iv.intensity?.map((f) => ({ tick: f.day, intensity: f.m }));
-    if (!out.timeline && legacyRamp?.length) {
-      out.timeline = {
-        transmissionReduction: legacyRamp.map((f) => ({ tick: f.tick, value: clamp(f.intensity, 0, 1) * tr })),
+    // v3 per-param tracks → keyframes: resolve the FULL param set at the union
+    // of all track ticks. Piecewise-linear functions sampled at every
+    // breakpoint reproduce exactly under re-interpolation — bit-equivalent.
+    if (!out.keyframes && iv.timeline && Object.keys(iv.timeline).length > 0) {
+      const ticks = [...new Set(Object.values(iv.timeline).flatMap((t) => (t ?? []).map((f) => f.tick)))].sort((a, b) => a - b);
+      const probe: InterventionSpec = { ...out, keyframes: undefined, params: out.params, timeline: iv.timeline } as InterventionSpec;
+      // Temporarily emulate the old per-param-track resolution:
+      const trackVal = (name: InterventionParamName, tick: number, base: number): number => {
+        const track = iv.timeline?.[name];
+        return track && track.length ? valueAt(track.map((f) => ({ tick: f.tick, value: f.value })), tick) : base;
       };
-      if (!out.params && out.intervention !== 'custom') out.intervention = 'custom';
+      void probe;
+      const bp = out.params ?? {};
+      out.keyframes = ticks.map((t) => ({
+        tick: t,
+        transmissionReduction: trackVal('transmissionReduction', t, tr),
+        params: {
+          uptake: trackVal('uptake', t, bp.uptake ?? 0),
+          protection: trackVal('protection', t, bp.protection ?? 0),
+          sourceControl: trackVal('sourceControl', t, bp.sourceControl ?? 0),
+          mortalityReduction: trackVal('mortalityReduction', t, bp.mortalityReduction ?? 0),
+          mobilityReduction: trackVal('mobilityReduction', t, bp.mobilityReduction ?? 0),
+          compliance: trackVal('compliance', t, bp.compliance ?? 0),
+          detectionRate: trackVal('detectionRate', t, bp.detectionRate ?? 0),
+          contactsRange: trackVal('contactsRange', t, bp.contactsRange ?? 1),
+          duration: trackVal('duration', t, bp.duration ?? 14),
+        },
+      }));
     }
-    // Every intervention shares one param schema — customs without params get
-    // the LOSSLESS defense mapping: uptake 1, protection = strength,
-    // sourceControl 0 ⇒ eff = protection, so schedules are bit-identical
-    // (any transmissionReduction track becomes a protection track verbatim).
+    // v1/v2 whole-intervention intensity ramps → custom-schema keyframes
+    // (uptake 1, protection = intensity·strength, sourceControl 0 ⇒ eff equal).
+    const legacyRamp = iv.events ?? iv.intensity?.map((f) => ({ tick: f.day, intensity: f.m }));
+    if (!out.keyframes && legacyRamp?.length) {
+      out.intervention = out.params ? out.intervention : 'custom';
+      out.keyframes = legacyRamp.map((f) => ({
+        tick: f.tick,
+        params: { uptake: 1, protection: clamp(f.intensity, 0, 1) * tr, sourceControl: 0, mortalityReduction: 0 },
+      }));
+    }
+    // One shared schema: every spec carries base params.
     if (!out.params) {
       out.params = { uptake: 1, protection: clamp(tr, 0, 0.95), sourceControl: 0, mortalityReduction: 0 };
-      if (out.timeline?.transmissionReduction) {
-        out.timeline.protection = out.timeline.transmissionReduction;
-        delete out.timeline.transmissionReduction;
-      }
     }
     return out;
   });
@@ -1584,11 +1634,14 @@ export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
     label: 'Safe & dignified burials',
     enabled: true,
     transmissionReduction: 0.3,
-    // Custom uses the canonical defense schema. Old eff = 0.3 × coverage:
-    // protection 0.3 const, sourceControl 0, uptake keyframed to the coverage
-    // ramp → eff = uptake(t)·0.3, schedule-equivalent to the calibration.
+    // Defense schema: protection 0.3 const, coverage (Rate) keyframed to the
+    // 2014 ramp → eff = uptake(t)·0.3, schedule-equivalent to the calibration.
     params: { uptake: 0, protection: 0.3, sourceControl: 0, mortalityReduction: 0 },
-    timeline: { uptake: [{ tick: 30, value: 0 }, { tick: 60, value: 0.4 }, { tick: 110, value: 0.8 }] },
+    keyframes: [
+      { tick: 30, params: { uptake: 0, protection: 0.3, sourceControl: 0, mortalityReduction: 0 } },
+      { tick: 60, params: { uptake: 0.4, protection: 0.3, sourceControl: 0, mortalityReduction: 0 } },
+      { tick: 110, params: { uptake: 0.8, protection: 0.3, sourceControl: 0, mortalityReduction: 0 } },
+    ],
   },
   {
     id: 'contact-tracing',
@@ -1597,8 +1650,13 @@ export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
     enabled: true,
     transmissionReduction: 0.25,
     params: { detectionRate: 0.05, contactsRange: 2, protection: 0.3, sourceControl: 0.5, duration: 21 },
-    // Old eff = 0.25 × coverage(0.1→0.3→0.5→0.7) = detectionRate(t) × 0.5:
-    timeline: { detectionRate: [{ tick: 7, value: 0.05 }, { tick: 45, value: 0.15 }, { tick: 82, value: 0.25 }, { tick: 110, value: 0.35 }] },
+    // Old eff = 0.25 × coverage = detectionRate(t) × 0.5:
+    keyframes: [
+      { tick: 7, params: { detectionRate: 0.05, contactsRange: 2, protection: 0.3, sourceControl: 0.5, duration: 21 } },
+      { tick: 45, params: { detectionRate: 0.15, contactsRange: 2, protection: 0.3, sourceControl: 0.5, duration: 21 } },
+      { tick: 82, params: { detectionRate: 0.25, contactsRange: 2, protection: 0.3, sourceControl: 0.5, duration: 21 } },
+      { tick: 110, params: { detectionRate: 0.35, contactsRange: 2, protection: 0.3, sourceControl: 0.5, duration: 21 } },
+    ],
   },
   {
     id: 'treatment-centers',
@@ -1607,8 +1665,13 @@ export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
     enabled: true,
     transmissionReduction: 0.3,
     params: { detectionRate: 0.15, contactsRange: 1, protection: 0.4, sourceControl: 0.6, duration: 30 },
-    // Old eff = 0.3 × coverage(0.3→0.5→0.7→0.8) = detectionRate(t) × 0.6:
-    timeline: { detectionRate: [{ tick: 38, value: 0.15 }, { tick: 74, value: 0.25 }, { tick: 91, value: 0.35 }, { tick: 110, value: 0.4 }] },
+    // Old eff = 0.3 × coverage = detectionRate(t) × 0.6:
+    keyframes: [
+      { tick: 38, params: { detectionRate: 0.15, contactsRange: 1, protection: 0.4, sourceControl: 0.6, duration: 30 } },
+      { tick: 74, params: { detectionRate: 0.25, contactsRange: 1, protection: 0.4, sourceControl: 0.6, duration: 30 } },
+      { tick: 91, params: { detectionRate: 0.35, contactsRange: 1, protection: 0.4, sourceControl: 0.6, duration: 30 } },
+      { tick: 110, params: { detectionRate: 0.4, contactsRange: 1, protection: 0.4, sourceControl: 0.6, duration: 30 } },
+    ],
   },
   {
     id: 'emergency-travel',
@@ -1617,9 +1680,14 @@ export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
     enabled: true,
     transmissionReduction: 0,
     params: { mobilityReduction: 0, compliance: 0 },
-    // Old eff = 0.15 × coverage(0→0.6→0.9): keyframe tr = 0 → 0.09 → 0.135
+    // Old eff = 0.15 × coverage: keyframe the transmission-reduction dial
     // (with mobility·compliance = 0, lockdown eff reduces to tr).
-    timeline: { transmissionReduction: [{ tick: 72, value: 0 }, { tick: 74, value: 0.09 }, { tick: 82, value: 0.135 }, { tick: 110, value: 0.135 }] },
+    keyframes: [
+      { tick: 72, transmissionReduction: 0, params: { mobilityReduction: 0, compliance: 0 } },
+      { tick: 74, transmissionReduction: 0.09, params: { mobilityReduction: 0, compliance: 0 } },
+      { tick: 82, transmissionReduction: 0.135, params: { mobilityReduction: 0, compliance: 0 } },
+      { tick: 110, transmissionReduction: 0.135, params: { mobilityReduction: 0, compliance: 0 } },
+    ],
   },
   {
     id: 'ring-vaccination',
@@ -1628,8 +1696,11 @@ export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
     enabled: false, // rVSV-ZEBOV ring trial began ~day 300; kept for exploration
     transmissionReduction: 0.5,
     params: { uptake: 0, protection: 0.5, sourceControl: 0, mortalityReduction: 0.5 },
-    // Old eff = 0.5 × coverage(0→0.8) = uptake(t)·0.5 with protection 0.5:
-    timeline: { uptake: [{ tick: 300, value: 0 }, { tick: 330, value: 0.8 }] },
+    // Old eff = 0.5 × coverage = uptake(t)·0.5:
+    keyframes: [
+      { tick: 300, params: { uptake: 0, protection: 0.5, sourceControl: 0, mortalityReduction: 0.5 } },
+      { tick: 330, params: { uptake: 0.8, protection: 0.5, sourceControl: 0, mortalityReduction: 0.5 } },
+    ],
   },
 ];
 

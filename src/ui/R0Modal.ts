@@ -741,12 +741,12 @@ export class R0Modal {
         label: `Intervention ${this.interventions.length + 1}`,
         enabled: true,
         transmissionReduction: 0.3,
-        // Sensible default: keyframe the REAL param — transmission reduction
-        // ramps 0 → 30% over two weeks starting mid-data, then holds.
-        timeline: { transmissionReduction: [
-          { tick: Math.round(lastObs / 2), value: 0 },
-          { tick: Math.round(lastObs / 2) + 14, value: 0.3 },
-        ] },
+        params: { uptake: 1, protection: 0.3, sourceControl: 0, mortalityReduction: 0 },
+        // Sensible default: two keyframes ramping in over two weeks, then held.
+        keyframes: [
+          { tick: Math.round(lastObs / 2), params: { uptake: 1, protection: 0, sourceControl: 0, mortalityReduction: 0 } },
+          { tick: Math.round(lastObs / 2) + 14, params: { uptake: 1, protection: 0.3, sourceControl: 0, mortalityReduction: 0 } },
+        ],
       });
       const details = this.el?.querySelector<HTMLDetailsElement>('[data-r0="itv-details"]');
       if (details) details.open = true;
@@ -916,9 +916,9 @@ export class R0Modal {
    *  chart-day coordinates (data day + the given offset shift). */
   private itvWindows(offset: number): { from: number; to: number; label: string }[] {
     return this.interventions
-      .filter((iv) => iv.enabled && iv.timeline && Object.values(iv.timeline).some((t) => t && t.length > 0))
+      .filter((iv) => iv.enabled && (iv.keyframes?.length ?? 0) > 0)
       .map((iv) => {
-        const ticks = Object.values(iv.timeline!).flatMap((t) => (t ?? []).map((f) => f.tick));
+        const ticks = iv.keyframes!.map((k) => k.tick);
         // Interventions persist indefinitely: the span extends to the chart's
         // right edge (Infinity, clamped when painting) unless the end state is
         // keyframed down to zero effect — only then does the span really end.
@@ -932,13 +932,13 @@ export class R0Modal {
       .filter((w) => Number.isFinite(w.from));
   }
 
-  /** Interventions editor — the SAME rich controls as the main sim's
-   *  Interventions panel, 1:1 per type (same Slider component, labels and
-   *  ranges), ALWAYS rendered (typed specs without params are seeded from the
-   *  live sim config on sight). The time dimension is KEYFRAMING THE REAL
-   *  PARAMS: every rendered param has a ⏱ track editor of (day, value)
-   *  keyframes — linear between keyframes, held at the ends. There is no
-   *  separate "intensity" scalar. Everything edits the shared store objects. */
+  /** Interventions editor. Card layout: header (enable / name / taxonomy /
+   *  remove) → the param sliders (the intervention's BASE values, used when no
+   *  keyframes exist) → the KEYFRAME section at the bottom. A keyframe is a
+   *  DAY plus a full param snapshot: each row shows its day input and expands
+   *  (row click) into that keyframe's own param sliders — the same sliders as
+   *  the top of the card — then collapses. Params interpolate linearly between
+   *  keyframe days and are HELD outside the first/last. No extra knobs. */
   private renderInterventions(): void {
     const host = this.el?.querySelector<HTMLElement>('[data-r0="itv-list"]');
     const count = this.el?.querySelector<HTMLElement>('[data-r0="itv-count"]');
@@ -955,7 +955,6 @@ export class R0Modal {
       return;
     }
     this.interventions.forEach((iv, idx) => {
-      // Every spec shares one param schema — always show the full controls.
       if (!iv.params) this.seedParams(iv);
       const card = document.createElement('div');
       card.className = 'r0-itv';
@@ -974,10 +973,11 @@ export class R0Modal {
         <div class="r0-itv-params" data-iv="params"></div>
         <div class="r0-itv-kf" data-iv="kf">
           <div class="r0-itv-kf-head">
-            <span class="r0-history-group">⏱ Keyframes — vary the params over time</span>
+            <span class="r0-history-group" title="A keyframe is a day plus this intervention's full param values on that day. Click a row to expand its sliders. Params interpolate linearly between keyframe days and HOLD outside the first/last — interventions persist into the prediction horizon unless keyframed to 0.">⏱ Keyframes</span>
             <span class="r0-itv-eff r0-muted" data-iv="eff" title="Derived max transmission reduction at the timeline's end state — what the model applies: R(t) = R0 × (1 − effectiveReduction(paramsAt(t)))."></span>
           </div>
           <div data-iv="kf-list"></div>
+          <button class="btn ghost" type="button" data-iv="kf-add">+ Add keyframe</button>
         </div>
       `;
       const persist = (): void => { this.notifyInterventions(); };
@@ -1007,118 +1007,136 @@ export class R0Modal {
         this.renderInterventions();
       });
 
-      // ── One row per REAL param: the main sim's Slider + a ⏱ keyframe track ──
+      // ── TOP: base param sliders (the values when no keyframes exist) ──
       const paramsHost = card.querySelector<HTMLElement>('[data-iv="params"]')!;
-      const addParam = (
-        key: InterventionParamName,
-        label: string,
-        min: number,
-        max: number,
-        unit: '%' | 'days' | 'tiles',
-        get: () => number,
-        set: (v: number) => void,
-        hint?: string,
-      ): void => {
-        const pct = unit === '%';
-        const row = document.createElement('div');
-        row.className = 'r0-itv-param';
-        const kfHost = card.querySelector<HTMLElement>('[data-iv="kf-list"]')!;
-        const kfRowHost = document.createElement('div');
-        kfRowHost.className = 'r0-itv-kf-param';
-        const slider = new Slider({
-          id: `r0-${iv.id}-${key}`, label, min, max, step: 1, unit,
-          value: pct ? Math.round(get() * 100) : get(),
-          hint: (hint ? `${hint} ` : '') + 'Keyframes (⏱) override this dial over time.',
-          onChange: (v) => { set(pct ? Math.min(1, Math.max(0, v / 100)) : v); refreshEff(); persist(); },
-        });
-        row.appendChild(slider.el);
-        const track = iv.timeline?.[key];
-        const kfBtn = document.createElement('button');
-        kfBtn.type = 'button';
-        kfBtn.className = `r0-kf-btn${track?.length ? ' active' : ''}`;
-        kfBtn.title = `Keyframe "${label}" over time: (day, value) points, linear between, HELD at the ends — interventions persist indefinitely unless keyframed down.`;
-        kfBtn.textContent = `⏱${track?.length ? ` ${track.length}` : ''}`;
-        const editor = document.createElement('div');
-        editor.className = 'r0-kf-editor';
-        editor.hidden = !(track?.length);
-        const renderTrack = (): void => {
-          editor.innerHTML = '';
-          const t = iv.timeline?.[key] ?? [];
-          t.sort((a, b) => a.tick - b.tick);
-          t.forEach((f, fi) => {
-            const kfRow = document.createElement('div');
-            kfRow.className = 'r0-adjust-row';
-            kfRow.innerHTML = `
-              <label>day <input class="r0-in tiny" type="number" step="1" value="${f.tick}" data-kf="day" aria-label="${label} keyframe day" /></label>
-              <label>${label} <input class="r0-in tiny" type="number" step="${pct ? 5 : 1}" value="${pct ? Math.round(f.value * 100) : f.value}" data-kf="val" aria-label="${label} keyframe value" />${pct ? '%' : ` ${unit}`}</label>
-              <button class="r0-del" type="button" aria-label="Delete keyframe">×</button>
-            `;
-            kfRow.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
-              f.tick = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
-              refreshEff(); persist();
-            });
-            kfRow.querySelector<HTMLInputElement>('[data-kf="val"]')!.addEventListener('change', (e) => {
-              const raw = Number((e.target as HTMLInputElement).value);
-              f.value = pct ? Math.min(1, Math.max(0, (raw || 0) / 100)) : Math.max(0, raw || 0);
-              refreshEff(); persist();
-            });
-            kfRow.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
-              t.splice(fi, 1);
-              if (t.length === 0 && iv.timeline) delete iv.timeline[key];
-              refreshEff(); persist(); renderTrack();
-              kfBtn.textContent = `⏱ ${label}${t.length ? ` (${t.length})` : ''}`;
-              kfBtn.classList.toggle('active', t.length > 0);
-            });
-            editor.appendChild(kfRow);
-          });
-          const addKf = document.createElement('button');
-          addKf.className = 'btn ghost';
-          addKf.type = 'button';
-          addKf.textContent = '+ keyframe';
-          addKf.addEventListener('click', () => {
-            if (!iv.timeline) iv.timeline = {};
-            if (!iv.timeline[key]) iv.timeline[key] = [];
-            const tt = iv.timeline[key]!;
-            const last = tt[tt.length - 1];
-            tt.push({ tick: (last?.tick ?? 0) + 14, value: last?.value ?? get() });
-            refreshEff(); persist(); renderTrack();
-            kfBtn.textContent = `⏱ ${label} (${tt.length})`;
-            kfBtn.classList.add('active');
-          });
-          editor.appendChild(addKf);
-        };
-        kfBtn.addEventListener('click', () => {
-          editor.hidden = !editor.hidden;
-          if (!editor.hidden) renderTrack();
-        });
-        if (!editor.hidden) renderTrack();
-        // Sliders FIRST (top of the card), keyframe controls at the BOTTOM.
-        paramsHost.appendChild(row);
-        kfBtn.textContent = `⏱ ${label}${track?.length ? ` (${track.length})` : ''}`;
-        kfRowHost.appendChild(kfBtn);
-        kfRowHost.appendChild(editor);
-        kfHost.appendChild(kfRowHost);
-      };
+      this.renderParamSliders(paramsHost, iv, {
+        idSuffix: 'base',
+        getTr: () => iv.transmissionReduction,
+        setTr: (v) => { iv.transmissionReduction = v; },
+        getP: (f) => (iv.params?.[f] as number | undefined),
+        setP: (f, v) => { if (!iv.params) iv.params = {}; iv.params[f] = v; },
+        onEdit: () => { refreshEff(); persist(); },
+      });
 
-      const p = iv.params;
-      if (p && (iv.intervention === 'mask' || iv.intervention === 'vaccine' || iv.intervention === 'custom')) {
-        addParam('uptake', 'Rate', 0, 100, '%', () => p.uptake ?? 0, (v) => { p.uptake = v; }, 'Population uptake — same control as the main sim.');
-        addParam('protection', 'Protection', 0, 100, '%', () => p.protection ?? 0, (v) => { p.protection = v; }, 'Reduces incoming attack success against the wearer.');
-        addParam('sourceControl', 'Source control', 0, 100, '%', () => p.sourceControl ?? 0, (v) => { p.sourceControl = v; }, 'Reduces outgoing attack success from the wearer.');
-        addParam('mortalityReduction', 'Mortality reduction', 0, 100, '%', () => p.mortalityReduction ?? 0, (v) => { p.mortalityReduction = v; }, 'Reduces IFR if infected — deaths in the live sim; not part of the fitted R(t).');
-      } else if (p && iv.intervention === 'lockdown') {
-        addParam('mobilityReduction', 'Mobility reduction', 0, 100, '%', () => p.mobilityReduction ?? 0, (v) => { p.mobilityReduction = v; }, 'Probabilistically skips neighbor visits for compliant cells.');
-        addParam('transmissionReduction', 'Transmission reduction', 0, 100, '%', () => iv.transmissionReduction, (v) => { iv.transmissionReduction = v; }, 'Global multiplicative reduction on transmission.');
-        addParam('compliance', 'Compliance', 0, 100, '%', () => p.compliance ?? 0, (v) => { p.compliance = v; }, 'Per-cell adherence to the lockdown.');
-      } else if (p && iv.intervention === 'quarantine') {
-        addParam('detectionRate', 'Detection rate', 0, 100, '%', () => p.detectionRate ?? 0, (v) => { p.detectionRate = v; }, 'Per-tick probability an infectious cell is detected.');
-        addParam('contactsRange', 'Close-contacts range', 1, 5, 'tiles', () => p.contactsRange ?? 1, (v) => { p.contactsRange = v; }, 'Radius of contacts isolated with a detected case (live-sim spatial dynamics; not in the fitted rate).');
-        addParam('protection', 'Protection', 0, 100, '%', () => p.protection ?? 0, (v) => { p.protection = v; }, 'Reduces transmission INTO quarantined cells.');
-        addParam('sourceControl', 'Source control', 0, 100, '%', () => p.sourceControl ?? 0, (v) => { p.sourceControl = v; }, 'Reduces transmission FROM quarantined cells.');
-        addParam('duration', 'Duration', 1, 60, 'days', () => p.duration ?? 14, (v) => { p.duration = v; }, 'Quarantine persistence (live-sim dynamics; not in the fitted rate).');
-      }
+      // ── BOTTOM: keyframes — a day row each, expanding to ITS param sliders ──
+      const kfList = card.querySelector<HTMLElement>('[data-iv="kf-list"]')!;
+      const kfs = (iv.keyframes ?? (iv.keyframes = [])).sort((a, b) => a.tick - b.tick);
+      kfs.forEach((kf, ki) => {
+        const row = document.createElement('div');
+        row.className = 'r0-kf-row';
+        row.innerHTML = `
+          <div class="r0-kf-row-head" role="button" tabindex="0" aria-label="Toggle keyframe ${ki + 1} sliders">
+            <span class="r0-kf-caret" aria-hidden="true">▸</span>
+            <label>day <input class="r0-in tiny" type="number" step="1" value="${kf.tick}" data-kf="day" aria-label="Keyframe day" /></label>
+            <button class="r0-del" type="button" aria-label="Delete keyframe" ${kfs.length <= 1 ? 'disabled' : ''}>×</button>
+          </div>
+          <div class="r0-kf-body" hidden></div>
+        `;
+        const head = row.querySelector<HTMLElement>('.r0-kf-row-head')!;
+        const body = row.querySelector<HTMLElement>('.r0-kf-body')!;
+        const caret = row.querySelector<HTMLElement>('.r0-kf-caret')!;
+        const toggle = (): void => {
+          body.hidden = !body.hidden;
+          caret.textContent = body.hidden ? '▸' : '▾';
+          if (!body.hidden && body.childElementCount === 0) {
+            // This keyframe's OWN sliders — same set as the top of the card.
+            this.renderParamSliders(body, iv, {
+              idSuffix: `kf${ki}`,
+              getTr: () => kf.transmissionReduction ?? iv.transmissionReduction,
+              setTr: (v) => { kf.transmissionReduction = v; },
+              getP: (f) => (kf.params[f] as number | undefined) ?? (iv.params?.[f] as number | undefined),
+              setP: (f, v) => { kf.params[f] = v; },
+              onEdit: () => { refreshEff(); persist(); },
+            });
+          }
+        };
+        head.addEventListener('click', (ev) => {
+          const t = ev.target as HTMLElement;
+          if (t.closest('input') || t.closest('button')) return;
+          toggle();
+        });
+        head.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+        });
+        row.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
+          kf.tick = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
+          refreshEff();
+          persist();
+        });
+        row.querySelector<HTMLButtonElement>('.r0-kf-row-head .r0-del')!.addEventListener('click', () => {
+          kfs.splice(ki, 1);
+          refreshEff();
+          persist();
+          this.renderInterventions();
+        });
+        kfList.appendChild(row);
+      });
+      card.querySelector<HTMLButtonElement>('[data-iv="kf-add"]')!.addEventListener('click', () => {
+        const last = kfs[kfs.length - 1];
+        iv.keyframes!.push({
+          tick: (last?.tick ?? 0) + 14,
+          transmissionReduction: last?.transmissionReduction,
+          params: { ...(last?.params ?? iv.params ?? {}) },
+        });
+        persist();
+        this.renderInterventions();
+      });
       host.appendChild(card);
     });
+  }
+
+  /** The per-type param sliders — one shared renderer for the card's base
+   *  values AND each keyframe's snapshot (the SAME sliders both places). */
+  private renderParamSliders(
+    host: HTMLElement,
+    iv: InterventionSpec,
+    io: {
+      idSuffix: string;
+      getTr: () => number;
+      setTr: (v: number) => void;
+      getP: (f: Exclude<InterventionParamName, 'transmissionReduction'>) => number | undefined;
+      setP: (f: Exclude<InterventionParamName, 'transmissionReduction'>, v: number) => void;
+      onEdit: () => void;
+    },
+  ): void {
+    const pctSlider = (f: InterventionParamName, label: string, hint?: string): void => {
+      host.appendChild(new Slider({
+        id: `r0-${iv.id}-${io.idSuffix}-${f}`, label, min: 0, max: 100, step: 1, unit: '%',
+        value: Math.round(((f === 'transmissionReduction' ? io.getTr() : io.getP(f as Exclude<InterventionParamName, 'transmissionReduction'>)) ?? 0) * 100),
+        hint,
+        onChange: (v) => {
+          const frac = Math.min(1, Math.max(0, v / 100));
+          if (f === 'transmissionReduction') io.setTr(Math.min(0.95, frac));
+          else io.setP(f as Exclude<InterventionParamName, 'transmissionReduction'>, frac);
+          io.onEdit();
+        },
+      }).el);
+    };
+    const rawSlider = (f: InterventionParamName, label: string, min: number, max: number, unit: 'days' | 'tiles', fallback: number, hint?: string): void => {
+      host.appendChild(new Slider({
+        id: `r0-${iv.id}-${io.idSuffix}-${f}`, label, min, max, step: 1, unit,
+        value: io.getP(f as Exclude<InterventionParamName, 'transmissionReduction'>) ?? fallback,
+        hint,
+        onChange: (v) => { io.setP(f as Exclude<InterventionParamName, 'transmissionReduction'>, v); io.onEdit(); },
+      }).el);
+    };
+    if (iv.intervention === 'lockdown') {
+      pctSlider('mobilityReduction', 'Mobility reduction', 'Probabilistically skips neighbor visits for compliant cells.');
+      pctSlider('transmissionReduction', 'Transmission reduction', 'Global multiplicative reduction on transmission.');
+      pctSlider('compliance', 'Compliance', 'Per-cell adherence to the lockdown.');
+    } else if (iv.intervention === 'quarantine') {
+      pctSlider('detectionRate', 'Detection rate', 'Per-tick probability an infectious cell is detected.');
+      rawSlider('contactsRange', 'Close-contacts range', 1, 5, 'tiles', 1, 'Radius of contacts isolated with a detected case (live-sim spatial dynamics; not in the fitted rate).');
+      pctSlider('protection', 'Protection', 'Reduces transmission INTO quarantined cells.');
+      pctSlider('sourceControl', 'Source control', 'Reduces transmission FROM quarantined cells.');
+      rawSlider('duration', 'Duration', 1, 60, 'days', 14, 'Quarantine persistence (live-sim dynamics; not in the fitted rate).');
+    } else {
+      // mask / vaccine / custom — the canonical defense quartet.
+      pctSlider('uptake', 'Rate', 'Population uptake — same control as the main sim.');
+      pctSlider('protection', 'Protection', 'Reduces incoming attack success against the wearer.');
+      pctSlider('sourceControl', 'Source control', 'Reduces outgoing attack success from the wearer.');
+      pctSlider('mortalityReduction', 'Mortality reduction', 'Reduces IFR if infected — deaths in the live sim; not part of the fitted R(t).');
+    }
   }
 
   /** Seed the rich per-type params from the CURRENT live sim config — true
@@ -1161,10 +1179,6 @@ export class R0Modal {
           sourceControl: 0,
           mortalityReduction: 0,
         };
-        if (iv.timeline?.transmissionReduction) {
-          iv.timeline.protection = iv.timeline.transmissionReduction;
-          delete iv.timeline.transmissionReduction;
-        }
       }
     }
   }
@@ -1597,9 +1611,7 @@ export class R0Modal {
       store.push({
         ...iv,
         params: iv.params ? { ...iv.params } : undefined,
-        timeline: iv.timeline
-          ? Object.fromEntries(Object.entries(iv.timeline).map(([k, t]) => [k, (t ?? []).map((f) => ({ ...f }))]))
-          : undefined,
+        keyframes: iv.keyframes?.map((k) => ({ tick: k.tick, transmissionReduction: k.transmissionReduction, params: { ...k.params } })),
       });
     }
     this.notifyInterventions();

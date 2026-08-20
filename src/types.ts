@@ -118,16 +118,25 @@ export interface InterventionEvent {
   label?: string;
 }
 
-/** One keyframe on a REAL parameter's timeline: at data day `tick` the param
- *  equals `value` (the param's own units — fractions for rates, days/cells for
- *  durations/ranges), linearly interpolated between keyframes and HELD at the
- *  end values outside them (so interventions persist indefinitely unless a
- *  later keyframe sets the param to 0). `tick` follows InterventionEvent.tick;
- *  in the R₀ Estimator context ticks are DATA days, mapped onto model ticks by
- *  the fitted index-date offset. */
+/** A (day, value) pair used internally for per-field interpolation. */
 export interface InterventionTimelinePoint {
   tick: number;
   value: number;
+}
+
+/** ONE keyframe = a data day plus the intervention's FULL param snapshot at
+ *  that day (the same fields the card's sliders edit). At a keyframe's day the
+ *  params are exactly its values; between keyframes each field interpolates
+ *  linearly; outside the first/last keyframe values are HELD — interventions
+ *  persist indefinitely unless a later keyframe sets them down. `tick` follows
+ *  InterventionEvent.tick; in the R₀ Estimator context ticks are DATA days,
+ *  mapped onto model ticks by the fitted index-date offset. */
+export interface InterventionKeyframe {
+  tick: number;
+  /** Snapshot of the flat/lockdown transmission-reduction dial at this day. */
+  transmissionReduction?: number;
+  /** Snapshot of the per-type params at this day. */
+  params: InterventionParams;
 }
 
 /** A keyframeable parameter name: every real per-type field plus the flat
@@ -187,13 +196,12 @@ export interface InterventionSpec {
    *  `params` derive their effective reduction from the rich fields. */
   transmissionReduction: number;
   /** The main sim's own per-type parameters (DefenseSpec / LockdownSpec /
-   *  QuarantineSpec fields). Present on every typed spec. */
+   *  QuarantineSpec fields) — the intervention's values when it has no
+   *  keyframes (and the fallback for any field a keyframe omits). */
   params?: InterventionParams;
-  /** Time dimension: per-REAL-PARAM keyframe tracks. A tracked param takes its
-   *  interpolated timeline value at day t (held at the ends); untracked params
-   *  stay at their base value. There is no separate "intensity" scalar — time
-   *  variation IS the params varying. */
-  timeline?: Partial<Record<InterventionParamName, InterventionTimelinePoint[]>>;
+  /** Time dimension: keyframes, each a day + a FULL param snapshot (see
+   *  InterventionKeyframe). When present they define the whole timeline. */
+  keyframes?: InterventionKeyframe[];
 }
 
 export interface SimStats {

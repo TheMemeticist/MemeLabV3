@@ -709,13 +709,15 @@ describe('cancel, prediction horizon, Bayesian band, Ebola keyframe defaults', (
 });
 
 describe('interventions: time-varying transmission R(t)', () => {
-  const kf = (tick: number, value: number) => ({ tick, value });
-  // Keyframed REAL param: transmission reduction ramps 0 → 0.5 over days 10–20
-  // and HOLDS (no separate "intensity" scalar exists anymore).
+  // A keyframe = a day + a FULL param snapshot. Custom uses the defense
+  // quartet; protection ramps 0 → 0.5 over days 10–20 and HOLDS.
+  const snap = (protection: number) => ({ uptake: 1, protection, sourceControl: 0, mortalityReduction: 0 });
+  const kf = (tick: number, protection: number) => ({ tick, params: snap(protection) });
   const iv = (over: Record<string, unknown> = {}): InterventionSpec => ({
     id: 'iv-1', intervention: 'custom', label: 'test', enabled: true,
     transmissionReduction: 0.5,
-    timeline: { transmissionReduction: [kf(10, 0), kf(20, 0.5)] },
+    params: snap(0.5),
+    keyframes: [kf(10, 0), kf(20, 0.5)],
     ...over,
   } as InterventionSpec);
 
@@ -727,18 +729,18 @@ describe('interventions: time-varying transmission R(t)', () => {
     expect(s[20]).toBeCloseTo(0.5, 12);   // ramp end: 1 − 0.5
     expect(s[30]).toBeCloseTo(0.5, 12);   // HELD past the last keyframe
     // Two interventions multiply: (1 − 0.5)·(1 − 0.2) at their ends.
-    const two = transmissionSchedule([iv(), iv({ id: 'iv-2', timeline: { transmissionReduction: [kf(10, 0), kf(20, 0.2)] } })], 31)!;
+    const two = transmissionSchedule([iv(), iv({ id: 'iv-2', params: snap(0.2), keyframes: [kf(10, 0), kf(20, 0.2)] })], 31)!;
     expect(two[25]).toBeCloseTo(0.4, 12);
     // Index-date offset shifts the mapping: model tick t ↔ data day t − offset.
     const shifted = transmissionSchedule([iv()], 31, 5)!;
     expect(shifted[20]).toBeCloseTo(s[15], 12);
     // Disabled / all-zero / empty → undefined (unscheduled fast path).
     expect(transmissionSchedule([iv({ enabled: false })], 10)).toBeUndefined();
-    expect(transmissionSchedule([iv({ timeline: { transmissionReduction: [kf(0, 0)] } })], 10)).toBeUndefined();
+    expect(transmissionSchedule([iv({ params: snap(0), keyframes: [kf(0, 0)] })], 10)).toBeUndefined();
     expect(transmissionSchedule([], 10)).toBeUndefined();
     // valueAt + specAtDay resolve keyframed params; effectiveReductionAt honors them.
-    expect(valueAt([kf(10, 0), kf(20, 0.5)], 15)).toBeCloseTo(0.25, 12);
-    expect(specAtDay(iv(), 15).transmissionReduction).toBeCloseTo(0.25, 12);
+    expect(valueAt([{ tick: 10, value: 0 }, { tick: 20, value: 0.5 }], 15)).toBeCloseTo(0.25, 12);
+    expect(specAtDay(iv(), 15).params!.protection).toBeCloseTo(0.25, 12);
     expect(effectiveReductionAt(iv(), 40)).toBeCloseTo(0.5, 12);
   });
 
@@ -749,7 +751,7 @@ describe('interventions: time-varying transmission R(t)', () => {
     expect(ones.curves).toEqual(bare.curves); // ×1 is IEEE-exact — bit-identical
     // Strong intervention from day 10: cumulative infections must end lower.
     const sched = transmissionSchedule(
-      [iv({ transmissionReduction: 0.8, timeline: { transmissionReduction: [kf(5, 0), kf(10, 0.8)] } })], 41)!;
+      [iv({ transmissionReduction: 0.8, params: snap(0.8), keyframes: [kf(5, 0), kf(10, 0.8)] })], 41)!;
     const damped = runTrials(cfg, 40, 4, cfg.seed, sched);
     const bareEnd = bare.curves.cumulative_infections[40];
     const dampedEnd = damped.curves.cumulative_infections[40];
@@ -767,7 +769,7 @@ describe('interventions: time-varying transmission R(t)', () => {
       observed,
       baseConfig: baseConfig({ size: 16 }),
       params: [findFitParam('attackRate')],
-      interventions: [iv({ transmissionReduction: 0.6, timeline: { transmissionReduction: [kf(8, 0), kf(14, 0.6)] } })],
+      interventions: [iv({ transmissionReduction: 0.6, params: snap(0.6), keyframes: [kf(8, 0), kf(14, 0.6)] })],
       population: 1_000,
       K: 3,
       loss: 'poisson',
@@ -791,12 +793,13 @@ describe('interventions: time-varying transmission R(t)', () => {
     expect(EBOLA_INTERVENTIONS.length).toBeGreaterThanOrEqual(4);
     for (const d of EBOLA_INTERVENTIONS) {
       expect(d.transmissionReduction).toBeGreaterThanOrEqual(0);
-      expect(d.timeline && Object.keys(d.timeline).length).toBeTruthy();
+      expect(d.keyframes!.length).toBeGreaterThanOrEqual(2); // day + full snapshot each
       expect(d.params).toBeDefined(); // ONE shared schema — every card renders rich controls
+      for (const k of d.keyframes!) expect(k.params).toBeDefined();
     }
     const ring = EBOLA_INTERVENTIONS.find((d) => d.id === 'ring-vaccination')!;
     expect(ring.enabled).toBe(false);
-    expect(Math.min(...ring.timeline!.uptake!.map((f) => f.tick))).toBeGreaterThan(96);
+    expect(Math.min(...ring.keyframes!.map((f) => f.tick))).toBeGreaterThan(96);
     // Schedule-equivalence to the previously calibrated strengths (verified
     // endpoints of the old model): factor 0.887 at model day 0 (offset 6) and
     // 0.412 at the horizon.
@@ -821,12 +824,16 @@ describe('shared intervention shape + instant cancel', () => {
       label: 'Lockdown',
       enabled: true,            // DefenseSpec-style field
       transmissionReduction: 0.4, // LockdownSpec's field name + semantics
-      // Toggles become a transmissionReduction keyframe track with
-      // step-preserving hold-points (on → 0.4, off → 0).
-      timeline: { transmissionReduction: [
-        { tick: 11, value: 0 }, { tick: 12, value: 0.4 },
-        { tick: 39, value: 0.4 }, { tick: 40, value: 0 },
-      ] },
+      // Toggles become keyframes of full snapshots with step-preserving
+      // hold-points; for the lockdown taxonomy the toggle keyframes the
+      // transmission-reduction dial (on → 0.4, off → 0).
+      params: { mobilityReduction: 0, compliance: 0 },
+      keyframes: [
+        { tick: 11, transmissionReduction: 0, params: { mobilityReduction: 0, compliance: 0 } },
+        { tick: 12, transmissionReduction: 0.4, params: { mobilityReduction: 0, compliance: 0 } },
+        { tick: 39, transmissionReduction: 0.4, params: { mobilityReduction: 0, compliance: 0 } },
+        { tick: 40, transmissionReduction: 0, params: { mobilityReduction: 0, compliance: 0 } },
+      ],
     };
     expect(spec).toEqual(expected);
     // And the fit consumes it directly — full effect inside the on-window only.
@@ -883,10 +890,11 @@ describe('shared intervention shape + instant cancel', () => {
 });
 
 describe('crossover store, future persistence, future Bayes band, full progress', () => {
+  const dsnap = (protection: number) => ({ uptake: 1, protection, sourceControl: 0, mortalityReduction: 0 });
   const spec = (over: Partial<InterventionSpec> = {}): InterventionSpec => ({
     id: 'iv-x', intervention: 'custom', label: 'x', enabled: true,
-    transmissionReduction: 0.5,
-    timeline: { transmissionReduction: [{ tick: 10, value: 0 }, { tick: 20, value: 0.5 }] },
+    transmissionReduction: 0.5, params: dsnap(0.5),
+    keyframes: [{ tick: 10, params: dsnap(0) }, { tick: 20, params: dsnap(0.5) }],
     ...over,
   });
   const obs3: ObservedPoint[] = [[0, 5], [10, 60], [20, 200]].map(([day, value]) =>
@@ -911,13 +919,13 @@ describe('crossover store, future persistence, future Bayes band, full progress'
   it('interventions PERSIST into the future: last intensity holds unless explicitly zeroed', () => {
     const cfg = baseConfig({ size: 24, strain: { ...baseConfig().strain, attackRate: 0.35 } });
     const horizon = 80; // well past the "data" — the prediction region
-    const hold = transmissionSchedule([spec({ transmissionReduction: 0.8, timeline: { transmissionReduction: [{ tick: 10, value: 0 }, { tick: 20, value: 0.8 }] } })], horizon + 1)!;
+    const hold = transmissionSchedule([spec({ transmissionReduction: 0.8, params: dsnap(0.8), keyframes: [{ tick: 10, params: dsnap(0) }, { tick: 20, params: dsnap(0.8) }] })], horizon + 1)!;
     expect(hold[horizon]).toBeCloseTo(0.2, 12); // still fully active at the horizon
     const stopped = transmissionSchedule(
-      [spec({ transmissionReduction: 0.8, timeline: { transmissionReduction: [
-        { tick: 10, value: 0 }, { tick: 20, value: 0.8 },
-        { tick: 40, value: 0.8 }, { tick: 41, value: 0 }, // keyframed to 0 → releases
-      ] } })], horizon + 1)!;
+      [spec({ transmissionReduction: 0.8, params: dsnap(0.8), keyframes: [
+        { tick: 10, params: dsnap(0) }, { tick: 20, params: dsnap(0.8) },
+        { tick: 40, params: dsnap(0.8) }, { tick: 41, params: dsnap(0) }, // keyframed to 0 → releases
+      ] })], horizon + 1)!;
     expect(stopped[horizon]).toBeCloseTo(1, 12); // released after the stop
     // Behavioral: the held intervention suppresses future growth; the stopped
     // one lets the epidemic resume — strictly more cumulative infections.
@@ -1010,10 +1018,11 @@ describe('rich intervention params: the model honors the FULL main-sim spec', ()
 
   it('keyframing a REAL param varies the model over time; releases when keyframed to 0', () => {
     // Mask with uptake keyframed: full early, keyframed to 0 at day 31.
+    const mk = (uptake: number) => ({ uptake, protection: 0.5, sourceControl: 0.5, mortalityReduction: 0 });
     const rich = base({
       intervention: 'mask',
-      params: { uptake: 1, protection: 0.5, sourceControl: 0.5, mortalityReduction: 0 },
-      timeline: { uptake: [{ tick: 0, value: 1 }, { tick: 30, value: 1 }, { tick: 31, value: 0 }] },
+      params: mk(1),
+      keyframes: [{ tick: 0, params: mk(1) }, { tick: 30, params: mk(1) }, { tick: 31, params: mk(0) }],
     });
     const sched = transmissionSchedule([rich], 81)!;
     expect(sched[3]).toBeCloseTo(0.25, 12);  // uptake 1 → eff 0.75
@@ -1037,12 +1046,21 @@ describe('rich intervention params: the model honors the FULL main-sim spec', ()
       { id: 'old', intervention: 'quarantine', label: 'o', enabled: true, effect: 0.5, intensity: [{ day: 10, m: 0 }, { day: 20, m: 1 }] },
     ]);
     expect(migrated[0].intervention).toBe('custom'); // param-less typed legacy → custom
-    // Lossless defense mapping: uptake 1, protection carries the strength
-    // track, sourceControl 0 ⇒ eff = protection — schedules bit-identical.
-    expect(migrated[0].params).toEqual({ uptake: 1, protection: 0.5, sourceControl: 0, mortalityReduction: 0 });
-    expect(migrated[0].timeline!.protection).toBeDefined();
-    expect(migrated[0].timeline!.transmissionReduction).toBeUndefined();
+    // Lossless defense mapping: keyframes of full snapshots with protection
+    // carrying intensity·strength — schedules bit-identical.
+    expect(migrated[0].keyframes).toEqual([
+      { tick: 10, params: { uptake: 1, protection: 0, sourceControl: 0, mortalityReduction: 0 } },
+      { tick: 20, params: { uptake: 1, protection: 0.5, sourceControl: 0, mortalityReduction: 0 } },
+    ]);
     expect(transmissionSchedule(migrated, 31)![15]).toBeCloseTo(0.75, 12); // 0.5·0.5 at halfway
+    // v3 per-param tracks also migrate exactly (union-of-ticks resolution).
+    const v3 = migrateInterventionSpecs([{
+      id: 'v3', intervention: 'custom', label: 'v', enabled: true, transmissionReduction: 0.5,
+      params: { uptake: 1, protection: 0.5, sourceControl: 0, mortalityReduction: 0 },
+      timeline: { protection: [{ tick: 10, value: 0 }, { tick: 20, value: 0.5 }] },
+    }]);
+    expect(v3[0].keyframes!.map((k) => [k.tick, k.params.protection])).toEqual([[10, 0], [20, 0.5]]);
+    expect(transmissionSchedule(v3, 31)![15]).toBeCloseTo(0.75, 12);
   });
 
   it("'custom' shares the SAME defense param schema as mask/vaccine", () => {
