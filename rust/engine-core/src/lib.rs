@@ -2,9 +2,14 @@
 //
 // This is a LINE-FAITHFUL port of `src/sim/engine.ts` (the Phase-1 event-driven
 // engine) for the single-strain configuration space: square / triangular /
-// hexagonal / mean-field geometries, defenses, lockdown, quarantine, births,
-// waning, txSchedule, and extinction reseed. Voronoi and strain mutation stay
-// on the TypeScript engine (the wrapper's compatibility gate routes them there).
+// hexagonal / mean-field / voronoi geometries, defenses, lockdown, quarantine,
+// births, waning, txSchedule, and extinction reseed. Strain mutation stays on
+// the TypeScript engine (the wrapper's compatibility gate routes it there).
+//
+// Voronoi neighborhoods are per-cell CSR lists (absolute indices) precomputed
+// by the TS geometry layer (VoronoiLattice.getNeighborIndices — direct CSR for
+// range 1, BFS order beyond) and copied in verbatim, so iteration order is the
+// TS order by construction, exactly like the lattice parity tables.
 //
 // Determinism contract: the TS wrapper seeds the population buffers directly in
 // this module's memory using the TS `seed()` (identical draws), then hands over
@@ -95,7 +100,7 @@ struct Params {
     q_src_mul: f64,  // 1 - sourceControl when on, else 1
     q_duration: i32,
     // misc
-    geometry: i32, // 0 square, 1 triangular, 2 hexagonal, 3 meanfield
+    geometry: i32, // 0 square, 1 triangular, 2 hexagonal, 3 meanfield, 4 voronoi
     birth_rate: f64,
     reseed_on: bool,
 }
@@ -128,6 +133,10 @@ struct Sim {
     // parity 0 for both. role 0 = transmission range, 1 = quarantine contacts,
     // 2 = birth range-1.
     tables: [[Vec<i32>; 2]; 3],
+    // Voronoi per-cell CSR neighbor lists per role (geometry 4): offsets is
+    // n+1 long, list holds absolute cell indices in TS iteration order.
+    csr_offsets: [Vec<i32>; 3],
+    csr_list: [Vec<i32>; 3],
     sched: Vec<f64>,
     // per-step stats out: [s,e,i,r,d,newInf,newInfectious,newDeaths,newRecovered,masked,vax,quar]
     stats: [i32; 12],
@@ -268,6 +277,8 @@ impl Sim {
         // 1) Transmission.
         if self.p.geometry == 3 {
             new_infections = self.transmit_mean_field(tick);
+        } else if self.p.geometry == 4 {
+            new_infections = self.transmit_spatial_csr(tick);
         } else {
             new_infections = self.transmit_spatial(tick);
         }
@@ -294,6 +305,27 @@ impl Sim {
                 self.q_expiry[i] = expiry;
                 self.schedule_quar(i as u32, expiry);
                 if mean_field {
+                    continue;
+                }
+                if self.p.geometry == 4 {
+                    let lo = self.csr_offsets[1][i] as usize;
+                    let hi = self.csr_offsets[1][i + 1] as usize;
+                    for k in lo..hi {
+                        let j = self.csr_list[1][k] as usize;
+                        if j == i {
+                            continue;
+                        }
+                        if self.quarantined[j] == 0 {
+                            self.quarantined[j] = 1;
+                            if self.state[j] != ST_D {
+                                self.quar_living += 1;
+                            }
+                        }
+                        if self.q_expiry[j] < expiry {
+                            self.q_expiry[j] = expiry;
+                            self.schedule_quar(j as u32, expiry);
+                        }
+                    }
                     continue;
                 }
                 let x = (i % self.size) as i32;
@@ -404,6 +436,23 @@ impl Sim {
                 let i = self.d_list[k] as usize;
                 let p = if mean_field {
                     self.p.birth_rate
+                } else if self.p.geometry == 4 {
+                    // TS neighborAliveFraction voronoi branch: alive/len over
+                    // the direct CSR neighbors, empty degree → 0.5.
+                    let lo = self.csr_offsets[2][i] as usize;
+                    let hi = self.csr_offsets[2][i + 1] as usize;
+                    let frac = if hi == lo {
+                        0.5
+                    } else {
+                        let mut alive = 0i32;
+                        for k in lo..hi {
+                            if self.state[self.csr_list[2][k] as usize] != ST_D {
+                                alive += 1;
+                            }
+                        }
+                        alive as f64 / (hi - lo) as f64
+                    };
+                    self.p.birth_rate * frac
                 } else {
                     let x = (i % self.size) as i32;
                     let y = (i / self.size) as i32;
@@ -560,6 +609,62 @@ impl Sim {
                     let ny = torus(y + dy, size);
                     (ny * size + nx) as usize
                 };
+                if self.state[j] != ST_S {
+                    continue;
+                }
+                let mut prot_mul = self.p.prot_by_mask[(self.defenses[j] & 3) as usize];
+                if quarantine_on && self.quarantined[j] != 0 {
+                    prot_mul *= self.p.q_prot_mul;
+                }
+                let p = atk_src * prot_mul;
+                if p <= 0.0 {
+                    continue;
+                }
+                if self.rng.bernoulli(p) && self.next[j] == ST_S {
+                    self.next[j] = ST_E;
+                    self.exposed_at[j] = tick;
+                    let t2 = tick + self.p.incub.max(1);
+                    self.schedule_life(j as u32, t2);
+                    self.census[ST_S as usize] -= 1;
+                    self.census[ST_E as usize] += 1;
+                    new_infections += 1;
+                }
+            }
+        }
+        new_infections
+    }
+
+    /// Voronoi transmission — the exact TS `transmitSpatial` voronoi branch:
+    /// same per-attacker multipliers and same per-neighbor draw order, with the
+    /// neighbor source swapped from parity offsets to the per-cell CSR list.
+    fn transmit_spatial_csr(&mut self, tick: i32) -> i32 {
+        let tx_mul = self.tx_mul_now();
+        let base_attack = self.p.attack * tx_mul;
+        let lockdown_on = self.p.lockdown_on;
+        let lockdown_skip_p = if lockdown_on { self.p.mobility } else { 0.0 };
+        let quarantine_on = self.p.quarantine_on;
+        let mut new_infections = 0i32;
+
+        let i_count = self.i_list.len();
+        for c in 0..i_count {
+            let i = self.i_list[c] as usize;
+            let mut src_mul = self.p.src_by_mask[(self.defenses[i] & 3) as usize];
+            if quarantine_on && self.quarantined[i] != 0 {
+                src_mul *= self.p.q_src_mul;
+            }
+            src_mul *= self.p.trans_mul;
+            let atk_src = base_attack * src_mul;
+            if atk_src <= 0.0 {
+                continue;
+            }
+            let src_under_lockdown = lockdown_on && self.lockdown_compliant[i] == 1;
+            let lo = self.csr_offsets[0][i] as usize;
+            let hi = self.csr_offsets[0][i + 1] as usize;
+            for k in lo..hi {
+                if src_under_lockdown && lockdown_skip_p > 0.0 && self.rng.bernoulli(lockdown_skip_p) {
+                    continue;
+                }
+                let j = self.csr_list[0][k] as usize;
                 if self.state[j] != ST_S {
                     continue;
                 }
@@ -751,6 +856,8 @@ pub extern "C" fn init(size: u32) {
         vaccinated_living: 0,
         quar_living: 0,
         tables: Default::default(),
+        csr_offsets: Default::default(),
+        csr_list: Default::default(),
         sched: Vec::new(),
         stats: [0; 12],
     };
@@ -821,6 +928,25 @@ pub extern "C" fn set_misc(geometry: i32, birth_rate: f64, reseed_on: i32) {
 #[no_mangle]
 pub extern "C" fn table_alloc(role: u32, parity: u32, len: u32) -> *mut i32 {
     let t = &mut sim().tables[role as usize][parity as usize];
+    t.clear();
+    t.resize(len as usize, 0);
+    t.as_mut_ptr()
+}
+
+/// Allocate the voronoi CSR offsets array for `role` (n+1 i32s) and return its
+/// pointer; the JS side writes into it.
+#[no_mangle]
+pub extern "C" fn csr_offsets_alloc(role: u32, len: u32) -> *mut i32 {
+    let t = &mut sim().csr_offsets[role as usize];
+    t.clear();
+    t.resize(len as usize, 0);
+    t.as_mut_ptr()
+}
+
+/// Allocate the voronoi CSR neighbor list for `role` (absolute cell indices).
+#[no_mangle]
+pub extern "C" fn csr_list_alloc(role: u32, len: u32) -> *mut i32 {
+    let t = &mut sim().csr_list[role as usize];
     t.clear();
     t.resize(len as usize, 0);
     t.as_mut_ptr()

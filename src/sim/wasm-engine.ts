@@ -1,9 +1,9 @@
 // WASM engine backend (docs/perf-plan.md Phase 2).
 //
 // `WasmEngine` is a drop-in for `Engine` over the single-strain configuration
-// space: square / triangular / hexagonal / mean-field geometries with the full
-// intervention surface (defenses, lockdown, quarantine, births, waning,
-// txSchedule, extinction reseed). Voronoi and strain mutation stay on the TS
+// space: square / triangular / hexagonal / mean-field / voronoi geometries with
+// the full intervention surface (defenses, lockdown, quarantine, births,
+// waning, txSchedule, extinction reseed). Strain mutation stays on the TS
 // engine — `wasmCompatible()` is the gate, and `createEngine()` is the factory
 // callers use so the fallback is automatic.
 //
@@ -12,7 +12,8 @@
 //    memory (identical draws, identical buffers);
 //  - the post-seed xoshiro128** state is handed to wasm, which continues the
 //    exact stream with the identical algorithm and draw order;
-//  - neighbor tables come from the TS geometry layer verbatim.
+//  - neighbor tables come from the TS geometry layer verbatim (parity offset
+//    tables for lattices, per-cell CSR lists for voronoi).
 // `tests/wasm-engine.test.ts` enforces equality against the TS golden digests.
 //
 // The wasm binary is embedded as base64 (rust/build.sh) so Vite, GitHub Pages
@@ -23,7 +24,8 @@ import type { LongStats, RetiredCostTotals, SimConfig, SimStats, VoronoiTopology
 import { LongHistory } from './long-history';
 import { Rng } from './rng';
 import { seed } from './population';
-import { makeGeometry } from './neighbors';
+import { makeGeometry, VoronoiLattice, type LatticeGeometry } from './neighbors';
+import { buildVoronoi } from './voronoi';
 import { resolveDefenses } from './defense';
 import { Engine, estimateAnalyticR0, type EngineOptions, type PassProfile } from './engine';
 import { ENGINE_CORE_WASM_B64 } from './wasm/engine-core-b64';
@@ -45,6 +47,8 @@ interface CoreExports {
   set_quarantine(on: number, detRate: number, qProtMul: number, qSrcMul: number, duration: number): void;
   set_misc(geometry: number, birthRate: number, reseedOn: number): void;
   table_alloc(role: number, parity: number, len: number): number;
+  csr_offsets_alloc(role: number, len: number): number;
+  csr_list_alloc(role: number, len: number): number;
   sched_alloc(len: number): number;
   finalize_init(): void;
   step(): void;
@@ -91,19 +95,19 @@ export function wasmAvailable(): boolean {
   return typeof WebAssembly !== 'undefined' && getModule() !== null;
 }
 
-/** Is this config inside the wasm engine's feature space? Voronoi needs the
- *  CSR topology and mutation needs the strain pool — both stay on the TS
- *  reference engine. */
+/** Is this config inside the wasm engine's feature space? Mutation needs the
+ *  strain pool and stays on the TS reference engine. */
 export function wasmCompatible(config: SimConfig): boolean {
-  return (config.geometry ?? 'square') !== 'voronoi' && config.mutate !== true;
+  return config.mutate !== true;
 }
 
-const GEOMETRY_CODE: Record<string, number> = { square: 0, triangular: 1, hexagonal: 2, meanfield: 3 };
+const GEOMETRY_CODE: Record<string, number> = { square: 0, triangular: 1, hexagonal: 2, meanfield: 3, voronoi: 4 };
 
 export class WasmEngine {
   private exports!: CoreExports;
   private config!: SimConfig;
   private txSchedule: number[] | null = null;
+  private geometryInst: LatticeGeometry = makeGeometry('square');
 
   tick = 0;
   history: LongHistory = new LongHistory();
@@ -124,17 +128,36 @@ export class WasmEngine {
     return this.history.toLongStats();
   }
 
-  constructor(config: SimConfig, _prebuiltTopo?: VoronoiTopology | null, opts?: EngineOptions) {
+  constructor(config: SimConfig, prebuiltTopo?: VoronoiTopology | null, opts?: EngineOptions) {
     const mod = getModule();
     if (!mod) throw new Error('wasm unavailable');
     if (!wasmCompatible(config)) throw new Error('config outside wasm engine feature space');
     this.exports = new WebAssembly.Instance(mod).exports as unknown as CoreExports;
-    this.reset(config, _prebuiltTopo, opts);
+    this.reset(config, prebuiltTopo, opts);
   }
 
-  reset(config: SimConfig, _prebuiltTopo?: VoronoiTopology | null, opts?: EngineOptions): void {
+  reset(config: SimConfig, prebuiltTopo?: VoronoiTopology | null, opts?: EngineOptions): void {
     if (!wasmCompatible(config)) throw new Error('config outside wasm engine feature space');
     this.config = config;
+    // Geometry mirrors Engine.reset: voronoi builds (or adopts) its topology
+    // with the same derived seed, everything else uses the shared lattices.
+    if ((config.geometry ?? 'square') === 'voronoi') {
+      const topo = prebuiltTopo ?? buildVoronoi(
+        config.size * config.size,
+        config.voronoiConfig,
+        new Rng(config.seed ^ 0x564f524f),
+        false,
+      );
+      // Keep the lattice (and its BFS cache) when the topology is unchanged —
+      // the fit path resets thousands of trials against one shared topo.
+      if (topo !== this.voronoiTopo || !(this.geometryInst instanceof VoronoiLattice)) {
+        this.geometryInst = new VoronoiLattice(topo);
+      }
+      this.voronoiTopo = topo;
+    } else {
+      this.voronoiTopo = null;
+      this.geometryInst = makeGeometry(config.geometry);
+    }
     const ex = this.exports;
     const n = config.size * config.size;
     ex.init(config.size);
@@ -195,7 +218,7 @@ export class WasmEngine {
     this.retiredCost = emptyRetired();
     this.rNaught = opts !== undefined && opts.rNaught !== undefined
       ? opts.rNaught
-      : estimateAnalyticR0(config, makeGeometry(config.geometry), null);
+      : estimateAnalyticR0(config, this.geometryInst, this.voronoiTopo);
   }
 
   private pushParams(config: SimConfig): void {
@@ -223,8 +246,12 @@ export class WasmEngine {
    *  Square/mean-field have no parity dependence — the same table fills both
    *  slots (empty for mean-field). */
   private pushTables(config: SimConfig): void {
-    const ex = this.exports;
     const geoType = config.geometry ?? 'square';
+    if (geoType === 'voronoi') {
+      this.pushCsrTables(config, this.geometryInst as VoronoiLattice);
+      return;
+    }
+    const ex = this.exports;
     const geo = makeGeometry(geoType);
     const contactsRange = Math.max(1, config.quarantine.contactsRange | 0);
     const roles: Array<[number, number]> = [
@@ -249,6 +276,53 @@ export class WasmEngine {
         const ptr = ex.table_alloc(role, parity, offsets.length);
         if (offsets.length > 0) {
           new Int32Array(ex.memory.buffer as ArrayBuffer, ptr, offsets.length).set(offsets);
+        }
+      }
+    }
+  }
+
+  /** Voronoi: per-cell CSR neighbor lists per role, in the exact order the TS
+   *  engine iterates them (VoronoiLattice.getNeighborIndices — direct CSR for
+   *  range 1, BFS discovery order beyond). Role 1 (quarantine contacts) can be
+   *  BFS-heavy at contactsRange > 1, so it is only materialized while
+   *  quarantine is enabled; patchConfig re-pushes tables on every change, so
+   *  enabling quarantine rebuilds it before the core ever reads it. */
+  private pushCsrTables(config: SimConfig, lat: VoronoiLattice): void {
+    const ex = this.exports;
+    const n = config.size * config.size;
+    const contactsRange = Math.max(1, config.quarantine.contactsRange | 0);
+    const roles: Array<[number, number, boolean]> = [
+      [0, Math.max(1, Math.floor(config.strain.range)), true],
+      [1, contactsRange, config.quarantine.enabled === true],
+      [2, 1, true],
+    ];
+    for (const [role, range, wanted] of roles) {
+      if (!wanted) {
+        ex.csr_offsets_alloc(role, 0);
+        ex.csr_list_alloc(role, 0);
+        continue;
+      }
+      const offsets = new Int32Array(n + 1);
+      const lists: Int32Array[] = new Array(n);
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        const nb = lat.getNeighborIndices!(i, range);
+        lists[i] = nb;
+        offsets[i] = total;
+        total += nb.length;
+      }
+      offsets[n] = total;
+      // Write offsets before the list alloc; a memory.grow in between preserves
+      // contents, and every view is taken fresh after its own alloc.
+      const offPtr = ex.csr_offsets_alloc(role, n + 1);
+      new Int32Array(ex.memory.buffer as ArrayBuffer, offPtr, n + 1).set(offsets);
+      const listPtr = ex.csr_list_alloc(role, total);
+      if (total > 0) {
+        const flat = new Int32Array(ex.memory.buffer as ArrayBuffer, listPtr, total);
+        let w = 0;
+        for (let i = 0; i < n; i++) {
+          flat.set(lists[i], w);
+          w += lists[i].length;
         }
       }
     }
@@ -292,7 +366,7 @@ export class WasmEngine {
       ex.rebuild_schedules(timingChanged ? 1 : 0, waneChanged ? 1 : 0);
     }
     this.config = newCfg;
-    this.rNaught = estimateAnalyticR0(newCfg, makeGeometry(newCfg.geometry), null);
+    this.rNaught = estimateAnalyticR0(newCfg, this.geometryInst, this.voronoiTopo);
   }
 
   step(): SimStats {

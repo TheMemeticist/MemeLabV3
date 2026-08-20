@@ -192,12 +192,16 @@ Every phase met or beat its bull target; every gate passed.
 All three phases are now INTEGRATED in the app, not just spiked:
 
 - **Phase 2 committed port**: `rust/engine-core` (full single-strain feature
-  surface: square/tri/hex/mean-field, defenses, lockdown, quarantine, births,
-  waning, txSchedule, reseed, patchConfig ops) behind
+  surface: square/tri/hex/mean-field/voronoi, defenses, lockdown, quarantine,
+  births, waning, txSchedule, reseed, patchConfig ops) behind
   `src/sim/wasm-engine.ts`. **Bit-identical to the TS engine** — the TS seed()
   seeds wasm memory directly and hands over the RNG state, so there is no
-  digest family split. The fit path (`lib/fit-sim.ts`) uses it automatically;
-  measured fit total vs the pre-P1 engine: 30.6 s → 6.8 s (4.5×).
+  digest family split. Voronoi neighborhoods are per-cell CSR lists
+  precomputed by the TS geometry layer (direct CSR at range 1, BFS order
+  beyond) and copied in verbatim; measured voronoi 128²: 4,635 → 11,462 t/s
+  (2.5× over the P1 TS engine). The fit path (`lib/fit-sim.ts`) uses wasm
+  automatically; measured fit total vs the pre-P1 engine: 30.6 s → 6.8 s
+  (4.5×).
 - **Phase 3 committed backend**: `src/sim/gpu-engine.ts` + async loop in
   `sim.worker.ts`. The WGSL was validated headlessly on real hardware before
   shipping (compile + pipeline + 100-tick conservation run), which caught a

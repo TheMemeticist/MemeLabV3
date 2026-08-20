@@ -335,6 +335,13 @@ export class GpuEngine {
     if (!gpuCompatible(config)) throw new Error('config outside gpu engine feature space');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('no WebGPU adapter');
+    // A software adapter (SwiftShader/llvmpipe) is slower than the WASM engine —
+    // treat it as unavailable so the fallback reason can point at the real fix.
+    const info = (adapter as GPUAdapter & { info?: GPUAdapterInfo }).info;
+    const softId = `${info?.vendor ?? ''} ${info?.architecture ?? ''} ${info?.description ?? ''}`.toLowerCase();
+    if (/swiftshader|llvmpipe|software/.test(softId) || (adapter as unknown as { isFallbackAdapter?: boolean }).isFallbackAdapter === true) {
+      throw new Error('software WebGPU adapter');
+    }
     const device = await adapter.requestDevice();
     const e = new GpuEngine();
     e.device = device;

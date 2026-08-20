@@ -15,6 +15,7 @@ function goldenConfig(geometry: GeometryType): SimConfig {
     seed: 0x5eed5eed >>> 0,
     size: 48,
     geometry,
+    voronoiConfig: { mode: 'jittered', irregularity: 0.5 },
     seedInfections: 0.03,
     birthRate: 0.05,
     mutate: false,
@@ -34,7 +35,7 @@ function expectSameStats(sa: SimStats, sb: SimStats): void {
   );
 }
 
-const WASM_GEOMETRIES: GeometryType[] = ['square', 'triangular', 'hexagonal', 'meanfield'];
+const WASM_GEOMETRIES: GeometryType[] = ['square', 'triangular', 'hexagonal', 'meanfield', 'voronoi'];
 
 describe('WasmEngine ↔ Engine bit-parity', () => {
   it('wasm is available in this runtime', () => {
@@ -108,6 +109,49 @@ describe('WasmEngine ↔ Engine bit-parity', () => {
     for (let t = 0; t < 60; t++) expectSameStats(dirty.step(), fresh.step());
   });
 
+  it('voronoi: a shared prebuilt topology gives the same stream as self-built', () => {
+    const cfg = goldenConfig('voronoi');
+    const self = new WasmEngine(goldenConfig('voronoi'));
+    const ts = new Engine(goldenConfig('voronoi'));
+    const shared = new WasmEngine(cfg, ts.voronoiTopo);
+    for (let t = 0; t < 100; t++) {
+      const a = self.step();
+      expectSameStats(a, shared.step());
+      expectSameStats(a, ts.step());
+    }
+  });
+
+  it('voronoi: BFS ranges (strain.range 2, contactsRange 2) stay bit-identical', () => {
+    const mk = () => {
+      const cfg = goldenConfig('voronoi');
+      cfg.strain.range = 2;
+      cfg.quarantine.contactsRange = 2;
+      return cfg;
+    };
+    const ts = new Engine(mk());
+    const wa = new WasmEngine(mk());
+    for (let t = 0; t < 120; t++) expectSameStats(ts.step(), wa.step());
+    expect(wa.buffers().state).toEqual(ts.buffers().state);
+    expect(wa.buffers().quarantined).toEqual(ts.buffers().quarantined);
+  });
+
+  it('voronoi: patchConfig enabling quarantine materializes the contacts CSR in parity', () => {
+    const mk = () => {
+      const cfg = goldenConfig('voronoi');
+      cfg.quarantine.enabled = false; // role-1 CSR deliberately not built
+      return cfg;
+    };
+    const ts = new Engine(mk());
+    const wa = new WasmEngine(mk());
+    for (let t = 0; t < 30; t++) expectSameStats(ts.step(), wa.step());
+    const on = mk();
+    on.quarantine.enabled = true;
+    ts.patchConfig(structuredClone(on));
+    wa.patchConfig(structuredClone(on));
+    for (let t = 0; t < 60; t++) expectSameStats(ts.step(), wa.step());
+    expect(wa.buffers().quarantined).toEqual(ts.buffers().quarantined);
+  });
+
   it('conservation holds: S+E+I+R+D = N every tick', () => {
     const cfg = goldenConfig('triangular');
     const wa = new WasmEngine(cfg);
@@ -120,12 +164,10 @@ describe('WasmEngine ↔ Engine bit-parity', () => {
 });
 
 describe('createEngine factory + compatibility gate', () => {
-  it('routes voronoi and mutation to the TS reference engine', () => {
-    const voronoi = goldenConfig('square');
-    voronoi.geometry = 'voronoi';
-    voronoi.voronoiConfig = { mode: 'jittered', irregularity: 0.5 };
-    expect(wasmCompatible(voronoi)).toBe(false);
-    expect(createEngine(voronoi, null, undefined, true)).toBeInstanceOf(Engine);
+  it('routes mutation to the TS reference engine; voronoi now runs on wasm', () => {
+    const voronoi = goldenConfig('voronoi');
+    expect(wasmCompatible(voronoi)).toBe(true);
+    expect(createEngine(voronoi, null, undefined, true)).toBeInstanceOf(WasmEngine);
 
     const mutating = goldenConfig('square');
     mutating.mutate = true;

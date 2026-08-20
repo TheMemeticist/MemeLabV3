@@ -31,8 +31,8 @@ let cachedTopoKey: string | null = null;
 //
 // Backend: the WASM engine when the config is inside its feature space (it is
 // BIT-IDENTICAL to the TS engine — tests/wasm-engine.test.ts — so fits produce
-// the same results either way, just faster); the TS engine for voronoi /
-// mutation configs or when wasm is unavailable.
+// the same results either way, just faster); the TS engine for mutation
+// configs or when wasm is unavailable.
 let cachedEngine: AnyEngine | null = null;
 
 function engineFor(config: SimConfig, topo: VoronoiTopology | undefined, opts: EngineOptions): AnyEngine {

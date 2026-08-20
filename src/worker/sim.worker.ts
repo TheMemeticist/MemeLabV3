@@ -140,20 +140,23 @@ function disposeGpu(): void {
 
 /** Why this config can't run on the wasm engine — names the feature AND the
  *  fix, because a bare "CPU" label reads as a broken toggle. */
-function wasmBlockReason(config: SimConfig): string {
-  if (config.mutate === true) return '🧬 natural selection is multi-strain — CPU engine only. Turn 🧬 off to use WASM/GPU';
-  return 'Voronoi geometry runs on the CPU engine — switch lattice geometry to use WASM/GPU';
+function wasmBlockReason(_config: SimConfig): string {
+  return '🧬 natural selection is multi-strain — CPU engine only. Turn 🧬 off to use WASM/GPU';
 }
 
 function gpuBlockReason(config: SimConfig): string {
-  if (config.mutate === true || (config.geometry ?? 'square') === 'voronoi') return wasmBlockReason(config);
+  if (config.mutate === true) return wasmBlockReason(config);
+  if ((config.geometry ?? 'square') === 'voronoi') return 'Voronoi geometry runs on the CPU/WASM engines — switch to a lattice geometry to use GPU';
   return 'extinction reseed runs on the CPU engines — disable it to use GPU';
 }
 
 function gpuInitFailReason(err: unknown): string {
   const msg = String((err as Error)?.message ?? err ?? '');
+  if (/software/i.test(msg)) {
+    return 'only a software WebGPU adapter (SwiftShader) is available — enable chrome://flags/#enable-vulkan and relaunch to use your real GPU';
+  }
   if (/adapter/i.test(msg)) {
-    return 'no GPU adapter — on Linux Chrome enable chrome://flags/#enable-unsafe-webgpu and relaunch';
+    return 'no GPU adapter — on Linux Chrome enable chrome://flags/#enable-vulkan and relaunch';
   }
   return `WebGPU init failed (${msg || 'unknown error'})`;
 }
@@ -184,7 +187,11 @@ function rebuild(config: SimConfig): void {
 
   if (requestedBackend === 'gpu') {
     if (!gpuSupported()) {
-      buildCpuEngine(config, topo, 'WebGPU not available in this browser');
+      // WebGPU is a secure-context API: on a plain-http origin navigator.gpu
+      // does not exist at all, and no browser flag can change that.
+      buildCpuEngine(config, topo, self.isSecureContext
+        ? 'WebGPU not available in this browser'
+        : 'WebGPU needs a secure origin — open the app over HTTPS (or localhost)');
       return;
     }
     if (!gpuCompatible(config)) {
