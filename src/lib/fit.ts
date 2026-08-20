@@ -907,11 +907,27 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
       req.signal,
       postTick,
     );
+    // TRUE posterior-predictive: for each retained parameter draw, sample ONE
+    // stochastic realization (K = 1, per-draw decorrelated seed) instead of the
+    // K-trial mean — the band then carries parameter AND process uncertainty,
+    // as a predictive band should. Deterministic: seeds derive from the base
+    // seed and the draw index; the pool caches by (genes, K, seed).
     const drawCurves: SimCurves[] = [];
-    for (const v of chain) {
+    for (let i = 0; i < chain.length; i++) {
       if (req.signal?.aborted) break;
-      const { result } = await evalAt(v, req.K);
-      if (result.curves.cumulative_infections.length) drawCurves.push(result.curves);
+      const v = chain[i];
+      try {
+        const one = await req.simulate(
+          configFor(v),
+          days,
+          1,
+          (baseSeed ^ ((0x51ab3d7 + i * 0x9e3779b1) >>> 0)) >>> 0,
+          schedFor(offsetOf(v)),
+        );
+        if (one.curves.cumulative_infections.length) drawCurves.push(one.curves);
+      } catch (err) {
+        if (!req.signal?.aborted) throw err;
+      }
       postTick();
     }
     if (drawCurves.length && !req.signal?.aborted) bayes = percentileBands(drawCurves, BAND_PROBS);

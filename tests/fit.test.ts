@@ -960,6 +960,10 @@ describe('crossover store, future persistence, future Bayes band, full progress'
     const width = (d: number): number => rows[2][d] - rows[0][d];
     expect(rows[1][r.days]).toBeGreaterThan(0);           // central projects into the future
     expect(width(r.days)).toBeGreaterThanOrEqual(width(20)); // plausible range widens (or holds)
+    // Posterior-PREDICTIVE: single-realization draws carry process noise, so
+    // the band must have real, visible width — not collapse to a hairline.
+    expect(width(r.days)).toBeGreaterThan(0);
+    expect(Math.max(...rows[0].map((_, d) => width(d)))).toBeGreaterThan(0.001); // ≥0.1% of pop somewhere
   }, 30_000);
 
   it('progress reaches 100% through ALL stages, monotonically (no 32% stall)', async () => {

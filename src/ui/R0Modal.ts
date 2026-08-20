@@ -970,7 +970,6 @@ export class R0Modal {
           </select>
           <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">×</button>
         </div>
-        <div class="r0-itv-params" data-iv="params"></div>
         <div class="r0-itv-kf" data-iv="kf">
           <div class="r0-itv-kf-head">
             <span class="r0-history-group" title="A keyframe is a day plus this intervention's full param values on that day. Click a row to expand its sliders. Params interpolate linearly between keyframe days and HOLD outside the first/last — interventions persist into the prediction horizon unless keyframed to 0.">⏱ Keyframes</span>
@@ -998,6 +997,10 @@ export class R0Modal {
       card.querySelector<HTMLSelectElement>('[data-iv="tax"]')!.addEventListener('change', (e) => {
         iv.intervention = (e.target as HTMLSelectElement).value as InterventionSpec['intervention'];
         this.seedParams(iv);
+        // The param fields changed shape — restart the timeline from one
+        // seeded keyframe at the old first day.
+        const firstTick = iv.keyframes?.[0]?.tick ?? 0;
+        iv.keyframes = [{ tick: firstTick, transmissionReduction: iv.transmissionReduction, params: { ...(iv.params ?? {}) } }];
         persist();
         this.renderInterventions();
       });
@@ -1007,26 +1010,21 @@ export class R0Modal {
         this.renderInterventions();
       });
 
-      // ── TOP: base param sliders (the values when no keyframes exist) ──
-      const paramsHost = card.querySelector<HTMLElement>('[data-iv="params"]')!;
-      this.renderParamSliders(paramsHost, iv, {
-        idSuffix: 'base',
-        getTr: () => iv.transmissionReduction,
-        setTr: (v) => { iv.transmissionReduction = v; },
-        getP: (f) => (iv.params?.[f] as number | undefined),
-        setP: (f, v) => { if (!iv.params) iv.params = {}; iv.params[f] = v; },
-        onEdit: () => { refreshEff(); persist(); },
-      });
-
-      // ── BOTTOM: keyframes — a day row each, expanding to ITS param sliders ──
+      // ── Keyframes — a day row each, expanding to ITS param sliders. The
+      // sliders live ONLY inside keyframes: an intervention without any gets
+      // one default keyframe at day 0 seeded from its base params (constant
+      // behavior — specAtDay with a single keyframe holds it everywhere). ──
       const kfList = card.querySelector<HTMLElement>('[data-iv="kf-list"]')!;
-      const kfs = (iv.keyframes ?? (iv.keyframes = [])).sort((a, b) => a.tick - b.tick);
+      if (!iv.keyframes || iv.keyframes.length === 0) {
+        iv.keyframes = [{ tick: 0, transmissionReduction: iv.transmissionReduction, params: { ...(iv.params ?? {}) } }];
+      }
+      const kfs = iv.keyframes.sort((a, b) => a.tick - b.tick);
       kfs.forEach((kf, ki) => {
         const row = document.createElement('div');
         row.className = 'r0-kf-row';
         row.innerHTML = `
           <div class="r0-kf-row-head" role="button" tabindex="0" aria-label="Toggle keyframe ${ki + 1} sliders">
-            <span class="r0-kf-caret" aria-hidden="true">▸</span>
+            <button class="r0-kf-caret" type="button" aria-label="Expand or collapse this keyframe">▸</button>
             <label>day <input class="r0-in tiny" type="number" step="1" value="${kf.tick}" data-kf="day" aria-label="Keyframe day" /></label>
             <button class="r0-del" type="button" aria-label="Delete keyframe" ${kfs.length <= 1 ? 'disabled' : ''}>×</button>
           </div>
@@ -1052,6 +1050,9 @@ export class R0Modal {
         };
         head.addEventListener('click', (ev) => {
           const t = ev.target as HTMLElement;
+          // The chevron button always toggles; the day input and the delete
+          // button never do; anywhere else on the row toggles too.
+          if (t.closest('.r0-kf-caret')) { toggle(); return; }
           if (t.closest('input') || t.closest('button')) return;
           toggle();
         });
@@ -2117,15 +2118,22 @@ export class R0Modal {
       const color = CAT_COLOR[cat];
       const rows = fan?.[cat];
       if (rows) {
-        // BAND_PROBS = [5, 50, 95] → one LOW..HIGH posterior-predictive fill.
-        const pairs: [number, number, number][] = [[0, 2, 0.16]];
-        for (const [lo, hi, alpha] of pairs) {
+        // BAND_PROBS = [5, 50, 95] → LOW..HIGH posterior-predictive fill with
+        // explicit dashed edge lines so even a narrow band reads as a band.
+        ctx.beginPath();
+        rows[2].forEach((v, d) => { if (d === 0) ctx.moveTo(X(0), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+        for (let d = rows[0].length - 1; d >= 0; d--) ctx.lineTo(X(d), Y(rows[0][d]));
+        ctx.closePath();
+        ctx.fillStyle = withAlpha(color, 0.28);
+        ctx.fill();
+        for (const edge of [0, 2]) {
           ctx.beginPath();
-          rows[hi].forEach((v, d) => { if (d === 0) ctx.moveTo(X(0), Y(v)); else ctx.lineTo(X(d), Y(v)); });
-          for (let d = rows[lo].length - 1; d >= 0; d--) ctx.lineTo(X(d), Y(rows[lo][d]));
-          ctx.closePath();
-          ctx.fillStyle = withAlpha(color, alpha);
-          ctx.fill();
+          rows[edge].forEach((v, d) => { if (d === 0) ctx.moveTo(X(0), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+          ctx.strokeStyle = withAlpha(color, 0.55);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.stroke();
+          ctx.setLineDash([]);
         }
       }
       const a = adj?.[cat];
