@@ -30,7 +30,7 @@ import {
 } from '../lib/fit';
 import type {
   FitCategory,
-  InterventionDef,
+  InterventionSpec,
   FitParamDef,
   FitParamName,
   FitProgress,
@@ -105,7 +105,7 @@ interface DemoPreset {
   /** Default underreporting keyframes loaded (enabled) with the preset. */
   adjust?: { t0: number; cases: Keyframe[]; deaths: Keyframe[] };
   /** Default interventions (time-varying transmission) loaded with the preset. */
-  interventions?: InterventionDef[];
+  interventions?: InterventionSpec[];
 }
 
 // Build observed points from [day, value] pairs for a single category.
@@ -305,7 +305,7 @@ interface R0Snapshot {
   fanTrials?: number; // legacy (index-case ensemble) — ignored
   bayesDraws?: number;
   predictionDays?: number;
-  interventions?: InterventionDef[];
+  interventions?: InterventionSpec[];
   adjust?: AdjustSettings;
   offsetEvolve?: boolean;
   offsetBounds?: [number, number];
@@ -349,7 +349,7 @@ export class R0Modal {
   private predictionDays = 0;
   // Interventions: time-varying transmission R(t) — the MODEL dimension,
   // separate from the case/death DATA adjustment.
-  private interventions: InterventionDef[] = [];
+  private interventions: InterventionSpec[] = [];
   private itvSeq = 0; // display-only id counter (never feeds the sim)
   private adjust: AdjustSettings = { ...DEFAULT_ADJUST };
   private running = false;
@@ -470,7 +470,7 @@ export class R0Modal {
       history: this.history,
       bayesDraws: this.bayesDraws,
       predictionDays: this.predictionDays,
-      interventions: this.interventions.map((iv) => ({ ...iv, intensity: iv.intensity.map((f) => ({ ...f })) })),
+      interventions: this.interventions.map((iv) => ({ ...iv, events: iv.events.map((f) => ({ ...f })) })),
       adjust: { ...this.adjust },
       offsetEvolve: this.offsetEvolve,
       offsetBounds: [...this.offsetBounds] as [number, number],
@@ -498,7 +498,22 @@ export class R0Modal {
     if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
     if (Number.isFinite(s.bayesDraws)) this.bayesDraws = Math.min(500, Math.max(0, Math.round(s.bayesDraws!)));
     if (Number.isFinite(s.predictionDays)) this.predictionDays = Math.min(365, Math.max(0, Math.round(s.predictionDays!)));
-    if (Array.isArray(s.interventions)) this.interventions = s.interventions.map((iv) => ({ ...iv, intensity: (iv.intensity ?? []).map((f) => ({ ...f })) }));
+    if (Array.isArray(s.interventions)) {
+      // Migrate pre-shared-shape snapshots ({effect, intensity:[{day,m}]}) to
+      // the live-sim-aligned InterventionSpec.
+      this.interventions = s.interventions.map((iv) => {
+        const legacy = iv as unknown as { effect?: number; intensity?: { day: number; m: number }[] };
+        return {
+          id: iv.id,
+          intervention: iv.intervention ?? 'custom',
+          label: iv.label,
+          enabled: iv.enabled,
+          transmissionReduction: iv.transmissionReduction ?? legacy.effect ?? 0.3,
+          events: (iv.events ?? (legacy.intensity ?? []).map((f) => ({ tick: f.day, intensity: f.m })))
+            .map((f) => ({ ...f })),
+        };
+      });
+    }
     if (s.adjust && typeof s.adjust === 'object') this.adjust = { ...DEFAULT_ADJUST, ...s.adjust };
     if (typeof s.offsetEvolve === 'boolean') this.offsetEvolve = s.offsetEvolve;
     if (Array.isArray(s.offsetBounds) && s.offsetBounds.length === 2) {
@@ -716,11 +731,12 @@ export class R0Modal {
       this.itvSeq++;
       this.interventions.push({
         id: `iv-${this.itvSeq}`,
+        intervention: 'custom',
         label: `Intervention ${this.interventions.length + 1}`,
         enabled: true,
-        effect: 0.3,
+        transmissionReduction: 0.3,
         // Sensible default: a 2-week ramp to full intensity starting mid-data.
-        intensity: [{ day: Math.round(lastObs / 2), m: 0 }, { day: Math.round(lastObs / 2) + 14, m: 1 }],
+        events: [{ tick: Math.round(lastObs / 2), intensity: 0 }, { tick: Math.round(lastObs / 2) + 14, intensity: 1 }],
       });
       const details = this.el?.querySelector<HTMLDetailsElement>('[data-r0="itv-details"]');
       if (details) details.open = true;
@@ -890,9 +906,9 @@ export class R0Modal {
    *  chart-day coordinates (data day + the given offset shift). */
   private itvWindows(offset: number): { from: number; to: number; label: string }[] {
     return this.interventions
-      .filter((iv) => iv.enabled && iv.effect > 0 && iv.intensity.length > 0)
+      .filter((iv) => iv.enabled && iv.transmissionReduction > 0 && iv.events.length > 0)
       .map((iv) => {
-        const days = iv.intensity.map((f) => f.day);
+        const days = iv.events.map((f) => f.tick);
         return { from: Math.min(...days) + offset, to: Math.max(...days) + offset, label: iv.label };
       });
   }
@@ -924,8 +940,8 @@ export class R0Modal {
             <input type="checkbox" data-iv="on" ${iv.enabled ? 'checked' : ''} />
           </label>
           <input class="r0-in r0-itv-name" type="text" value="${iv.label.replace(/"/g, '&quot;')}" data-iv="label" aria-label="Intervention name" />
-          <label class="r0-itv-effect" title="Maximum transmission reduction at full (100%) intensity. R(t) is multiplied by 1 − effect × intensity(t).">
-            −<input class="r0-in tiny" type="number" min="0" max="95" step="5" value="${Math.round(iv.effect * 100)}" data-iv="effect" aria-label="Max effect %" />% transmission
+          <label class="r0-itv-effect" title="Maximum transmission reduction at full (100%) intensity — the live sim's transmissionReduction. R(t) is multiplied by 1 − transmissionReduction × intensity(t).">
+            −<input class="r0-in tiny" type="number" min="0" max="95" step="5" value="${Math.round(iv.transmissionReduction * 100)}" data-iv="effect" aria-label="Max effect %" />% transmission
           </label>
           <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">×</button>
         </div>
@@ -943,8 +959,8 @@ export class R0Modal {
       });
       card.querySelector<HTMLInputElement>('[data-iv="effect"]')!.addEventListener('change', (e) => {
         const v = Number((e.target as HTMLInputElement).value);
-        iv.effect = Number.isFinite(v) ? Math.min(0.95, Math.max(0, v / 100)) : 0.3;
-        (e.target as HTMLInputElement).value = String(Math.round(iv.effect * 100));
+        iv.transmissionReduction = Number.isFinite(v) ? Math.min(0.95, Math.max(0, v / 100)) : 0.3;
+        (e.target as HTMLInputElement).value = String(Math.round(iv.transmissionReduction * 100));
         persist();
       });
       card.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
@@ -954,24 +970,24 @@ export class R0Modal {
       });
       // Intensity ramp rows: day + intensity %, add/remove keyframes.
       const framesHost = card.querySelector<HTMLElement>('[data-iv="frames"]')!;
-      const frames = iv.intensity.slice().sort((a, b) => a.day - b.day);
-      iv.intensity = frames;
+      const frames = iv.events.slice().sort((a, b) => a.tick - b.tick);
+      iv.events = frames;
       frames.forEach((f, fi) => {
         const row = document.createElement('div');
         row.className = 'r0-adjust-row';
         row.innerHTML = `
-          <label>day <input class="r0-in tiny" type="number" step="1" value="${f.day}" data-kf="day" aria-label="${iv.label} ramp day" /></label>
-          <label>intensity <input class="r0-in tiny" type="number" min="0" max="100" step="5" value="${Math.round(f.m * 100)}" data-kf="m" aria-label="${iv.label} intensity %" />%</label>
+          <label>day <input class="r0-in tiny" type="number" step="1" value="${f.tick}" data-kf="day" aria-label="${iv.label} ramp day" /></label>
+          <label>intensity <input class="r0-in tiny" type="number" min="0" max="100" step="5" value="${Math.round(f.intensity * 100)}" data-kf="m" aria-label="${iv.label} intensity %" />%</label>
           <button class="r0-del" type="button" aria-label="Delete ramp point" ${frames.length <= 1 ? 'disabled' : ''}>×</button>
         `;
         row.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
-          f.day = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
+          f.tick = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
           persist();
         });
         row.querySelector<HTMLInputElement>('[data-kf="m"]')!.addEventListener('change', (e) => {
           const v = Number((e.target as HTMLInputElement).value);
-          f.m = Number.isFinite(v) ? Math.min(1, Math.max(0, v / 100)) : 0;
-          (e.target as HTMLInputElement).value = String(Math.round(f.m * 100));
+          f.intensity = Number.isFinite(v) ? Math.min(1, Math.max(0, v / 100)) : 0;
+          (e.target as HTMLInputElement).value = String(Math.round(f.intensity * 100));
           persist();
         });
         row.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
@@ -987,7 +1003,7 @@ export class R0Modal {
       add.textContent = '+ ramp point';
       add.addEventListener('click', () => {
         const last = frames[frames.length - 1];
-        frames.push({ day: (last?.day ?? 0) + 14, m: last?.m ?? 1 });
+        frames.push({ tick: (last?.tick ?? 0) + 14, intensity: last?.intensity ?? 1 });
         persist();
         this.renderInterventions();
       });
@@ -1171,7 +1187,7 @@ export class R0Modal {
     if (liveSize > FIT_GRID_CAP) {
       warnings.push(`fitting on a ${FIT_GRID_CAP}×${FIT_GRID_CAP} grid for speed — on a larger grid the outbreak spreads farther per capita, so deaths may not reproduce exactly`);
     }
-    if (this.interventions.some((iv) => iv.enabled && iv.effect > 0)) {
+    if (this.interventions.some((iv) => iv.enabled && iv.transmissionReduction > 0)) {
       warnings.push('interventions active — model transmission R(t) is modulated over time; Apply to simulation does not carry interventions');
     }
     if (Number.isFinite(minObs) && cellPeople > minObs) {
@@ -1418,7 +1434,7 @@ export class R0Modal {
     const adjT0 = this.el?.querySelector<HTMLInputElement>('[data-adj="t0"]');
     if (adjT0) adjT0.value = this.adjust.t0 == null ? '' : String(this.adjust.t0);
     this.renderAdjust();
-    this.interventions = (p.interventions ?? []).map((iv) => ({ ...iv, intensity: iv.intensity.map((f) => ({ ...f })) }));
+    this.interventions = (p.interventions ?? []).map((iv) => ({ ...iv, events: iv.events.map((f) => ({ ...f })) }));
     this.renderInterventions();
     this.result = null;
     this.renderTable();

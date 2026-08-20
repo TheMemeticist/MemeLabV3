@@ -118,6 +118,36 @@ export interface InterventionEvent {
   label?: string;
 }
 
+/** One point on an intervention's timeline: the main sim's binary
+ *  `InterventionEvent.on` generalized to a fractional intensity in [0, 1]
+ *  (on = 1, off = 0), linearly interpolated between events and clamped
+ *  outside the first/last. `tick` follows InterventionEvent.tick — in the
+ *  R₀ Estimator context ticks are DATA days (day 0 = the dataset's day 0),
+ *  mapped onto model ticks by the fitted index-date offset. */
+export interface InterventionTimelinePoint {
+  tick: number;
+  intensity: number;
+}
+
+/** The SHARED intervention shape used by the R₀ Estimator's time-varying
+ *  transmission R(t) and designed to plug into the live simulation's
+ *  intervention system: `id`/`label`/`enabled` follow DefenseSpec,
+ *  `intervention` is the live sim's InterventionKey taxonomy ('custom' for
+ *  measures outside it), `transmissionReduction` reuses LockdownSpec's field
+ *  name and semantics (global multiplicative reduction on transmission, 0..1,
+ *  here at FULL intensity), and `events` generalizes InterventionEvent (see
+ *  InterventionTimelinePoint). R(t) = R₀ × Π(1 − transmissionReduction ×
+ *  intensity(t)). */
+export interface InterventionSpec {
+  id: string;
+  intervention: InterventionKey | 'custom';
+  label: string;
+  enabled: boolean;
+  /** Max transmission reduction at full intensity — LockdownSpec semantics. */
+  transmissionReduction: number;
+  events: InterventionTimelinePoint[];
+}
+
 export interface SimStats {
   tick: number;
   s: number;

@@ -22,10 +22,12 @@ import {
   resolutionFitSize,
   revisionEnvelope,
   runFit,
+  specFromEvents,
   transmissionSchedule,
   vintagedAdjust,
 } from '../src/lib/fit';
 import type { ObservedPoint, SimCurves, SimResult } from '../src/lib/fit';
+import type { InterventionEvent, InterventionSpec } from '../src/types';
 
 function baseConfig(overrides: Partial<SimConfig> = {}): SimConfig {
   return {
@@ -701,10 +703,11 @@ describe('cancel, prediction horizon, Bayesian band, Ebola keyframe defaults', (
 });
 
 describe('interventions: time-varying transmission R(t)', () => {
-  const ramp = (day: number, m: number) => ({ day, m });
+  const ramp = (tick: number, intensity: number) => ({ tick, intensity });
   const iv = (over: Record<string, unknown> = {}) => ({
-    id: 'iv-1', label: 'test', enabled: true, effect: 0.5,
-    intensity: [ramp(10, 0), ramp(20, 1)],
+    id: 'iv-1', intervention: 'custom' as const, label: 'test', enabled: true,
+    transmissionReduction: 0.5,
+    events: [ramp(10, 0), ramp(20, 1)],
     ...over,
   });
 
@@ -716,14 +719,14 @@ describe('interventions: time-varying transmission R(t)', () => {
     expect(s[20]).toBeCloseTo(0.5, 12);   // full intensity: 1 − 0.5·1
     expect(s[30]).toBeCloseTo(0.5, 12);   // clamped past the last keyframe
     // Two interventions multiply: (1 − 0.5)·(1 − 0.2) at full intensity.
-    const two = transmissionSchedule([iv(), iv({ id: 'iv-2', effect: 0.2 })], 31)!;
+    const two = transmissionSchedule([iv(), iv({ id: 'iv-2', transmissionReduction: 0.2 })], 31)!;
     expect(two[25]).toBeCloseTo(0.4, 12);
     // Index-date offset shifts the mapping: model tick t ↔ data day t − offset.
     const shifted = transmissionSchedule([iv()], 31, 5)!;
     expect(shifted[20]).toBeCloseTo(s[15], 12);
     // Disabled / zero-effect / empty → undefined (unscheduled fast path).
     expect(transmissionSchedule([iv({ enabled: false })], 10)).toBeUndefined();
-    expect(transmissionSchedule([iv({ effect: 0 })], 10)).toBeUndefined();
+    expect(transmissionSchedule([iv({ transmissionReduction: 0 })], 10)).toBeUndefined();
     expect(transmissionSchedule([], 10)).toBeUndefined();
   });
 
@@ -734,7 +737,7 @@ describe('interventions: time-varying transmission R(t)', () => {
     expect(ones.curves).toEqual(bare.curves); // ×1 is IEEE-exact — bit-identical
     // Strong intervention from day 10: cumulative infections must end lower.
     const sched = transmissionSchedule(
-      [iv({ effect: 0.8, intensity: [ramp(5, 0), ramp(10, 1)] })], 41)!;
+      [iv({ transmissionReduction: 0.8, events: [ramp(5, 0), ramp(10, 1)] })], 41)!;
     const damped = runTrials(cfg, 40, 4, cfg.seed, sched);
     const bareEnd = bare.curves.cumulative_infections[40];
     const dampedEnd = damped.curves.cumulative_infections[40];
@@ -752,7 +755,7 @@ describe('interventions: time-varying transmission R(t)', () => {
       observed,
       baseConfig: baseConfig({ size: 16 }),
       params: [findFitParam('attackRate')],
-      interventions: [iv({ effect: 0.6, intensity: [ramp(8, 0), ramp(14, 1)] })],
+      interventions: [iv({ transmissionReduction: 0.6, events: [ramp(8, 0), ramp(14, 1)] })],
       population: 1_000,
       K: 3,
       loss: 'poisson',
@@ -775,21 +778,96 @@ describe('interventions: time-varying transmission R(t)', () => {
   it('EBOLA_INTERVENTIONS defaults are sane and grounded on the dataset day axis', () => {
     expect(EBOLA_INTERVENTIONS.length).toBeGreaterThanOrEqual(4);
     for (const d of EBOLA_INTERVENTIONS) {
-      expect(d.effect).toBeGreaterThan(0);
-      expect(d.effect).toBeLessThanOrEqual(0.95);
-      expect(d.intensity.length).toBeGreaterThanOrEqual(2);
-      for (const f of d.intensity) {
-        expect(f.m).toBeGreaterThanOrEqual(0);
-        expect(f.m).toBeLessThanOrEqual(1);
+      expect(d.transmissionReduction).toBeGreaterThan(0);
+      expect(d.transmissionReduction).toBeLessThanOrEqual(0.95);
+      expect(d.events.length).toBeGreaterThanOrEqual(2);
+      for (const f of d.events) {
+        expect(f.intensity).toBeGreaterThanOrEqual(0);
+        expect(f.intensity).toBeLessThanOrEqual(1);
       }
     }
     // Ring vaccination is real but outside this dataset's window → disabled.
     const ring = EBOLA_INTERVENTIONS.find((d) => d.id === 'ring-vaccination')!;
     expect(ring.enabled).toBe(false);
-    expect(Math.min(...ring.intensity.map((f) => f.day))).toBeGreaterThan(96);
+    expect(Math.min(...ring.events.map((f) => f.tick))).toBeGreaterThan(96);
     // The enabled defaults act within/around the ~96-day data window.
     for (const d of EBOLA_INTERVENTIONS.filter((x) => x.enabled)) {
-      expect(Math.min(...d.intensity.map((f) => f.day))).toBeLessThan(96);
+      expect(Math.min(...d.events.map((f) => f.tick))).toBeLessThan(96);
     }
   });
+});
+
+describe('shared intervention shape + instant cancel', () => {
+  it('fit-modal interventions ARE the live-sim shape: InterventionEvent converts losslessly', () => {
+    // The live sim records binary toggle events (App.recordInterventionToggle);
+    // the shared spec generalizes `on` to intensity — on→1, off→0.
+    const events: InterventionEvent[] = [
+      { tick: 12, intervention: 'lockdown', on: true, label: 'Lockdown' },
+      { tick: 40, intervention: 'lockdown', on: false },
+    ];
+    const spec = specFromEvents('lockdown', events, 0.4);
+    const expected: InterventionSpec = {
+      id: 'lockdown',
+      intervention: 'lockdown', // the live sim's InterventionKey taxonomy
+      label: 'Lockdown',
+      enabled: true,            // DefenseSpec-style field
+      transmissionReduction: 0.4, // LockdownSpec's field name + semantics
+      // Step-preserving conversion: hold-points pin the binary value.
+      events: [
+        { tick: 11, intensity: 0 }, { tick: 12, intensity: 1 },
+        { tick: 39, intensity: 1 }, { tick: 40, intensity: 0 },
+      ],
+    };
+    expect(spec).toEqual(expected);
+    // And the fit consumes it directly — full effect inside the on-window only.
+    const sched = transmissionSchedule([spec], 60)!;
+    expect(sched[0]).toBe(1);               // before the toggle-on: off
+    expect(sched[12]).toBeCloseTo(0.6, 12); // on → 1 − 0.4·1
+    expect(sched[30]).toBeCloseTo(0.6, 12); // HELD at full effect mid-window
+    expect(sched[50]).toBeCloseTo(1, 12);   // after toggle-off (clamped 0)
+    // EBOLA defaults use the same taxonomy buckets.
+    const buckets = new Set(EBOLA_INTERVENTIONS.map((d) => d.intervention));
+    expect(buckets.has('quarantine')).toBe(true);
+    expect(buckets.has('lockdown')).toBe(true);
+    expect(buckets.has('vaccine')).toBe(true);
+  });
+
+  it('cancel settles fast at every phase — mid-search, mid-profile-grid, mid-MCMC', async () => {
+    const observed: ObservedPoint[] = [[0, 5], [10, 60], [20, 200]].map(([day, value]) =>
+      ({ day, value, category: 'cumulative_infections' as const }));
+    // Abort after N real sims; post-abort the "pool" keeps working (models the
+    // respawned pool) — the fix must never issue another sim once aborted.
+    const runWithAbortAt = async (abortAtCall: number): Promise<{ post: number; ms: number }> => {
+      const signal = { aborted: false };
+      let calls = 0;
+      let abortTime = 0;
+      let postAbortCalls = 0;
+      const sim = (cfg: SimConfig, days: number, K: number, seed: number, schedule?: number[]): Promise<SimResult> => {
+        calls++;
+        if (signal.aborted) postAbortCalls++;
+        if (calls === abortAtCall) { signal.aborted = true; abortTime = performance.now(); }
+        return Promise.resolve(runTrials(cfg, days, K, seed, schedule));
+      };
+      await runFit({
+        observed,
+        baseConfig: baseConfig({ size: 16 }),
+        params: [findFitParam('attackRate')],
+        offset: { bounds: [0, 10] },
+        posterior: { draws: 60 },
+        population: 1_000,
+        K: 3,
+        loss: 'poisson',
+        simulate: sim,
+        signal,
+        budget: 16,
+        nmIters: 6,
+      });
+      return { post: postAbortCalls, ms: abortTime ? performance.now() - abortTime : 0 };
+    };
+    for (const at of [5, 40, 90]) { // mid-search, mid-profile-grid, mid-MCMC
+      const { post, ms } = await runWithAbortAt(at);
+      expect(post).toBe(0);       // not one simulation issued after the abort
+      expect(ms).toBeLessThan(100); // settles within a few frames
+    }
+  }, 30_000);
 });

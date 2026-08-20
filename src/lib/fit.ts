@@ -22,7 +22,7 @@
 // loss re-scores cached curves without re-simulating (same "pure derived
 // overlay" discipline as the cost layer).
 
-import type { GeometryType, SimConfig, StrainGenes } from '../types';
+import type { GeometryType, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, StrainGenes } from '../types';
 import { makeGeometry, torus } from '../sim/neighbors';
 import { Rng } from '../sim/rng';
 import { runGA } from './ga';
@@ -629,7 +629,7 @@ export interface FitRequest extends FitOptions {
    *  index offset the schedule shifts per candidate (the pool cache keys on
    *  the schedule, so this is safe — but it does mean offsets no longer share
    *  one sim while interventions are active). */
-  interventions?: InterventionDef[];
+  interventions?: InterventionSpec[];
   /** Runs K trials of `config` for `days` days and returns mean per-capita curves
    *  plus the candidate's analytic R₀. `schedule` is the per-tick transmission
    *  multiplier (interventions); implementations may ignore it only if the
@@ -727,10 +727,18 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     return schedCache.get(o);
   };
 
+  const EMPTY_EVAL = {
+    loss: Number.POSITIVE_INFINITY,
+    r0: null as number | null,
+    result: { curves: { cumulative_infections: [], cumulative_deaths: [], active_infections: [] }, rNaught: null } as SimResult,
+  };
   const evalAt = async (
     values: number[],
     K: number,
   ): Promise<{ loss: number; r0: number | null; result: SimResult }> => {
+    // Cancel must be instant at EVERY await: after cancelAll respawns the pool,
+    // a fresh simulate would run for real — so never issue one once aborted.
+    if (req.signal?.aborted) return EMPTY_EVAL;
     try {
       const result = await req.simulate(configFor(values), days, K, baseSeed, schedFor(offsetOf(values)));
       const shifted = shiftPts(req.observed, offsetOf(values));
@@ -739,13 +747,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
       // A cancelled pool rejects every pending sim so nothing awaits a message
       // that will never arrive — swallow those into +Inf losses and let the
       // optimizer wind down instantly. Real errors still propagate.
-      if (req.signal?.aborted) {
-        return {
-          loss: Number.POSITIVE_INFINITY,
-          r0: null,
-          result: { curves: { cumulative_infections: [], cumulative_deaths: [], active_infections: [] }, rNaught: null },
-        };
-      }
+      if (req.signal?.aborted) return EMPTY_EVAL;
       throw err;
     }
   };
@@ -830,21 +832,26 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   if (offsetDef && !req.signal?.aborted) {
     const profile: { offset: number; loss: number }[] = [];
     for (let o = offLo; o <= offHi; o++) {
+      if (req.signal?.aborted) break; // cancel mid-grid, not at the stage boundary
       const v = bestValues.slice();
       v[req.params.length] = o;
       const { loss } = await evalAt(v, req.K);
       profile.push({ offset: o, loss });
     }
-    let mi = 0;
-    for (let i = 1; i < profile.length; i++) if (profile[i].loss < profile[mi].loss) mi = i;
-    // Adopt the profile mode as the point estimate: a strict deterministic
-    // improvement when the joint search landed a day off, and it guarantees the
-    // reported offset IS the mode of the profile the CI is read from.
-    if (profile[mi].loss < bestLossFinal) {
-      bestValues[req.params.length] = profile[mi].offset;
-      bestLossFinal = profile[mi].loss;
+    if (req.signal?.aborted || profile.length === 0) {
+      // Cancelled mid-grid — skip the CI rather than reading a partial profile.
+    } else {
+      let mi = 0;
+      for (let i = 1; i < profile.length; i++) if (profile[i].loss < profile[mi].loss) mi = i;
+      // Adopt the profile mode as the point estimate: a strict deterministic
+      // improvement when the joint search landed a day off, and it guarantees
+      // the reported offset IS the mode of the profile the CI is read from.
+      if (profile[mi].loss < bestLossFinal) {
+        bestValues[req.params.length] = profile[mi].offset;
+        bestLossFinal = profile[mi].loss;
+      }
+      offsetCI = profileOffsetCI(profile, mi, req.loss, req.observed.length);
     }
-    offsetCI = profileOffsetCI(profile, mi, req.loss, req.observed.length);
   }
 
   // ── Bayesian posterior-predictive band (post-fit, seeded, deterministic) ──
@@ -869,6 +876,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
       burn,
       req.loss,
       req.observed.length,
+      req.signal,
     );
     const drawCurves: SimCurves[] = [];
     for (const v of chain) {
@@ -926,6 +934,7 @@ export async function metropolisChain(
   burn: number,
   lossType: LossType = 'poisson',
   nObs = 1,
+  signal?: { aborted: boolean },
 ): Promise<number[][]> {
   const rng = new Rng((seed ^ 0x6d636d63) >>> 0);
   const lo = params.map((p) => p.bounds[0]);
@@ -947,6 +956,7 @@ export async function metropolisChain(
   let accepted = 0;
   let window = 0;
   for (let it = 0; it < iters; it++) {
+    if (signal?.aborted) break; // cancel mid-chain — return the draws so far
     const prop = decode(cur.map((x, i) => x + rng.gaussian() * step[i]));
     const propDev = deviance(await nll(prop), lossType, nObs);
     // Accept with probability exp(devCur − devProp) — the likelihood ratio.
@@ -1316,16 +1326,55 @@ export function vintagedAdjust(
 // separate dimension from the case/death keyframe multipliers above, which
 // correct the reported DATA for under-ascertainment and never touch the model.
 
-export interface InterventionDef {
-  id: string;
-  label: string;
-  enabled: boolean;
-  /** Max fractional transmission reduction at full intensity, 0–0.95. */
-  effect: number;
-  /** Intensity keyframes over DATA days (day 0 = the dataset's day 0): m is
-   *  the intensity in [0, 1], linearly interpolated, clamped outside the end
-   *  keyframes. Days before the data / after it are fine. */
-  intensity: Keyframe[];
+// The intervention shape is SHARED with the live simulation — see
+// InterventionSpec in types.ts (DefenseSpec-style id/label/enabled, the live
+// sim's InterventionKey taxonomy, LockdownSpec's transmissionReduction, and a
+// timeline that generalizes InterventionEvent's binary on/off to fractional
+// intensity). Re-exported here so fit consumers have one import surface.
+export type { InterventionSpec } from '../types';
+
+/** Intensity of one intervention at a (data-day) tick: linear interpolation
+ *  over its timeline events, clamped outside the first/last, result in [0,1]. */
+export function intensityAt(events: { tick: number; intensity: number }[], tick: number): number {
+  return clamp(multiplierAt(events.map((e) => ({ day: e.tick, m: e.intensity })), tick), 0, 1);
+}
+
+/** Convert the live sim's binary InterventionEvent timeline into the shared
+ *  spec: on → intensity 1, off → intensity 0 (step-like ramps come out of
+ *  adjacent events). `transmissionReduction` must be supplied — the live sim
+ *  keeps strengths in its spec objects (DefenseSpec/LockdownSpec), not on the
+ *  events. */
+export function specFromEvents(
+  key: InterventionKey,
+  events: InterventionEvent[],
+  transmissionReduction: number,
+  label?: string,
+): InterventionSpec {
+  // Binary toggles are STEPS, but the shared timeline interpolates linearly and
+  // clamps to its end values — so emit hold-points that pin the previous value
+  // until the day before each change (a faithful 1-day transition), and a zero
+  // point before the first toggle-ON so pre-history is off, not clamped-on.
+  const sorted = events.slice().sort((a, b) => a.tick - b.tick);
+  const pts: { tick: number; intensity: number }[] = [];
+  let prev = 0;
+  for (const e of sorted) {
+    const v = e.on ? 1 : 0;
+    if (pts.length === 0) {
+      if (v > 0) pts.push({ tick: e.tick - 1, intensity: 0 });
+    } else if (v !== prev && e.tick - 1 > pts[pts.length - 1].tick) {
+      pts.push({ tick: e.tick - 1, intensity: prev });
+    }
+    pts.push({ tick: e.tick, intensity: v });
+    prev = v;
+  }
+  return {
+    id: key,
+    intervention: key,
+    label: label ?? sorted.find((e) => e.label)?.label ?? key,
+    enabled: true,
+    transmissionReduction: clamp(transmissionReduction, 0, 0.95),
+    events: pts,
+  };
 }
 
 /** Per-model-tick transmission multiplier for the engine: tick t maps to data
@@ -1333,19 +1382,20 @@ export interface InterventionDef {
  *  model leads it). Undefined when nothing is active — callers can skip the
  *  scheduled path entirely, keeping unscheduled runs bit-identical. */
 export function transmissionSchedule(
-  interventions: InterventionDef[],
+  interventions: InterventionSpec[],
   len: number,
   offsetDays = 0,
 ): number[] | undefined {
-  const active = interventions.filter((iv) => iv.enabled && iv.effect > 0 && iv.intensity.length > 0);
+  const active = interventions.filter(
+    (iv) => iv.enabled && iv.transmissionReduction > 0 && iv.events.length > 0,
+  );
   if (active.length === 0) return undefined;
   const out = new Array<number>(len);
   for (let t = 0; t < len; t++) {
     const d = t - offsetDays;
     let f = 1;
     for (const iv of active) {
-      const intensity = clamp(multiplierAt(iv.intensity, d), 0, 1);
-      f *= 1 - clamp(iv.effect, 0, 0.95) * intensity;
+      f *= 1 - clamp(iv.transmissionReduction, 0, 0.95) * intensityAt(iv.events, d);
     }
     out[t] = f;
   }
@@ -1366,45 +1416,50 @@ export function transmissionSchedule(
  *  drove a large transmission share; early tracing coverage was low) — edit
  *  freely. Ring vaccination ships DISABLED: the rVSV-ZEBOV ring trial only
  *  began in March 2015 (~day 300), outside this dataset's window. */
-export const EBOLA_INTERVENTIONS: InterventionDef[] = [
+export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
   {
     id: 'safe-burials',
+    intervention: 'custom', // no live-sim analogue — burial-practice change
     label: 'Safe & dignified burials',
     enabled: true,
-    effect: 0.3, // burial contact drove a major share of transmission (estimate)
-    intensity: [{ day: 30, m: 0 }, { day: 60, m: 0.4 }, { day: 110, m: 0.8 }], // coverage ramp: estimate
+    transmissionReduction: 0.3, // burial contact drove a major share (estimate)
+    events: [{ tick: 30, intensity: 0 }, { tick: 60, intensity: 0.4 }, { tick: 110, intensity: 0.8 }],
   },
   {
     id: 'contact-tracing',
+    intervention: 'quarantine', // closest live-sim bucket: detect + isolate
     label: 'Contact tracing & case isolation',
     enabled: true,
-    effect: 0.25,
+    transmissionReduction: 0.25,
     // Tracing ran from the outbreak's confirmation but with low coverage,
     // scaling after the emergency declarations / PHEIC (days 74–82).
-    intensity: [{ day: 7, m: 0.1 }, { day: 45, m: 0.3 }, { day: 82, m: 0.5 }, { day: 110, m: 0.7 }],
+    events: [{ tick: 7, intensity: 0.1 }, { tick: 45, intensity: 0.3 }, { tick: 82, intensity: 0.5 }, { tick: 110, intensity: 0.7 }],
   },
   {
     id: 'treatment-centers',
+    intervention: 'quarantine', // ETC admission ≈ case isolation
     label: 'Treatment centres (ETCs)',
     enabled: true,
-    effect: 0.3,
+    transmissionReduction: 0.3,
     // Kailahun ETC ~day 38; capacity grows; ELWA-3 (day 91) at the tail.
-    intensity: [{ day: 38, m: 0.3 }, { day: 74, m: 0.5 }, { day: 91, m: 0.7 }, { day: 110, m: 0.8 }],
+    events: [{ tick: 38, intensity: 0.3 }, { tick: 74, intensity: 0.5 }, { tick: 91, intensity: 0.7 }, { tick: 110, intensity: 0.8 }],
   },
   {
     id: 'emergency-travel',
+    intervention: 'lockdown', // movement restrictions map onto lockdown
     label: 'Emergency measures & travel restrictions',
     enabled: true,
-    effect: 0.15,
+    transmissionReduction: 0.15,
     // Airline suspensions ~day 72; SoE day 74; quarantines 78–80; PHEIC day 82.
-    intensity: [{ day: 72, m: 0 }, { day: 74, m: 0.6 }, { day: 82, m: 0.9 }, { day: 110, m: 0.9 }],
+    events: [{ tick: 72, intensity: 0 }, { tick: 74, intensity: 0.6 }, { tick: 82, intensity: 0.9 }, { tick: 110, intensity: 0.9 }],
   },
   {
     id: 'ring-vaccination',
+    intervention: 'vaccine',
     label: 'Ring vaccination (2015 — outside this window)',
     enabled: false, // rVSV-ZEBOV ring trial began ~day 300; kept for exploration
-    effect: 0.5,
-    intensity: [{ day: 300, m: 0 }, { day: 330, m: 0.8 }],
+    transmissionReduction: 0.5,
+    events: [{ tick: 300, intensity: 0 }, { tick: 330, intensity: 0.8 }],
   },
 ];
 
