@@ -20,6 +20,10 @@ let gpu: GpuEngine | null = null; // gpu backend (asynchronous)
 // with an in-flight batch.
 let gpuChain: Promise<void> = Promise.resolve();
 let currentConfig: SimConfig | null = null;
+// Fitted R(t) transmission schedule (per-tick multiplier) from the estimator's
+// Apply. Stored here and handed to the engine as EngineOptions at the next
+// rebuild — the sender always follows setSchedule with a reset/init.
+let txSchedule: number[] | null = null;
 
 let playing = false;
 let tps = 30;
@@ -161,6 +165,48 @@ function gpuInitFailReason(err: unknown): string {
   return `WebGPU init failed (${msg || 'unknown error'})`;
 }
 
+/** Availability probe for the engine picker menu — the worker is the single
+ *  authority on what can actually run, so the menu asks it rather than
+ *  guessing. Checks runtime support AND the current config's gates; the GPU
+ *  check goes as far as acquiring a real adapter (refusing software ones). */
+async function probeBackends(): Promise<void> {
+  const cfg = currentConfig;
+  const wasm: import('../types').BackendAvailability = !wasmAvailable()
+    ? { ok: false, reason: 'WebAssembly unavailable in this browser' }
+    : cfg && !wasmCompatible(cfg)
+      ? { ok: false, reason: wasmBlockReason(cfg) }
+      : { ok: true };
+  let gpuAvail: import('../types').BackendAvailability;
+  if (txSchedule) {
+    gpuAvail = { ok: false, reason: 'the fitted R(t) schedule runs on the CPU/WASM engines — clear it (chart chip ✕) to use GPU' };
+  } else if (!gpuSupported()) {
+    gpuAvail = {
+      ok: false,
+      reason: self.isSecureContext
+        ? 'WebGPU not available in this browser'
+        : 'WebGPU needs a secure origin — open the app over HTTPS (or localhost)',
+    };
+  } else if (cfg && !gpuCompatible(cfg)) {
+    gpuAvail = { ok: false, reason: gpuBlockReason(cfg) };
+  } else {
+    try {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      if (!adapter) {
+        gpuAvail = { ok: false, reason: 'no GPU adapter — on Linux Chrome enable chrome://flags/#enable-vulkan and relaunch' };
+      } else {
+        const info = (adapter as GPUAdapter & { info?: GPUAdapterInfo }).info;
+        const softId = `${info?.vendor ?? ''} ${info?.architecture ?? ''} ${info?.description ?? ''}`.toLowerCase();
+        gpuAvail = /swiftshader|llvmpipe|software/.test(softId)
+          ? { ok: false, reason: 'only a software adapter (SwiftShader) — enable chrome://flags/#enable-vulkan and relaunch to use your real GPU' }
+          : { ok: true };
+      }
+    } catch (err) {
+      gpuAvail = { ok: false, reason: gpuInitFailReason(err) };
+    }
+  }
+  self.postMessage({ type: 'backendProbe', wasm, gpu: gpuAvail } satisfies import('../types').BackendProbeMessage);
+}
+
 /** After a (re)build, resume the right loop if the user was playing. */
 function resumeIfPlaying(): void {
   if (!playing) return;
@@ -186,6 +232,10 @@ function rebuild(config: SimConfig): void {
   lastFrame = performance.now();
 
   if (requestedBackend === 'gpu') {
+    if (txSchedule) {
+      buildCpuEngine(config, topo, 'the fitted R(t) schedule runs on the CPU/WASM engines — clear it (chart chip ✕) to use GPU');
+      return;
+    }
     if (!gpuSupported()) {
       // WebGPU is a secure-context API: on a plain-http origin navigator.gpu
       // does not exist at all, and no browser flag can change that.
@@ -221,7 +271,7 @@ function rebuild(config: SimConfig): void {
 
 function buildCpuEngine(config: SimConfig, topo: import('../types').VoronoiTopology | null, fallbackReason?: string): void {
   const wantWasm = requestedBackend !== 'cpu';
-  engine = createEngine(config, topo, undefined, wantWasm);
+  engine = createEngine(config, topo, txSchedule ? { txSchedule } : undefined, wantWasm);
   const active: EngineBackend = engine instanceof WasmEngine ? 'wasm' : 'cpu';
   let reason = fallbackReason;
   if (wantWasm && active === 'cpu') {
@@ -357,6 +407,16 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
         engine.patchConfig(cfg);
         postFrame();
       }
+      break;
+    }
+    case 'setSchedule': {
+      // Stored only — the sender always follows with a reset/init, which is
+      // where the engine actually picks it up (schedules start at day 0).
+      txSchedule = m.schedule && m.schedule.length > 0 ? m.schedule : null;
+      break;
+    }
+    case 'probeBackends': {
+      void probeBackends();
       break;
     }
     case 'play': {

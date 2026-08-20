@@ -1,6 +1,6 @@
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
-import type { InterventionEvent, LongStats } from '../types';
+import type { FitWindow, InterventionEvent, LongStats } from '../types';
 
 const MARKER_COLORS: Record<string, string> = {
   mask: 'rgb(38, 169, 198)',
@@ -50,6 +50,7 @@ export class Chart {
   private lastH = 0;
   private resizeRaf = 0;
   private markers: InterventionEvent[] = [];
+  private fitWindows: FitWindow[] = [];
   private markerTip: HTMLElement | null = null;
   private mouseHandler: ((ev: MouseEvent) => void) | null = null;
   private leaveHandler: (() => void) | null = null;
@@ -80,6 +81,12 @@ export class Chart {
     // Don't call plot.redraw() — uPlot 1.x's redraw() can clear cached series
     // paths in a way that wipes the visible traces. The next setData() (which
     // arrives at every sim tick) re-fires hooks.draw and paints markers fresh.
+  }
+
+  /** Fitted-intervention windows (sim days) shaded behind the series while an
+   *  applied R(t) schedule is active. Same repaint contract as setMarkers. */
+  setFitWindows(windows: FitWindow[]): void {
+    this.fitWindows = windows;
   }
 
   setView(view: ChartView): void {
@@ -328,6 +335,7 @@ export class Chart {
         series,
         hooks: {
           draw: [
+            (u) => this.paintFitWindows(u),
             (u) => { if (isReff) this.paintReffThreshold(u); },
             (u) => this.paintMarkers(u),
           ],
@@ -432,6 +440,40 @@ export class Chart {
       const color = typeof stroke === 'function' ? null : (stroke as string | null | undefined);
       if (color) dot.style.setProperty('--dot-color', color);
     });
+  }
+
+  /** Translucent bands over the fitted R(t) intervention windows, with a small
+   *  label at the base — painted before the series so traces stay on top. */
+  private paintFitWindows(u: uPlot): void {
+    if (this.fitWindows.length === 0) return;
+    const ctx = u.ctx;
+    const top = u.bbox.top;
+    const h = u.bbox.height;
+    const left = u.bbox.left;
+    const right = left + u.bbox.width;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    ctx.font = `600 ${9 * dpr}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textBaseline = 'bottom';
+    ctx.textAlign = 'left';
+    for (const w of this.fitWindows) {
+      const x0 = Math.max(left, u.valToPos(w.from, 'x', true));
+      const x1 = Number.isFinite(w.to) ? Math.min(right, u.valToPos(w.to, 'x', true)) : right;
+      if (!Number.isFinite(x0) || x1 <= left || x0 >= right || x1 <= x0) continue;
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.10)';
+      ctx.fillRect(x0, top, x1 - x0, h);
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.45)';
+      ctx.lineWidth = 1 * dpr;
+      ctx.setLineDash([4 * dpr, 3 * dpr]);
+      ctx.beginPath();
+      ctx.moveTo(x0, top);
+      ctx.lineTo(x0, top + h);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.9)';
+      ctx.fillText(w.label, x0 + 3 * dpr, top + h - 3 * dpr);
+    }
+    ctx.restore();
   }
 
   private paintMarkers(u: uPlot): void {

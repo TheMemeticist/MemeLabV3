@@ -1,4 +1,4 @@
-import type { BackendMessage, CostConfig, EngineBackend, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
+import type { BackendMessage, BackendProbeMessage, CostConfig, EngineBackend, FitWindow, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { findPreset, baseSimConfig, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
 import { Petri } from './Petri';
 import { Chart, type ChartView, type CostChartData } from './Chart';
@@ -9,6 +9,7 @@ import { AboutModal } from './AboutModal';
 import { CostModal } from './CostModal';
 import { R0Modal } from './R0Modal';
 import { ShareMenu } from './ShareMenu';
+import { BackendMenu } from './BackendMenu';
 import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
 import { migrateInterventionSpecs, syncSpecsWithToggle } from '../lib/fit';
@@ -42,6 +43,13 @@ export class App {
   private requestedBackend: EngineBackend = read<EngineBackend>('backend', 'wasm');
   private activeBackend: EngineBackend | null = null;
   private backendReason: string | null = null;
+  private backendMenu!: BackendMenu;
+  private probeResolve: ((p: BackendProbeMessage) => void) | null = null;
+  // Fitted R(t) schedule from the estimator's Apply — the live run replays the
+  // fitted intervention timeline (worker holds a copy; survives reloads).
+  private fitSchedule: number[] | null = null;
+  private fitWindows: FitWindow[] = [];
+  private fitChip: HTMLButtonElement | null = null;
   private themeBtn!: HTMLButtonElement;
   private shareBtn!: HTMLButtonElement;
   private shareMenu!: ShareMenu;
@@ -130,14 +138,18 @@ export class App {
 
     // Worker
     this.worker = new Worker(new URL('../worker/sim.worker.ts', import.meta.url), { type: 'module' });
-    this.worker.onmessage = (ev: MessageEvent<FrameMessage | TopologyMessage | BackendMessage>) => {
+    this.worker.onmessage = (ev: MessageEvent<FrameMessage | TopologyMessage | BackendMessage | BackendProbeMessage>) => {
       const msg = ev.data;
       if (msg.type === 'topology') {
         this.petri.setVoronoiTopology(msg.topo);
+      } else if (msg.type === 'backendProbe') {
+        this.probeResolve?.(msg);
+        this.probeResolve = null;
       } else if (msg.type === 'backend') {
         this.activeBackend = msg.active;
         this.backendReason = msg.active !== msg.requested ? (msg.reason ?? null) : null;
         this.refreshEngineLabel();
+        this.backendMenu.refresh();
         // A backend message always accompanies an engine rebuild: the run is
         // starting over, so epidemic-ended tracking must restart too —
         // otherwise the placeholder frame (E+I = 0) posted right after the
@@ -154,6 +166,17 @@ export class App {
     };
     // Backend preference travels before init so the first build uses it.
     this.send({ cmd: 'setBackend', backend: this.requestedBackend });
+    // Restore an applied fitted R(t) schedule (and its chart windows) so a
+    // reload keeps reproducing the fitted outbreak instead of silently
+    // diverging from what the estimator showed.
+    const fitRt = read<{ schedule: number[] | null; windows: FitWindow[] } | null>('fitRt', null);
+    if (fitRt?.schedule?.length) {
+      this.fitSchedule = fitRt.schedule;
+      this.fitWindows = (fitRt.windows ?? []).map((w) => ({ ...w, to: w.to === null ? Number.POSITIVE_INFINITY : w.to }));
+      this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
+      this.chart.setFitWindows(this.fitWindows);
+    }
+    this.refreshFitChip();
     this.send({ cmd: 'init', config: initialConfig });
     if ((initialConfig.geometry ?? 'square') !== 'voronoi') {
       this.petri.setVoronoiTopology(null);
@@ -288,6 +311,7 @@ export class App {
                 <button class="chart-mode-btn active" data-mode="active" title="Currently in each state">Active</button>
                 <button class="chart-mode-btn" data-mode="total" title="Cumulative totals (e.g. total ever infected)">Total</button>
               </div>
+              <button class="chart-fit-chip" data-act="fit-chip" type="button" hidden data-tip="A fitted R(t) intervention schedule from the R₀ Estimator is modulating transmission in this run (shaded windows). Click ✕ to clear it and restart clean.">📈 fitted R(t) <span class="chip-x">✕</span></button>
               <button class="chart-expand" data-act="expand-chart" type="button" title="Expand chart" aria-label="Expand chart" aria-pressed="false">⤢</button>
             </div>
             <div class="chart-area" data-section="chart"></div>
@@ -341,6 +365,10 @@ export class App {
     const expandBtn = this.root.querySelector<HTMLButtonElement>('[data-act="expand-chart"]');
     expandBtn?.addEventListener('click', () => this.toggleChartExpand());
 
+    // Fitted-R(t) chip: visible while an applied fit schedule is active.
+    this.fitChip = this.root.querySelector<HTMLButtonElement>('[data-act="fit-chip"]');
+    this.fitChip?.addEventListener('click', () => this.clearFitSchedule());
+
     this.controls = new ControlPanel(this.defaultConfig().config, DEFAULT_PRESET_ID, {
       onConfigChange: () => this.onConfigChange(),
       onPresetChange: (p) => { this.loadPresetCost(p); this.onConfigChange(); },
@@ -363,6 +391,11 @@ export class App {
     this.speedBtn = this.toolbarBtns['speed'];
     this.mutateBtn = this.toolbarBtns['mutate'];
     this.engineBtn = this.toolbarBtns['engine'];
+    this.backendMenu = new BackendMenu(this.engineBtn, {
+      getState: () => ({ requested: this.requestedBackend, active: this.activeBackend, reason: this.backendReason }),
+      probe: () => this.probeBackends(),
+      onSelect: (b) => this.selectBackend(b),
+    });
     this.refreshEngineLabel();
 
     // Topbar buttons
@@ -394,7 +427,7 @@ export class App {
     // config-change path.
     this.r0Modal = new R0Modal({
       getConfig: () => this.controls.config(),
-      onApply: (fitted) => this.applyFit(fitted),
+      onApply: (fitted, extras) => this.applyFit(fitted, extras),
       // Shared intervention store: hand out the live array (same objects both
       // sides); the modal notifies on every mutation so App persists it.
       getInterventions: () => this.interventions,
@@ -670,27 +703,63 @@ export class App {
     this.persist();
   }
 
-  /** Merge fitted strain genes from the R₀ Estimator into the live config. Only
-   *  the genes are taken (the estimator runs on its own grid/mutation settings);
-   *  the change routes through the normal patch path so the disease updates
-   *  without resetting the user's grid. */
-  private applyFit(fitted: SimConfig): void {
-    const cfg = this.controls.config();
-    cfg.strain = { ...cfg.strain, ...fitted.strain };
+  /** Adopt the fitted WORLD from the R₀ Estimator — not just the strain genes.
+   *  The fitted curve was produced by a specific data-generating process: the
+   *  fit grid size, a single patient-zero index case, mechanical interventions
+   *  off, and (when interventions were modeled) a per-tick R(t) transmission
+   *  schedule. Reproducing the curve on this screen requires running that same
+   *  process, so Apply installs all of it; the previous genes-only apply left
+   *  the live grid/seeding in place and the death curve could lag the fit by
+   *  the grid-size ratio (e.g. 2× slower on a 2×-side board). */
+  private applyFit(fitted: SimConfig, extras: { schedule: number[] | null; windows: FitWindow[] }): void {
+    const liveSize = this.controls.config().size;
+    const cfg = structuredClone(fitted);
     this.controls.hydrate(cfg, this.controls.currentPresetId());
-    // Start a fresh run from the single index case so the fitted disease plays out
-    // from day 0 — that's the outbreak the estimator fit (at this grid size), so the
-    // death curve now reproduces. Patching mid-run would not.
+    this.prevConfig = structuredClone(cfg);
+
+    this.fitSchedule = extras.schedule;
+    this.fitWindows = extras.schedule ? extras.windows : [];
+    this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
+    this.chart.setFitWindows(this.fitWindows);
+    this.persistFitRt();
+    this.refreshFitChip();
+
+    // Fresh run from the fitted world's day 0 (handleReset re-sends the config).
     this.handleReset();
-    // The fitted genes are the *pre-intervention* disease (R₀ is the basic number).
-    // If interventions are active they'll act on top, pulling deaths below the fit.
-    const interventionsOn =
-      cfg.defenses.some((d) => d.enabled) || cfg.lockdown.enabled || cfg.quarantine.enabled;
-    this.toast(
-      interventionsOn
-        ? 'Applied fitted disease — your active interventions will reduce deaths below the fit.'
-        : 'Applied fitted disease parameters.',
-    );
+
+    const notes: string[] = [];
+    if (cfg.size !== liveSize) notes.push(`grid → ${cfg.size}×${cfg.size} (the fit's grid — timing is size-dependent)`);
+    notes.push('patient-zero start');
+    notes.push(extras.schedule ? 'interventions replayed as the fitted R(t) schedule (shaded on the chart)' : 'interventions off (as fitted)');
+    this.toast(`Applied fitted outbreak: ${notes.join(' · ')}.`);
+  }
+
+  /** Persist the applied schedule/windows (JSON has no Infinity — open-ended
+   *  windows round-trip as null in `to`). */
+  private persistFitRt(): void {
+    if (this.fitSchedule) {
+      write('fitRt', {
+        schedule: this.fitSchedule,
+        windows: this.fitWindows.map((w) => ({ ...w, to: Number.isFinite(w.to) ? w.to : null })),
+      });
+    } else {
+      write('fitRt', null);
+    }
+  }
+
+  private refreshFitChip(): void {
+    if (this.fitChip) this.fitChip.hidden = this.fitSchedule === null;
+  }
+
+  private clearFitSchedule(): void {
+    this.fitSchedule = null;
+    this.fitWindows = [];
+    this.send({ cmd: 'setSchedule', schedule: null });
+    this.chart.setFitWindows([]);
+    this.persistFitRt();
+    this.refreshFitChip();
+    this.handleReset();
+    this.toast('Cleared the fitted R(t) schedule — run restarted without it.');
   }
 
   private needsRebuild(prev: SimConfig | null, next: SimConfig): boolean {
@@ -730,19 +799,33 @@ export class App {
       case 'reset': this.handleReset(); break;
       case 'speed': this.cycleSpeed(); break;
       case 'mutate': this.toggleMutate(); break;
-      case 'engine': this.cycleBackend(); break;
+      case 'engine': this.backendMenu.toggle(); break;
     }
   }
 
-  private cycleBackend(): void {
-    // No pre-flight gating here: the worker is where the engine actually runs,
-    // so it makes the call and reports honest fallback reasons (an App-side
-    // requestAdapter probe proved flaky during early page load).
-    const order: EngineBackend[] = ['wasm', 'gpu', 'cpu'];
-    const next = order[(order.indexOf(this.requestedBackend) + 1) % order.length];
+  /** Ask the worker which backends can actually run right now (it is the sole
+   *  authority — an App-side requestAdapter probe proved flaky during early
+   *  page load). Times out pessimistically so the menu never hangs. */
+  private probeBackends(): Promise<BackendProbeMessage> {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        if (this.probeResolve === wrapped) {
+          this.probeResolve = null;
+          resolve({ type: 'backendProbe', wasm: { ok: false, reason: 'no response from the sim worker' }, gpu: { ok: false, reason: 'no response from the sim worker' } });
+        }
+      }, 4000);
+      const wrapped = (p: BackendProbeMessage): void => { clearTimeout(timeout); resolve(p); };
+      this.probeResolve = wrapped;
+      this.send({ cmd: 'probeBackends' });
+    });
+  }
+
+  private selectBackend(next: EngineBackend): void {
+    if (next === this.requestedBackend && next === this.activeBackend) return;
     this.requestedBackend = next;
     write('backend', next);
-    // The worker rebuilds in place (run restarts from day 0, keeps playing).
+    // The worker rebuilds in place (run restarts from day 0, keeps playing)
+    // and reports what actually runs via a backend message.
     this.send({ cmd: 'setBackend', backend: next });
     this.toast(`Engine backend → ${next.toUpperCase()} (run restarts from day 0)`);
     this.refreshEngineLabel();

@@ -208,10 +208,12 @@ All three phases are now INTEGRATED in the app, not just spiked:
   portability bug the spike missed: baseline WebGPU allows only 8 storage
   bindings per stage, so per-cell words are packed (state+age,
   defenses+compliance).
-- **UI**: toolbar backend button (⚙ CPU / ⚙ WASM / ⚡ GPU), localStorage
-  preference, automatic fallback with a status toast. Verified in headless
-  Chrome (Vulkan WebGPU): all three backends step, render, and chart with
-  zero console errors.
+- **UI**: toolbar backend picker (⚙/⚡ button opens a menu — each backend row
+  shows running / requested-but-fell-back / unavailable with the actionable
+  reason, availability probed by the worker), localStorage preference,
+  automatic fallback with a status toast. Verified in headless Chrome (Vulkan
+  WebGPU): all three backends step, render, and chart with zero console
+  errors.
 - Determinism contract: cpu ≡ wasm (bit-exact, golden digests shared); gpu is
   its own deterministic family per (config, seed). Backend choice is a runtime
   preference, never part of SimConfig or permalinks.

@@ -392,6 +392,30 @@ export interface BackendMessage {
   reason?: string;
 }
 
+/** One backend's availability for the CURRENT config, as probed by the worker
+ *  (the single authority on what can actually run). `reason` explains a false
+ *  `ok` in actionable terms. */
+export interface BackendAvailability {
+  ok: boolean;
+  reason?: string;
+}
+
+/** Reply to `probeBackends` — drives the engine picker menu. */
+export interface BackendProbeMessage {
+  type: 'backendProbe';
+  wasm: BackendAvailability;
+  gpu: BackendAvailability;
+}
+
+/** A fitted-intervention window in sim-day coordinates, shaded on the live
+ *  chart while an applied R(t) schedule is active. `to` may be Infinity when
+ *  the intervention never keyframes back to zero effect. */
+export interface FitWindow {
+  from: number;
+  to: number;
+  label: string;
+}
+
 export type WorkerCommand =
   | { cmd: 'init'; config: SimConfig }
   | { cmd: 'play'; tps: number }
@@ -400,7 +424,12 @@ export type WorkerCommand =
   | { cmd: 'reset'; config: SimConfig }
   | { cmd: 'updateConfig'; config: SimConfig }
   | { cmd: 'patchConfig'; config: SimConfig }
-  | { cmd: 'setBackend'; backend: EngineBackend };
+  | { cmd: 'setBackend'; backend: EngineBackend }
+  // Store the fitted R(t) transmission schedule (per-tick multiplier). Takes
+  // effect at the next rebuild — the sender always follows with reset/init.
+  | { cmd: 'setSchedule'; schedule: number[] | null }
+  // Probe backend availability for the current config → BackendProbeMessage.
+  | { cmd: 'probeBackends' };
 
 // ─── R₀ Estimator fitting-worker protocol ────────────────────────────────────
 // A separate, isolated worker pool (`src/worker/fit.worker.ts`) runs headless

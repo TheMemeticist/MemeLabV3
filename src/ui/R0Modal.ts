@@ -29,6 +29,7 @@ import {
   resolutionFitSize,
   revisionEnvelope,
   runFit,
+  transmissionSchedule,
   vintagedAdjust,
 } from '../lib/fit';
 import type {
@@ -47,8 +48,11 @@ import type {
 interface R0ModalEvents {
   /** Current simulation config — the fit inherits its geometry and untouched genes. */
   getConfig: () => SimConfig;
-  /** Push the fitted config back into the simulation. */
-  onApply: (config: SimConfig) => void;
+  /** Push the fitted WORLD back into the simulation: the full fitted config
+   *  (fit grid, patient-zero seeding, interventions-off baseline) plus the
+   *  fitted R(t) schedule and its chart windows, so the live run reproduces
+   *  the curve the estimator showed. */
+  onApply: (config: SimConfig, extras: { schedule: number[] | null; windows: { from: number; to: number; label: string }[] }) => void;
   /** The SHARED intervention store (owned by App; same array/objects as the
    *  main sim). Optional so the modal still works standalone (local fallback). */
   getInterventions?: () => InterventionSpec[];
@@ -818,9 +822,19 @@ export class R0Modal {
     });
     q<HTMLButtonElement>('[data-r0="apply"]').addEventListener('click', () => {
       if (!this.result) return;
-      this.events.onApply(this.result.config);
+      this.events.onApply(this.result.config, this.applyExtras(this.result));
       this.close(); // dismiss so the user lands back on the running simulation
     });
+  }
+
+  /** Everything beyond the config that the live sim needs to reproduce the
+   *  fitted curve: the exact R(t) schedule the winning candidate ran under
+   *  (same builder + fitted index offset the fit used) and its window spans
+   *  for chart shading. */
+  private applyExtras(result: FitResult): { schedule: number[] | null; windows: { from: number; to: number; label: string }[] } {
+    const o = result.indexOffset ?? 0;
+    const schedule = transmissionSchedule(this.interventions, result.days + 1, o) ?? null;
+    return { schedule, windows: schedule ? this.itvWindows(o) : [] };
   }
 
   // ── Observed-data table ──
@@ -1354,13 +1368,13 @@ export class R0Modal {
         : 'underreporting adjustment shown as overlay only (fit targets the reported counts)');
     }
     if (base.size > liveSize) {
-      warnings.push(`fit ran at ${base.size}×${base.size} for resolution — enlarge the live grid before Apply to reproduce`);
+      warnings.push(`fit runs at ${base.size}×${base.size} for data resolution — Apply adopts that grid so the curve reproduces`);
     }
     if (liveSize > FIT_GRID_CAP) {
-      warnings.push(`fitting on a ${FIT_GRID_CAP}×${FIT_GRID_CAP} grid for speed — on a larger grid the outbreak spreads farther per capita, so deaths may not reproduce exactly`);
+      warnings.push(`fitting on a ${FIT_GRID_CAP}×${FIT_GRID_CAP} grid for speed — Apply switches the live grid to it (outbreak timing is size-dependent)`);
     }
     if (this.interventions.some((iv) => iv.enabled && iv.transmissionReduction > 0)) {
-      warnings.push('interventions active — model transmission R(t) is modulated over time; Apply to simulation does not carry interventions');
+      warnings.push('interventions active — modeled as time-varying transmission R(t); Apply to simulation replays the same schedule (shaded on the live chart)');
     }
     if (Number.isFinite(minObs) && cellPeople > minObs) {
       warnings.push(`one grid cell = ${fmtNum(cellPeople)} people — larger than your smallest data point (${fmtNum(minObs)}); raise grid size or lower Population`);
@@ -1836,7 +1850,7 @@ export class R0Modal {
           this.note('Loaded fit from history.');
         });
         row.querySelector<HTMLButtonElement>('[data-act="apply"]')!.addEventListener('click', () => {
-          this.events.onApply(e.result.config);
+          this.events.onApply(e.result.config, this.applyExtras(e.result));
           this.close();
         });
         host.appendChild(row);

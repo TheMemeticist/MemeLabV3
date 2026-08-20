@@ -848,6 +848,29 @@ input[type='range']::-moz-range-thumb {
 .chart-mode-btn:hover { background: var(--accent-soft); color: var(--text); }
 .chart-mode-btn.active { background: var(--accent); color: #fff; }
 
+/* Fitted-R(t) chip — visible while an applied fit schedule modulates the run. */
+.chart-fit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: center;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 5px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 100ms ease, border-color 100ms ease;
+}
+.chart-fit-chip:hover { background: rgba(245, 158, 11, 0.22); }
+.chart-fit-chip[hidden] { display: none; }
+.chart-fit-chip .chip-x { opacity: 0.65; font-size: 10px; }
+.chart-fit-chip:hover .chip-x { opacity: 1; }
+
 /* Expand button — pushed to the right edge of the tabs row. */
 .chart-expand {
   margin-left: auto;
@@ -1673,6 +1696,60 @@ button.panel-head:focus-visible { outline-offset: -2px; }
   animation: share-pop-in 160ms cubic-bezier(0.2, 0.7, 0.25, 1);
 }
 .share-pop.share-out { animation: fade-out 150ms ease forwards; }
+
+/* Engine backend picker — anchored under the toolbar ⚙/⚡ button. */
+.backend-pop {
+  position: fixed;
+  z-index: 260;
+  width: min(380px, calc(100vw - 24px));
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  padding: 8px;
+  animation: share-pop-in 160ms cubic-bezier(0.2, 0.7, 0.25, 1);
+}
+.bp-head {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 6px 10px 8px;
+}
+.bp-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 100ms ease, border-color 100ms ease;
+}
+.bp-row:hover { background: var(--accent-soft); }
+.bp-row.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.bp-icon { font-size: 15px; line-height: 1.4; }
+.bp-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.bp-name { font-size: 13px; font-weight: 700; }
+.bp-desc { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 8px; }
+.bp-state { font-size: 11px; line-height: 1.35; }
+.bp-on { color: var(--accent); font-weight: 700; }
+.bp-fell { color: rgb(245, 158, 11); }
+.bp-blocked { color: var(--text-muted); }
+.bp-dim { color: var(--text-muted); }
+.bp-foot {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  padding: 8px 10px 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 6px;
+}
 
 @keyframes share-pop-in {
   from { opacity: 0; transform: translateY(-6px) scale(0.97); }
