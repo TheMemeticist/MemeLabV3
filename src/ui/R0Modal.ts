@@ -919,7 +919,15 @@ export class R0Modal {
       .filter((iv) => iv.enabled && iv.timeline && Object.values(iv.timeline).some((t) => t && t.length > 0))
       .map((iv) => {
         const ticks = Object.values(iv.timeline!).flatMap((t) => (t ?? []).map((f) => f.tick));
-        return { from: Math.min(...ticks) + offset, to: Math.max(...ticks) + offset, label: iv.label };
+        // Interventions persist indefinitely: the span extends to the chart's
+        // right edge (Infinity, clamped when painting) unless the end state is
+        // keyframed down to zero effect — only then does the span really end.
+        const holds = effectiveReductionAt(iv, Number.MAX_SAFE_INTEGER) > 0;
+        return {
+          from: Math.min(...ticks) + offset,
+          to: holds ? Number.POSITIVE_INFINITY : Math.max(...ticks) + offset,
+          label: iv.label,
+        };
       })
       .filter((w) => Number.isFinite(w.from));
   }
@@ -947,8 +955,8 @@ export class R0Modal {
       return;
     }
     this.interventions.forEach((iv, idx) => {
-      // Typed specs must always show the full main-sim controls.
-      if (iv.intervention !== 'custom' && !iv.params) this.seedParams(iv);
+      // Every spec shares one param schema — always show the full controls.
+      if (!iv.params) this.seedParams(iv);
       const card = document.createElement('div');
       card.className = 'r0-itv';
       card.innerHTML = `
@@ -1081,7 +1089,7 @@ export class R0Modal {
       };
 
       const p = iv.params;
-      if (p && (iv.intervention === 'mask' || iv.intervention === 'vaccine')) {
+      if (p && (iv.intervention === 'mask' || iv.intervention === 'vaccine' || iv.intervention === 'custom')) {
         addParam('uptake', 'Rate', 0, 100, '%', () => p.uptake ?? 0, (v) => { p.uptake = v; }, 'Population uptake — same control as the main sim.');
         addParam('protection', 'Protection', 0, 100, '%', () => p.protection ?? 0, (v) => { p.protection = v; }, 'Reduces incoming attack success against the wearer.');
         addParam('sourceControl', 'Source control', 0, 100, '%', () => p.sourceControl ?? 0, (v) => { p.sourceControl = v; }, 'Reduces outgoing attack success from the wearer.');
@@ -1096,9 +1104,6 @@ export class R0Modal {
         addParam('protection', 'Protection', 0, 100, '%', () => p.protection ?? 0, (v) => { p.protection = v; }, 'Reduces transmission INTO quarantined cells.');
         addParam('sourceControl', 'Source control', 0, 100, '%', () => p.sourceControl ?? 0, (v) => { p.sourceControl = v; }, 'Reduces transmission FROM quarantined cells.');
         addParam('duration', 'Duration', 1, 60, 'days', () => p.duration ?? 14, (v) => { p.duration = v; }, 'Quarantine persistence (live-sim dynamics; not in the fitted rate).');
-      } else {
-        addParam('transmissionReduction', 'Transmission reduction', 0, 95, '%', () => iv.transmissionReduction, (v) => { iv.transmissionReduction = Math.min(0.95, v); },
-          'Max multiplicative cut to transmission.');
       }
       host.appendChild(card);
     });
@@ -1133,8 +1138,22 @@ export class R0Modal {
           duration: cfg.quarantine.duration,
         };
         break;
-      default:
-        delete iv.params;
+      default: {
+        // Custom shares the canonical defense schema. Map any existing flat
+        // strength LOSSLESSLY: uptake 1, protection = strength, sourceControl 0
+        // ⇒ eff = protection; a transmissionReduction keyframe track carries
+        // over verbatim as a protection track (identical schedules).
+        iv.params = {
+          uptake: 1,
+          protection: Math.min(0.95, Math.max(0, iv.transmissionReduction)),
+          sourceControl: 0,
+          mortalityReduction: 0,
+        };
+        if (iv.timeline?.transmissionReduction) {
+          iv.timeline.protection = iv.timeline.transmissionReduction;
+          delete iv.timeline.transmissionReduction;
+        }
+      }
     }
   }
 
@@ -2036,7 +2055,7 @@ export class R0Modal {
     // intervention's name at the top, staggered per row.
     this.liveItvWindows.forEach((w, wi) => {
       const x1 = X(w.from);
-      const x2 = X(w.to);
+      const x2 = Number.isFinite(w.to) ? X(w.to) : u.bbox.left + u.bbox.width;
       ctx.fillStyle = 'rgba(139, 92, 246, 0.06)';
       ctx.fillRect(x1, u.bbox.top, Math.max(1, x2 - x1), u.bbox.height);
       ctx.beginPath();

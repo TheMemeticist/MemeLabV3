@@ -792,7 +792,7 @@ describe('interventions: time-varying transmission R(t)', () => {
     for (const d of EBOLA_INTERVENTIONS) {
       expect(d.transmissionReduction).toBeGreaterThanOrEqual(0);
       expect(d.timeline && Object.keys(d.timeline).length).toBeTruthy();
-      if (d.intervention !== 'custom') expect(d.params).toBeDefined(); // rich controls render
+      expect(d.params).toBeDefined(); // ONE shared schema — every card renders rich controls
     }
     const ring = EBOLA_INTERVENTIONS.find((d) => d.id === 'ring-vaccination')!;
     expect(ring.enabled).toBe(false);
@@ -1037,6 +1037,22 @@ describe('rich intervention params: the model honors the FULL main-sim spec', ()
       { id: 'old', intervention: 'quarantine', label: 'o', enabled: true, effect: 0.5, intensity: [{ day: 10, m: 0 }, { day: 20, m: 1 }] },
     ]);
     expect(migrated[0].intervention).toBe('custom'); // param-less typed legacy → custom
+    // Lossless defense mapping: uptake 1, protection carries the strength
+    // track, sourceControl 0 ⇒ eff = protection — schedules bit-identical.
+    expect(migrated[0].params).toEqual({ uptake: 1, protection: 0.5, sourceControl: 0, mortalityReduction: 0 });
+    expect(migrated[0].timeline!.protection).toBeDefined();
+    expect(migrated[0].timeline!.transmissionReduction).toBeUndefined();
     expect(transmissionSchedule(migrated, 31)![15]).toBeCloseTo(0.75, 12); // 0.5·0.5 at halfway
+  });
+
+  it("'custom' shares the SAME defense param schema as mask/vaccine", () => {
+    // With params, custom composes exactly like a defense measure...
+    const custom = base({ intervention: 'custom', params: { uptake: 1, protection: 0.5, sourceControl: 0.5 } });
+    const mask = base({ intervention: 'mask', params: { uptake: 1, protection: 0.5, sourceControl: 0.5 } });
+    expect(effectiveReduction(custom)).toBeCloseTo(effectiveReduction(mask), 12);
+    // ...and the lossless mapping reproduces the old flat strength exactly.
+    const mapped = base({ intervention: 'custom', params: { uptake: 1, protection: 0.3, sourceControl: 0, mortalityReduction: 0 } });
+    expect(effectiveReduction(mapped)).toBeCloseTo(0.3, 12);
+    expect(effectiveReduction(base())).toBeCloseTo(0.3, 12); // param-less fallback unchanged
   });
 });

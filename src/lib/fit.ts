@@ -797,7 +797,9 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   // optimizer stage + exactly-counted post stages; when a stage ends early its
   // allocation completes (an honest "stage done" jump), never regresses.
   const postDraws = req.posterior ? Math.max(10, Math.round(req.posterior.draws ?? 120)) : 0;
-  const postBurn = req.posterior ? Math.max(30, Math.round(req.posterior.burn ?? Math.ceil(postDraws * 0.25))) : 0;
+  // Burn-in doubles as step-scale adaptation; sharp likelihoods need several
+  // shrink windows (10 iters each) before the chain mixes, so don't skimp.
+  const postBurn = req.posterior ? Math.max(40, Math.round(req.posterior.burn ?? Math.ceil(postDraws * 0.5))) : 0;
   const postTotal = (offsetDef ? offHi - offLo + 1 : 0) + (postDraws + postBurn) + postDraws + 1;
   let optT = 0;
   let optDone = 0;
@@ -999,7 +1001,12 @@ export async function metropolisChain(
     window++;
     if (it < burn && window === 10) {
       const rate = accepted / window;
-      const f = rate < 0.15 ? 0.5 : rate > 0.45 ? 1.4 : 1;
+      // Razor-sharp likelihoods (many large Poisson counts) reject EVERY move
+      // at the initial 8%-of-bounds scale — without an aggressive shrink the
+      // chain never mixes and the posterior band collapses to zero width.
+      // Shrink hard (×0.25) while acceptance is zero, gently (×0.5/×1.4)
+      // around the ~30% target otherwise; frozen after burn-in.
+      const f = rate === 0 ? 0.25 : rate < 0.15 ? 0.5 : rate > 0.45 ? 1.4 : 1;
       if (f !== 1) for (let i = 0; i < step.length; i++) step[i] *= f;
       accepted = 0;
       window = 0;
@@ -1388,7 +1395,8 @@ export function effectiveReduction(iv: InterventionSpec): number {
   if (!p) return clamp(iv.transmissionReduction, 0, 0.95);
   switch (iv.intervention) {
     case 'mask':
-    case 'vaccine': {
+    case 'vaccine':
+    case 'custom': { // custom shares the canonical defense schema
       const u = clamp(p.uptake ?? 0, 0, 1);
       const incoming = 1 - u * clamp(p.protection ?? 0, 0, 1);
       const outgoing = 1 - u * clamp(p.sourceControl ?? 0, 0, 1);
@@ -1498,6 +1506,17 @@ export function migrateInterventionSpecs(list: unknown[]): InterventionSpec[] {
       };
       if (!out.params && out.intervention !== 'custom') out.intervention = 'custom';
     }
+    // Every intervention shares one param schema — customs without params get
+    // the LOSSLESS defense mapping: uptake 1, protection = strength,
+    // sourceControl 0 ⇒ eff = protection, so schedules are bit-identical
+    // (any transmissionReduction track becomes a protection track verbatim).
+    if (!out.params) {
+      out.params = { uptake: 1, protection: clamp(tr, 0, 0.95), sourceControl: 0, mortalityReduction: 0 };
+      if (out.timeline?.transmissionReduction) {
+        out.timeline.protection = out.timeline.transmissionReduction;
+        delete out.timeline.transmissionReduction;
+      }
+    }
     return out;
   });
 }
@@ -1565,8 +1584,11 @@ export const EBOLA_INTERVENTIONS: InterventionSpec[] = [
     label: 'Safe & dignified burials',
     enabled: true,
     transmissionReduction: 0.3,
-    // Old eff = 0.3 × coverage(0→0.4→0.8): keyframe tr = 0 → 0.12 → 0.24.
-    timeline: { transmissionReduction: [{ tick: 30, value: 0 }, { tick: 60, value: 0.12 }, { tick: 110, value: 0.24 }] },
+    // Custom uses the canonical defense schema. Old eff = 0.3 × coverage:
+    // protection 0.3 const, sourceControl 0, uptake keyframed to the coverage
+    // ramp → eff = uptake(t)·0.3, schedule-equivalent to the calibration.
+    params: { uptake: 0, protection: 0.3, sourceControl: 0, mortalityReduction: 0 },
+    timeline: { uptake: [{ tick: 30, value: 0 }, { tick: 60, value: 0.4 }, { tick: 110, value: 0.8 }] },
   },
   {
     id: 'contact-tracing',
