@@ -969,10 +969,16 @@ export class R0Modal {
             ${['custom', 'mask', 'vaccine', 'lockdown', 'quarantine']
               .map((k) => `<option value="${k}"${iv.intervention === k ? ' selected' : ''}>${k}</option>`).join('')}
           </select>
-          <span class="r0-itv-eff r0-muted" data-iv="eff" title="Derived max transmission reduction at the timeline's end state — what the model applies: R(t) = R0 × (1 − effectiveReduction(paramsAt(t)))."></span>
           <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">×</button>
         </div>
         <div class="r0-itv-params" data-iv="params"></div>
+        <div class="r0-itv-kf" data-iv="kf">
+          <div class="r0-itv-kf-head">
+            <span class="r0-history-group">⏱ Keyframes — vary the params over time</span>
+            <span class="r0-itv-eff r0-muted" data-iv="eff" title="Derived max transmission reduction at the timeline's end state — what the model applies: R(t) = R0 × (1 − effectiveReduction(paramsAt(t)))."></span>
+          </div>
+          <div data-iv="kf-list"></div>
+        </div>
       `;
       const persist = (): void => { this.notifyInterventions(); };
       const effBadge = card.querySelector<HTMLElement>('[data-iv="eff"]')!;
@@ -1016,6 +1022,9 @@ export class R0Modal {
         const pct = unit === '%';
         const row = document.createElement('div');
         row.className = 'r0-itv-param';
+        const kfHost = card.querySelector<HTMLElement>('[data-iv="kf-list"]')!;
+        const kfRowHost = document.createElement('div');
+        kfRowHost.className = 'r0-itv-kf-param';
         const slider = new Slider({
           id: `r0-${iv.id}-${key}`, label, min, max, step: 1, unit,
           value: pct ? Math.round(get() * 100) : get(),
@@ -1057,7 +1066,7 @@ export class R0Modal {
               t.splice(fi, 1);
               if (t.length === 0 && iv.timeline) delete iv.timeline[key];
               refreshEff(); persist(); renderTrack();
-              kfBtn.textContent = `⏱${t.length ? ` ${t.length}` : ''}`;
+              kfBtn.textContent = `⏱ ${label}${t.length ? ` (${t.length})` : ''}`;
               kfBtn.classList.toggle('active', t.length > 0);
             });
             editor.appendChild(kfRow);
@@ -1073,7 +1082,7 @@ export class R0Modal {
             const last = tt[tt.length - 1];
             tt.push({ tick: (last?.tick ?? 0) + 14, value: last?.value ?? get() });
             refreshEff(); persist(); renderTrack();
-            kfBtn.textContent = `⏱ ${tt.length}`;
+            kfBtn.textContent = `⏱ ${label} (${tt.length})`;
             kfBtn.classList.add('active');
           });
           editor.appendChild(addKf);
@@ -1083,9 +1092,12 @@ export class R0Modal {
           if (!editor.hidden) renderTrack();
         });
         if (!editor.hidden) renderTrack();
-        row.appendChild(kfBtn);
-        row.appendChild(editor);
+        // Sliders FIRST (top of the card), keyframe controls at the BOTTOM.
         paramsHost.appendChild(row);
+        kfBtn.textContent = `⏱ ${label}${track?.length ? ` (${track.length})` : ''}`;
+        kfRowHost.appendChild(kfBtn);
+        kfRowHost.appendChild(editor);
+        kfHost.appendChild(kfRowHost);
       };
 
       const p = iv.params;

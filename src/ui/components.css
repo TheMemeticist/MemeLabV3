@@ -2304,6 +2304,11 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 .r0-itv-frames .r0-adjust-row { cursor: pointer; }
 .r0-itv-eff { margin-left: auto; font-size: 11.5px; white-space: nowrap; }
 .r0-itv-params { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+.r0-itv-kf { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.r0-itv-kf-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.r0-itv-kf-head .r0-itv-eff { margin-left: auto; }
+.r0-itv-kf-param { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.r0-itv-kf-param .r0-kf-btn { align-self: flex-start; }
 .r0-itv-params .btn { align-self: flex-start; padding: 2px 10px; font-size: 11.5px; margin-top: 4px; }
 .r0-itv-sliders { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 8px 10px; border: 1px dashed var(--border); border-radius: 8px; }
 .r0-itv-sliders .r0-check { font-size: 12.5px; color: var(--text-muted); }
