@@ -8,9 +8,11 @@ import {
   findFitParam,
   goodnessOfFit,
   hasDownwardRevisions,
+  EBOLA_ADJUST,
   mse,
   optimize,
   parseObservedCSV,
+  metropolisChain,
   multiplierAt,
   percentileBands,
   poissonNLL,
@@ -578,4 +580,120 @@ describe('index-date offset: evolved param + profile-likelihood CI', () => {
     expect(r2.indexOffset).toBe(r.indexOffset);
     expect(r2.offsetCI).toEqual(r.offsetCI);
   }, 40_000);
+});
+
+describe('cancel, prediction horizon, Bayesian band, Ebola keyframe defaults', () => {
+  const obsPts = (pairs: [number, number][]): ObservedPoint[] =>
+    pairs.map(([day, value]) => ({ day, value, category: 'cumulative_infections' as const }));
+
+  it('runFit settles promptly when cancel rejects in-flight simulations (no hang)', async () => {
+    const signal = { aborted: false };
+    let calls = 0;
+    const cancellingSimulate = (cfg: SimConfig, days: number, K: number, seed: number): Promise<SimResult> => {
+      calls++;
+      if (signal.aborted) return Promise.reject(new Error('fit cancelled'));
+      if (calls >= 3) {
+        // Simulate the Cancel click: abort flag set, then the pool rejects
+        // everything still pending — exactly what FitPool.cancelAll does.
+        signal.aborted = true;
+        return Promise.reject(new Error('fit cancelled'));
+      }
+      return Promise.resolve(runTrials(cfg, days, K, seed));
+    };
+    const result = await runFit({
+      observed: obsPts([[0, 5], [10, 60], [20, 200]]),
+      baseConfig: baseConfig({ size: 16 }),
+      params: [findFitParam('attackRate')],
+      population: 1_000,
+      K: 4,
+      loss: 'poisson',
+      simulate: cancellingSimulate,
+      signal,
+      budget: 16,
+      nmIters: 4,
+    });
+    expect(result).toBeDefined(); // resolved — nothing awaited a dead worker
+    expect(signal.aborted).toBe(true);
+  }, 10_000);
+
+  it('extraDays extends the projected curves beyond the data end', async () => {
+    const r = await runFit({
+      observed: obsPts([[0, 5], [10, 60], [20, 200]]),
+      baseConfig: baseConfig({ size: 16 }),
+      params: [findFitParam('attackRate')],
+      extraDays: 15,
+      population: 1_000,
+      K: 3,
+      loss: 'poisson',
+      simulate,
+      budget: 8,
+      nmIters: 3,
+    });
+    expect(r.days).toBe(35); // 20 data days + 15 prediction
+    expect(r.simulated.cumulative_infections).toHaveLength(36);
+  }, 20_000);
+
+  it('metropolisChain samples a known Gaussian posterior (calibrated + deterministic)', async () => {
+    const param = { name: 'attackRate' as const, label: 'x', bounds: [-10, 10] as [number, number], get: () => 0, set: () => {} };
+    const nll = (v: number[]): number => 0.5 * (v[0] - 2) ** 2; // N(2, 1) log-density
+    const a = await metropolisChain(nll, [2], [param], 123, 4500, 500);
+    const b = await metropolisChain(nll, [2], [param], 123, 4500, 500);
+    expect(b).toEqual(a); // seeded → bit-identical
+    const xs = a.map((v) => v[0]).sort((p, q) => p - q);
+    const q = (p: number): number => xs[Math.floor(p * (xs.length - 1))];
+    expect(Math.abs(q(0.5) - 2)).toBeLessThan(0.15); // median ≈ mode
+    const mean = xs.reduce((s, x) => s + x, 0) / xs.length;
+    const sd = Math.sqrt(xs.reduce((s, x) => s + (x - mean) ** 2, 0) / xs.length);
+    expect(sd).toBeGreaterThan(0.75); // ≈ σ = 1 (loose for MC error)
+    expect(sd).toBeLessThan(1.3);
+    expect(Math.abs(q(0.05) - (2 - 1.645))).toBeLessThan(0.35); // 5th ≈ μ−1.645σ
+    expect(Math.abs(q(0.95) - (2 + 1.645))).toBeLessThan(0.35); // 95th ≈ μ+1.645σ
+  }, 20_000);
+
+  it('runFit posterior band: reproducible, ordered LOW ≤ CENTRAL ≤ HIGH, central sane', async () => {
+    const run = () => runFit({
+      observed: obsPts([[0, 5], [8, 40], [16, 130], [24, 260]]),
+      baseConfig: baseConfig({ size: 16 }),
+      params: [findFitParam('attackRate')],
+      posterior: { draws: 24 },
+      population: 1_000,
+      K: 3,
+      loss: 'poisson',
+      simulate,
+      budget: 8,
+      nmIters: 3,
+    });
+    const r1 = await run();
+    const r2 = await run();
+    expect(r1.bayes).not.toBeNull();
+    expect(r2.bayes).toEqual(r1.bayes); // seeded → same band
+    const rows = r1.bayes!.cumulative_infections;
+    expect(rows).toHaveLength(3);
+    for (let d = 0; d < rows[0].length; d++) {
+      expect(rows[0][d]).toBeLessThanOrEqual(rows[1][d] + 1e-12);
+      expect(rows[1][d]).toBeLessThanOrEqual(rows[2][d] + 1e-12);
+    }
+    const last = rows[0].length - 1;
+    // central inside its own band and in the same ballpark as the point fit
+    expect(rows[1][last]).toBeGreaterThan(0);
+    const point = r1.simulated.cumulative_infections[last];
+    expect(rows[0][last]).toBeLessThanOrEqual(point + 1e-12);
+    expect(rows[2][last]).toBeGreaterThanOrEqual(point - 1e-12);
+  }, 30_000);
+
+  it('Ebola default keyframes: midpoints ≥ 1, interpolation + clamping incl. outside the data', () => {
+    expect(EBOLA_ADJUST.cases.every((f) => f.m >= 1)).toBe(true);
+    expect(EBOLA_ADJUST.deaths.every((f) => f.m >= 1)).toBe(true);
+    expect(multiplierAt(EBOLA_ADJUST.cases, -20)).toBe(5.0);                 // clamp before day −8
+    expect(multiplierAt(EBOLA_ADJUST.cases, -4)).toBeCloseTo(4.9, 9);        // midpoint of [−8, 0]
+    expect(multiplierAt(EBOLA_ADJUST.cases, 50)).toBeCloseTo(3.0 + (1.9 - 3.0) * (5 / 23), 9);
+    expect(multiplierAt(EBOLA_ADJUST.cases, 200)).toBe(1.25);                // clamp beyond day 110
+    expect(multiplierAt(EBOLA_ADJUST.deaths, 64)).toBeCloseTo(1.6, 9);       // halfway 60→68
+    const pts = obsPts([[17, 352], [30, 729], [96, 5042]]);
+    const { upper, central } = vintagedAdjust(pts, { cumulative_infections: EBOLA_ADJUST.cases }, EBOLA_ADJUST.t0);
+    pts.forEach((p, i) => {
+      expect(central[i].value).toBeGreaterThanOrEqual(p.value);
+      expect(upper[i].value).toBeGreaterThanOrEqual(central[i].value);
+    });
+  });
 });

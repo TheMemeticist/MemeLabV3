@@ -20,7 +20,8 @@ import {
   FIT_PARAMS,
   hasDownwardRevisions,
   parseObservedCSV,
-  percentileBands,
+  BAND_CENTRAL,
+  EBOLA_ADJUST,
   resolutionFitSize,
   revisionEnvelope,
   runFit,
@@ -99,6 +100,8 @@ interface DemoPreset {
   label: string;
   population: number;
   points: ObservedPoint[];
+  /** Default underreporting keyframes loaded (enabled) with the preset. */
+  adjust?: { t0: number; cases: Keyframe[]; deaths: Keyframe[] };
 }
 
 // Build observed points from [day, value] pairs for a single category.
@@ -148,6 +151,9 @@ const HISTORICAL_PRESETS: DemoPreset[] = [
     id: 'ebola-rev',
     label: 'Ebola — 2026 outbreak (revised counts)',
     population: 15_000,
+    // Default sitrep-phase underreporting keyframes (user-provided tables;
+    // ranges → midpoints, all ≥ 1). Loaded enabled; fully editable.
+    adjust: EBOLA_ADJUST,
     points: [
       ...series('cumulative_infections', [
         [0, 653], [5, 968], [6, 1010], [10, 1042], [12, 1205], [13, 1038], [14, 1262],
@@ -272,8 +278,6 @@ const DEFAULT_ADJUST: AdjustSettings = { enabled: false, asTarget: true, t0: nul
 const RAMP_DAYS = 42;
 const ADJ_DEFAULTS: Record<'cases' | 'deaths', [number, number]> = { cases: [5.0, 3.8], deaths: [3.0, 2.5] };
 
-// Fan-chart percentiles: median + 25% band (37.5–62.5), 50% band (25–75), 90% band (5–95).
-const FAN_PROBS = [5, 25, 37.5, 50, 62.5, 75, 95];
 
 interface R0Snapshot {
   population: number;
@@ -288,7 +292,9 @@ interface R0Snapshot {
   indexOffset?: number;
   honorRevisions?: boolean;
   history?: FitHistoryEntry[];
-  fanTrials?: number;
+  fanTrials?: number; // legacy (index-case ensemble) — ignored
+  bayesDraws?: number;
+  predictionDays?: number;
   adjust?: AdjustSettings;
   offsetEvolve?: boolean;
   offsetBounds?: [number, number];
@@ -324,9 +330,12 @@ export class R0Modal {
   // data has downward revisions. A no-op on monotone data, so on by default.
   private honorRevisions = true;
   private history: FitHistoryEntry[] = [];
-  // Fan-chart ensemble size: trials of the best-fit config, each from a
-  // different index case, aggregated into percentile bands. 1 = single line.
-  private fanTrials = 30;
+  // Posterior draws for the FINAL Bayesian posterior-predictive band (seeded
+  // Metropolis over the fitted params; 0/1 = band off). The live streaming line
+  // stays the cheap path — this runs once, post-fit.
+  private bayesDraws = 120;
+  // Days to project the model beyond the data's last day.
+  private predictionDays = 0;
   private adjust: AdjustSettings = { ...DEFAULT_ADJUST };
   private running = false;
   private signal = { aborted: false };
@@ -346,7 +355,7 @@ export class R0Modal {
   // Per-category greyed raw-overlay columns (null = category has no revisions);
   // parallel to liveCats, cached so live frames rebuild the same data shape.
   private liveRawCols: ((number | null)[] | null)[] = [];
-  // Fan-chart percentile rows (people-scaled, FAN_PROBS order) per category, and
+  // Band rows (people-scaled, BAND_PROBS order: low/central/high) per category, and
   // sparse floor/central/upper vertices for the adjustment envelope — painted by
   // a custom uPlot draw hook so the chart's data columns / legend stay untouched.
   private liveFanCols: Partial<Record<FitCategory, number[][]>> | null = null;
@@ -442,7 +451,8 @@ export class R0Modal {
       indexOffset: this.indexOffset,
       honorRevisions: this.honorRevisions,
       history: this.history,
-      fanTrials: this.fanTrials,
+      bayesDraws: this.bayesDraws,
+      predictionDays: this.predictionDays,
       adjust: { ...this.adjust },
       offsetEvolve: this.offsetEvolve,
       offsetBounds: [...this.offsetBounds] as [number, number],
@@ -468,7 +478,8 @@ export class R0Modal {
     if (Number.isFinite(s.indexOffset)) this.indexOffset = Math.max(0, Math.round(s.indexOffset!));
     if (typeof s.honorRevisions === 'boolean') this.honorRevisions = s.honorRevisions;
     if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
-    if (Number.isFinite(s.fanTrials)) this.fanTrials = Math.min(100, Math.max(1, Math.round(s.fanTrials!)));
+    if (Number.isFinite(s.bayesDraws)) this.bayesDraws = Math.min(500, Math.max(0, Math.round(s.bayesDraws!)));
+    if (Number.isFinite(s.predictionDays)) this.predictionDays = Math.min(365, Math.max(0, Math.round(s.predictionDays!)));
     if (s.adjust && typeof s.adjust === 'object') this.adjust = { ...DEFAULT_ADJUST, ...s.adjust };
     if (typeof s.offsetEvolve === 'boolean') this.offsetEvolve = s.offsetEvolve;
     if (Array.isArray(s.offsetBounds) && s.offsetBounds.length === 2) {
@@ -511,7 +522,8 @@ export class R0Modal {
     this.result = null;
     this.honorRevisions = true;
     this.history = [];
-    this.fanTrials = 30;
+    this.bayesDraws = 120;
+    this.predictionDays = 0;
     this.adjust = { ...DEFAULT_ADJUST };
     this.offsetEvolve = true;
     this.offsetBounds = [0, 28];
@@ -593,7 +605,7 @@ export class R0Modal {
       this.presetId = preset.value;
       if (preset.value === 'synthetic') { void this.loadDemo(); return; }
       const p = HISTORICAL_PRESETS.find((x) => x.id === preset.value);
-      if (p) this.loadDataset(p.points, p.population);
+      if (p) this.loadDataset(p);
     });
 
     q<HTMLButtonElement>('[data-r0="clear"]').addEventListener('click', () => {
@@ -629,13 +641,23 @@ export class R0Modal {
         : 'Fitting the raw series — downward revisions left as-is.');
     });
 
-    // Fan-chart trials (percentile bands around the best fit).
+    // Posterior draws for the final Bayesian band (0 = off).
     const fanInput = q<HTMLInputElement>('[data-r0="fan"]');
-    fanInput.value = String(this.fanTrials);
+    fanInput.value = String(this.bayesDraws);
     fanInput.addEventListener('change', () => {
       const v = Number(fanInput.value);
-      this.fanTrials = Number.isFinite(v) ? Math.min(100, Math.max(1, Math.round(v))) : 30;
-      fanInput.value = String(this.fanTrials);
+      this.bayesDraws = Number.isFinite(v) ? Math.min(500, Math.max(0, Math.round(v))) : 120;
+      fanInput.value = String(this.bayesDraws);
+      this.persist();
+    });
+
+    // Prediction horizon: project the model this many days past the data end.
+    const predInput = q<HTMLInputElement>('[data-r0="pred"]');
+    predInput.value = String(this.predictionDays);
+    predInput.addEventListener('change', () => {
+      const v = Number(predInput.value);
+      this.predictionDays = Number.isFinite(v) ? Math.min(365, Math.max(0, Math.round(v))) : 0;
+      predInput.value = String(this.predictionDays);
       this.persist();
     });
 
@@ -719,7 +741,16 @@ export class R0Modal {
     this.syncOptimizerUI();
 
     q<HTMLButtonElement>('[data-r0="run"]').addEventListener('click', () => this.run());
-    q<HTMLButtonElement>('[data-r0="cancel"]').addEventListener('click', () => { this.signal.aborted = true; });
+    q<HTMLButtonElement>('[data-r0="cancel"]').addEventListener('click', () => {
+      // Order matters: set the abort flag FIRST so the pool's rejections are
+      // swallowed into +Inf losses, then hard-kill the workers — terminate is
+      // the only real cancel for a busy worker — and reject every pending sim
+      // so no await hangs on a reply that will never arrive. cancelAll also
+      // respawns a fresh pool, so the next Run fit works immediately.
+      this.signal.aborted = true;
+      this.pool?.cancelAll();
+      this.note('Cancelling…');
+    });
     q<HTMLButtonElement>('[data-r0="apply"]').addEventListener('click', () => {
       if (!this.result) return;
       this.events.onApply(this.result.config);
@@ -1001,6 +1032,8 @@ export class R0Modal {
         K: this.K,
         loss: this.loss,
         offset: this.offsetEvolve ? { bounds: [...this.offsetBounds] as [number, number] } : undefined,
+        extraDays: this.predictionDays,
+        posterior: this.bayesDraws > 1 ? { draws: this.bayesDraws } : undefined,
         optimizer: this.optimizer,
         gaPopulation: this.ga.population,
         gaGenerations: this.ga.generations,
@@ -1054,26 +1087,19 @@ export class R0Modal {
             };
           }
         }
-        // Fan chart: re-run the best config as an ensemble (each trial from a
-        // different index case) and aggregate into percentile bands. Display
-        // only — the fit result above is already final. Deterministic in
-        // (config, days, N, seed).
-        if (this.fanTrials > 1 && this.pool) {
-          this.note(`Computing confidence bands (${this.fanTrials} trials)…`);
-          try {
-            const ens = await this.pool.simulateEnsemble(
-              this.result.config, this.result.days, this.fanTrials, base.seed,
-            );
-            if (ens.perTrial?.length) this.lastFan = percentileBands(ens.perTrial, FAN_PROBS);
-          } catch { /* bands are optional — the fit result stands without them */ }
-        }
+        // FINAL band = the Bayesian posterior-predictive band computed inside
+        // runFit (seeded Metropolis, LOW/CENTRAL/HIGH = 5/50/95 across draws).
+        // The old index-case ensemble percentiles are no longer displayed —
+        // they were uncalibrated; the ensemble machinery remains in the lib.
+        this.lastFan = this.result.bayes ?? null;
         // Record the fit in the history, keyed by the effective dataset it ran
         // against, so the table only ranks like-for-like.
         this.history.unshift({
           t: Date.now(),
           hash: datasetHash(observed, this.population),
           presetId: this.presetId,
-          result: this.result,
+          // The Bayesian band is bulky and transient — recompute by re-running.
+          result: { ...this.result, bayes: undefined },
         });
         if (this.history.length > HISTORY_CAP) this.history.length = HISTORY_CAP;
         this.persist();
@@ -1209,17 +1235,38 @@ export class R0Modal {
     }
   }
 
-  /** Load a fixed observed dataset (a historical preset) into the table. */
-  private loadDataset(points: ObservedPoint[], population: number): void {
-    this.observed = points.map((p) => ({ ...p }));
-    this.population = population;
+  /** Load a fixed observed dataset (a historical preset) into the table. A
+   *  preset with default adjustment keyframes loads them ENABLED (editable);
+   *  one without resets the adjustment so stale frames from another dataset
+   *  can't silently distort the next fit. */
+  private loadDataset(p: DemoPreset): void {
+    this.observed = p.points.map((pt) => ({ ...pt }));
+    this.population = p.population;
     const popInput = this.el?.querySelector<HTMLInputElement>('[data-r0="population"]');
-    if (popInput) popInput.value = String(population);
+    if (popInput) popInput.value = String(p.population);
+    this.adjust = p.adjust
+      ? {
+          enabled: true,
+          asTarget: true,
+          t0: p.adjust.t0,
+          cases: p.adjust.cases.map((f) => ({ ...f })),
+          deaths: p.adjust.deaths.map((f) => ({ ...f })),
+        }
+      : { ...DEFAULT_ADJUST };
+    const adjEnabled = this.el?.querySelector<HTMLInputElement>('[data-adj="enabled"]');
+    if (adjEnabled) adjEnabled.checked = this.adjust.enabled;
+    const adjTarget = this.el?.querySelector<HTMLInputElement>('[data-adj="astarget"]');
+    if (adjTarget) adjTarget.checked = this.adjust.asTarget;
+    const adjT0 = this.el?.querySelector<HTMLInputElement>('[data-adj="t0"]');
+    if (adjT0) adjT0.value = this.adjust.t0 == null ? '' : String(this.adjust.t0);
+    this.renderAdjust();
     this.result = null;
     this.renderTable();
     this.renderOutput();
     this.persist();
-    this.note('Dataset loaded — press Run fit.');
+    this.note(p.adjust
+      ? 'Dataset loaded with default underreporting keyframes (enabled, editable) — press Run fit.'
+      : 'Dataset loaded — press Run fit.');
   }
 
   private activeParams(): FitParamDef[] {
@@ -1287,7 +1334,9 @@ export class R0Modal {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="output"]')!;
     const applyBtn = this.el!.querySelector<HTMLButtonElement>('[data-r0="apply"]')!;
     applyBtn.disabled = true;
-    const days = Math.max(1, ...observed.map((p) => Math.round(p.day)));
+    // Chart domain includes the prediction horizon so the live line already
+    // draws into the projected future.
+    const days = Math.max(1, ...observed.map((p) => Math.round(p.day))) + this.predictionDays;
 
     host.innerHTML = `
       <div class="r0-result-grid">
@@ -1337,7 +1386,8 @@ export class R0Modal {
               ? ' <span class="r0-muted">(≈ exact — the data over-determines the date)</span>'
               : ` <span class="r0-muted">(95% CI ${r.offsetCI.ci95[0]}–${r.offsetCI.ci95[1]} · 68% ${r.offsetCI.ci68[0]}–${r.offsetCI.ci68[1]})</span>`)
             : ''}</td>
-        </tr>`);
+        </tr>`)
+      + bayesRows(r);
 
     host.innerHTML = `
       <div class="r0-result-grid">
@@ -1585,10 +1635,17 @@ export class R0Modal {
             ] as [number, number],
           },
         },
-        // Percentile fan + floor/central/upper envelope are painted directly on
-        // the canvas (below the series, which redraw after this hook) so the
-        // data columns and legend stay exactly as before.
-        hooks: { draw: [(u) => this.paintOverlays(u)] },
+        // Band + floor/central/upper envelope are painted directly on the
+        // canvas (below the series, which redraw after this hook) so the data
+        // columns and legend stay exactly as before. The legend pins to the
+        // END-STATE values whenever the cursor is not on the chart — live
+        // streaming values appear only while hovering the live line.
+        hooks: {
+          draw: [(u) => this.paintOverlays(u)],
+          ready: [(u) => this.pinLegendToEnd(u)],
+          setData: [(u) => this.pinLegendToEnd(u)],
+          setCursor: [(u) => { if (u.cursor.idx == null) this.pinLegendToEnd(u); }],
+        },
         axes: [
           axisOpts('Day', { space: 56, values: (_u, splits) => splits.map((v) => String(Math.round(v))) }),
           // fmtNum keeps big counts compact (12k, 1.2M) so ticks stay inside the
@@ -1613,7 +1670,7 @@ export class R0Modal {
       // When a percentile fan is cached, the central line is the MEDIAN (p50)
       // of the ensemble — for N=1 that is exactly the single trial — instead
       // of the fit's mean curve, so the line always sits inside its bands.
-      const p50 = this.liveFanCols?.[cat]?.[FAN_PROBS.indexOf(50)];
+      const p50 = this.liveFanCols?.[cat]?.[BAND_CENTRAL];
       const arr = p50 ?? curves[cat] ?? [];
       const scale = p50 ? 1 : this.livePop; // fan rows are already people-scaled
       const shift = p50 ? 0 : this.liveModelShift; // fan renders post-fit, already aligned
@@ -1631,9 +1688,25 @@ export class R0Modal {
     this.plot.setData(data as uPlot.AlignedData);
   }
 
-  /** Canvas-paint the percentile fan (25% / 50% / 90% bands around the median)
-   *  and the adjustment envelope (floor / central / upper) for each category.
-   *  Runs as a uPlot draw hook; series redraw on top. */
+  /** Pin the legend readout to the final day when the cursor is off the chart,
+   *  so non-hover labels always show the end-state numbers. Guarded against
+   *  re-entrancy (setLegend can fire hooks). */
+  private pinningLegend = false;
+  private pinLegendToEnd(u: uPlot): void {
+    if (this.pinningLegend) return;
+    const n = u.data?.[0]?.length ?? 0;
+    if (!n) return;
+    this.pinningLegend = true;
+    try {
+      u.setLegend({ idx: n - 1 }, false);
+    } finally {
+      this.pinningLegend = false;
+    }
+  }
+
+  /** Canvas-paint the posterior-predictive band (LOW..HIGH fill around the
+   *  CENTRAL line) and the adjustment envelope (floor / central / upper) for
+   *  each category. Runs as a uPlot draw hook; series redraw on top. */
   private paintOverlays(u: uPlot): void {
     const fan = this.liveFanCols;
     const adj = this.liveAdjustPts;
@@ -1667,8 +1740,8 @@ export class R0Modal {
       const color = CAT_COLOR[cat];
       const rows = fan?.[cat];
       if (rows) {
-        // FAN_PROBS = [5, 25, 37.5, 50, 62.5, 75, 95] → (lo, hi, alpha) pairs.
-        const pairs: [number, number, number][] = [[0, 6, 0.07], [1, 5, 0.13], [2, 4, 0.2]];
+        // BAND_PROBS = [5, 50, 95] → one LOW..HIGH posterior-predictive fill.
+        const pairs: [number, number, number][] = [[0, 2, 0.16]];
         for (const [lo, hi, alpha] of pairs) {
           ctx.beginPath();
           rows[hi].forEach((v, d) => { if (d === 0) ctx.moveTo(X(0), Y(v)); else ctx.lineTo(X(d), Y(v)); });
@@ -1720,6 +1793,26 @@ export class R0Modal {
 }
 
 // ── Formatting helpers ──
+
+/** LOW / CENTRAL / HIGH readout rows for the Bayesian posterior-predictive
+ *  band at the projection end, one row per category present. */
+function bayesRows(r: FitResult): string {
+  if (!r.bayes) return '';
+  let out = '';
+  for (const cat of FIT_CATEGORIES) {
+    const rows = r.bayes[cat];
+    if (!rows?.[0]?.length) continue;
+    if (!r.observed.some((p) => p.category === cat)) continue;
+    const last = rows[0].length - 1;
+    const f = (i: number): string => fmtNum(rows[i][last] * r.population);
+    out += `<tr>
+      <td title="Bayesian posterior-predictive band at the projection end — seeded Metropolis over the fitted parameters (flat priors within the search bounds), 5/50/95 percentiles across draws. Calibrated parameter-uncertainty propagation; distinct from the index-date profile-likelihood CI, which is a parameter interval.">${CAT_SHORT[cat]} @ day ${last} (Bayes)</td>
+      <td>low ${f(0)} · <b>central ${f(1)}</b> · high ${f(2)}</td>
+    </tr>`;
+  }
+  return out;
+}
+
 function fmtParam(name: FitParamName, v: number): string {
   if (name === 'attackRate' || name === 'ifr') return `${(v * 100).toFixed(1)}%`;
   if (name === 'range') return String(Math.round(v));
@@ -1857,9 +1950,13 @@ const TEMPLATE = `
         <span>Max trials per candidate: <b data-r0="k-label">30</b></span>
         <input type="range" min="10" max="100" step="5" data-r0="k" />
       </label>
-      <label class="r0-field r0-field-inline" title="After the fit, re-run the best-fit disease this many times — each run starting from a DIFFERENT index case on the board — and shade the spread as percentile bands (25% / 50% / 90%) around the median. Caveat: trials are deterministic seeded realizations, so the bands quantify stochastic-path + index-case-location spread, not a Bayesian posterior over parameters. 1 = single line.">
-        <span>Fan-chart trials</span>
-        <input class="r0-in tiny" type="number" min="1" max="100" step="1" data-r0="fan" />
+      <label class="r0-field r0-field-inline" title="After the fit, sample the parameter posterior with a SEEDED Metropolis chain (flat priors within the search bounds), simulate each draw's curve, and shade the 5–95% posterior-predictive band with LOW / CENTRAL / HIGH readouts. This is calibrated parameter-uncertainty propagation — distinct from the index-date profile-likelihood CI (a parameter interval), and it replaces the old uncalibrated index-case ensemble band. Deterministic: same seed → same band. 0 = off.">
+        <span>Posterior draws (Bayes band)</span>
+        <input class="r0-in tiny" type="number" min="0" max="500" step="10" data-r0="fan" />
+      </label>
+      <label class="r0-field r0-field-inline" title="Project the fitted model this many days beyond the data's last day — the curve (and the Bayesian band) extends into the future. Deterministic.">
+        <span>Predict (days ahead)</span>
+        <input class="r0-in tiny" type="number" min="0" max="365" step="1" data-r0="pred" />
       </label>
     </div>
     <div class="r0-ga" data-r0="ga-controls">

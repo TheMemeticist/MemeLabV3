@@ -14,6 +14,7 @@ interface Job {
   cmd: FitWorkerCommand;
   key: string;
   resolve: (result: SimResult) => void;
+  reject: (err: Error) => void;
 }
 
 function poolSize(): number {
@@ -88,10 +89,37 @@ export class FitPool {
     const key = cacheKey(cmd);
     const cached = this.cache.get(key);
     if (cached) return Promise.resolve(cached);
-    return new Promise<SimResult>((resolve) => {
-      this.queue.push({ cmd, key, resolve });
+    return new Promise<SimResult>((resolve, reject) => {
+      this.queue.push({ cmd, key, resolve, reject });
       this.pump();
     });
+  }
+
+  /** Hard-cancel: terminate every worker mid-computation (a busy worker cannot
+   *  process a message, so terminate IS the cancel), reject every in-flight and
+   *  queued promise immediately so nothing awaits a reply that will never come,
+   *  then respawn a fresh pool so the next fit runs cleanly. The result cache
+   *  is kept — completed sims remain valid. */
+  cancelAll(): void {
+    const err = new Error('fit cancelled');
+    const size = this.workers.length || poolSize();
+    for (const w of this.workers) {
+      w.onmessage = null;
+      w.terminate();
+    }
+    for (const [, job] of this.inFlight) job.reject(err);
+    for (const job of this.queue) job.reject(err);
+    this.workers = [];
+    this.idle = [];
+    this.queue = [];
+    this.inFlight.clear();
+    this.pending.clear();
+    for (let i = 0; i < size; i++) {
+      const w = new Worker(new URL('../worker/fit.worker.ts', import.meta.url), { type: 'module' });
+      w.onmessage = (ev: MessageEvent<FitWorkerResult>) => this.onMessage(w, ev.data);
+      this.workers.push(w);
+      this.idle.push(w);
+    }
   }
 
   private pump(): void {

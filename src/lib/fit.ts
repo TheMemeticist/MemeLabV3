@@ -616,6 +616,14 @@ export interface FitRequest extends FitOptions {
    *  shifts the loss's day mapping only — never the SimConfig — so same-gene
    *  candidates at different offsets share one memoized sim. */
   offset?: { bounds: [number, number] };
+  /** Project this many days beyond the data's last day: the sim horizon (and
+   *  therefore every returned curve) extends past the observations. */
+  extraDays?: number;
+  /** Post-fit Bayesian posterior-predictive band: a seeded Metropolis chain
+   *  over the fitted parameters (flat priors within their bounds), each draw's
+   *  curve simulated (pool-memoized), percentiles across draws. Heavier than
+   *  the live path — runs once, after the optimum lands. */
+  posterior?: { draws?: number; burn?: number };
   /** Runs K trials of `config` for `days` days and returns mean per-capita curves
    *  plus the candidate's analytic R₀. */
   simulate: (config: SimConfig, days: number, K: number, seed: number) => Promise<SimResult>;
@@ -651,7 +659,16 @@ export interface FitResult {
   indexOffset?: number;
   /** Profile-likelihood CI for the index date (null when not evolved). */
   offsetCI?: OffsetCI | null;
+  /** Bayesian posterior-predictive band per category: three per-capita rows —
+   *  LOW (5th), CENTRAL (50th), HIGH (95th percentile across posterior draws).
+   *  Parameter-uncertainty propagation (calibrated), distinct from the
+   *  index-date profile-likelihood CI. Null when not requested/aborted. */
+  bayes?: Record<FitCategory, number[][]> | null;
 }
+
+/** Posterior-predictive band percentiles: LOW / CENTRAL / HIGH. */
+export const BAND_PROBS = [5, 50, 95];
+export const BAND_CENTRAL = 1; // index of the central row in BAND_PROBS order
 
 export async function runFit(req: FitRequest): Promise<FitResult> {
   const maxObsDay = Math.max(1, ...req.observed.map((p) => Math.round(p.day)));
@@ -659,7 +676,8 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   // largest candidate shift; without one this reduces to the old fixed horizon.
   const offLo = req.offset ? Math.max(0, Math.round(req.offset.bounds[0])) : 0;
   const offHi = req.offset ? Math.max(offLo, Math.round(req.offset.bounds[1])) : 0;
-  const days = maxObsDay + offHi;
+  const extraDays = Math.max(0, Math.round(req.extraDays ?? 0));
+  const days = maxObsDay + offHi + extraDays;
   const baseSeed = req.baseConfig.seed;
 
   // The searched vector = the gene params plus (optionally) the index-date
@@ -696,9 +714,23 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     values: number[],
     K: number,
   ): Promise<{ loss: number; r0: number | null; result: SimResult }> => {
-    const result = await req.simulate(configFor(values), days, K, baseSeed);
-    const shifted = shiftPts(req.observed, offsetOf(values));
-    return { loss: lossOf(shifted, result.curves, req.population, req.loss), r0: result.rNaught, result };
+    try {
+      const result = await req.simulate(configFor(values), days, K, baseSeed);
+      const shifted = shiftPts(req.observed, offsetOf(values));
+      return { loss: lossOf(shifted, result.curves, req.population, req.loss), r0: result.rNaught, result };
+    } catch (err) {
+      // A cancelled pool rejects every pending sim so nothing awaits a message
+      // that will never arrive — swallow those into +Inf losses and let the
+      // optimizer wind down instantly. Real errors still propagate.
+      if (req.signal?.aborted) {
+        return {
+          loss: Number.POSITIVE_INFINITY,
+          r0: null,
+          result: { curves: { cumulative_infections: [], cumulative_deaths: [], active_infections: [] }, rNaught: null },
+        };
+      }
+      throw err;
+    }
   };
 
   // Stream the best-so-far to the UI. Full-fidelity (Kfull) improvements gate
@@ -798,6 +830,38 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     offsetCI = profileOffsetCI(profile, mi, req.loss, req.observed.length);
   }
 
+  // ── Bayesian posterior-predictive band (post-fit, seeded, deterministic) ──
+  // Metropolis over ALL fitted dimensions (flat priors within bounds) started
+  // at the MAP; each retained draw's mean curve comes from the pool (memoized —
+  // repeated/quantized draws are free), then per-day 5/50/95 percentiles across
+  // draws. Parameter-uncertainty propagation: calibrated, unlike the raw
+  // index-case ensemble percentiles this replaces for the FINAL band. The live
+  // streaming path stays the cheap one.
+  let bayes: Record<FitCategory, number[][]> | null = null;
+  if (req.posterior && !req.signal?.aborted) {
+    const draws = Math.max(10, Math.round(req.posterior.draws ?? 120));
+    // Burn-in doubles as the step-adaptation phase — needs a few adaptation
+    // windows to find the posterior's scale on sharp likelihoods.
+    const burn = Math.max(30, Math.round(req.posterior.burn ?? Math.ceil(draws * 0.25)));
+    const chain = await metropolisChain(
+      async (v) => (await evalAt(v, req.K)).loss,
+      bestValues,
+      allParams,
+      (baseSeed ^ 0x0ba7e5ea) >>> 0,
+      draws + burn,
+      burn,
+      req.loss,
+      req.observed.length,
+    );
+    const drawCurves: SimCurves[] = [];
+    for (const v of chain) {
+      if (req.signal?.aborted) break;
+      const { result } = await evalAt(v, req.K);
+      if (result.curves.cumulative_infections.length) drawCurves.push(result.curves);
+    }
+    if (drawCurves.length && !req.signal?.aborted) bayes = percentileBands(drawCurves, BAND_PROBS);
+  }
+
   const bestConfig = configFor(bestValues);
   const best = await evalAt(bestValues, req.K); // cache hit
   const bestOffset = offsetOf(bestValues);
@@ -825,8 +889,94 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     config: bestConfig,
     indexOffset: offsetDef ? bestOffset : undefined,
     offsetCI,
+    bayes,
   };
 }
+
+/** Seeded random-walk Metropolis over the fit parameters, flat priors within
+ *  their bounds. Works in DEVIANCE units so both loss types are handled (for
+ *  Poisson NLL the deviance is the NLL itself, so the acceptance ratio is the
+ *  exact likelihood ratio; for MSE it is the Gaussian profile approximation).
+ *  Integer dimensions propose in whole steps; everything clamps to bounds.
+ *  Deterministic: a pure function of (nll, start, params, seed, iters, burn).
+ *  Returns the retained draws (post burn-in). */
+export async function metropolisChain(
+  nll: (values: number[]) => Promise<number> | number,
+  start: number[],
+  params: FitParamDef[],
+  seed: number,
+  iters: number,
+  burn: number,
+  lossType: LossType = 'poisson',
+  nObs = 1,
+): Promise<number[][]> {
+  const rng = new Rng((seed ^ 0x6d636d63) >>> 0);
+  const lo = params.map((p) => p.bounds[0]);
+  const hi = params.map((p) => p.bounds[1]);
+  const step = params.map((p, i) => {
+    const s = 0.08 * (hi[i] - lo[i]);
+    return p.integer ? Math.max(1, s) : s;
+  });
+  const decode = (v: number[]): number[] =>
+    v.map((x, i) => clamp(params[i].integer ? Math.round(x) : x, lo[i], hi[i]));
+
+  let cur = decode(start.slice());
+  let curDev = deviance(await nll(cur), lossType, nObs);
+  const draws: number[][] = [];
+  // Deterministic step adaptation DURING BURN-IN ONLY (frozen afterwards, so
+  // the retained draws satisfy detailed balance): a sharp likelihood (large
+  // counts) needs far smaller proposals than 8% of the bounds, or nothing is
+  // ever accepted and the band collapses to the MAP. Target ≈ 20–45% acceptance.
+  let accepted = 0;
+  let window = 0;
+  for (let it = 0; it < iters; it++) {
+    const prop = decode(cur.map((x, i) => x + rng.gaussian() * step[i]));
+    const propDev = deviance(await nll(prop), lossType, nObs);
+    // Accept with probability exp(devCur − devProp) — the likelihood ratio.
+    if (Math.log(Math.max(rng.random(), 1e-12)) < curDev - propDev) {
+      cur = prop;
+      curDev = propDev;
+      accepted++;
+    }
+    window++;
+    if (it < burn && window === 10) {
+      const rate = accepted / window;
+      const f = rate < 0.15 ? 0.5 : rate > 0.45 ? 1.4 : 1;
+      if (f !== 1) for (let i = 0; i < step.length; i++) step[i] *= f;
+      accepted = 0;
+      window = 0;
+    }
+    if (it >= burn) draws.push(cur.slice());
+  }
+  return draws;
+}
+
+/** Default underreporting keyframes for the current-outbreak Ebola preset
+ *  ('ebola-rev'), from the user's sitrep-phase tables (ranges → midpoints; all
+ *  ≥ 1 so floor ≤ central ≤ upper). Day −8 = first confirmed case (before the
+ *  data), day 110 = projected asymptote (beyond the data) — the keyframe
+ *  interpolation clamps outside its ends. Editable defaults, not fixed. */
+export const EBOLA_ADJUST: { t0: number; cases: Keyframe[]; deaths: Keyframe[] } = {
+  t0: -8,
+  cases: [
+    { day: -8, m: 5.0 },   // first confirmed case; early undetected spread
+    { day: 0, m: 4.8 },    // declaration (4.6–5.0)
+    { day: 34, m: 3.8 },   // 6 wk post-first-case; conflict setting
+    { day: 45, m: 3.0 },   // data resumes; band edge
+    { day: 68, m: 1.9 },   // Jul 25 backlog dump / reconciliation
+    { day: 81, m: 1.45 },  // active-response phase (1.4–1.5)
+    { day: 110, m: 1.25 }, // projected asymptote (1.2–1.3)
+  ],
+  deaths: [
+    { day: -8, m: 3.0 },   // burials keep deaths more visible
+    { day: 0, m: 2.9 },    // no burial teams yet (2.8–3.0)
+    { day: 34, m: 2.5 },   // safe-burial teams scaling
+    { day: 60, m: 1.8 },   // death reporting accelerating
+    { day: 68, m: 1.4 },   // Jul 25 death dump / reconciliation
+    { day: 81, m: 1.1 },   // deaths now over-ascertained (1.0–1.2)
+    { day: 110, m: 1.05 }, // projected; deaths converge first (1.0–1.1)
+  ],
+};
 
 /** Profile-likelihood CI over a 1D offset profile via 2·ln(L_max/L) ≤ χ²₁
  *  (3.84 → 95%, 1.0 → ≈68%). Walks OUTWARD from the mode so the interval is the
