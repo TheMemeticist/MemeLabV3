@@ -272,6 +272,22 @@ export class Chart {
             { label: 'Dead', stroke: cssVar('--chart-dead'), width: 1.6, value: fmtCountVal },
           ];
       const isReff = this.view === 'reff';
+      // Named y axis + compact ticks: raw comma-separated large values
+      // ("1,500,000,000" on the costs chart) overflow the default 50px
+      // gutter and clip; compact "$1.5B" ticks plus a measured gutter width
+      // (autoAxisSize) keep every label fully visible.
+      const yAxis: uPlot.Axis = {
+        stroke: accent('--text-muted'),
+        grid: { stroke: accent('--grid-color') },
+        label: isReff ? 'Reproduction number (R)' : this.view === 'costs' ? 'Cumulative cost' : 'People',
+        labelSize: 18,
+        labelFont: AXIS_LABEL_FONT,
+        size: autoAxisSize,
+      };
+      if (!isReff) {
+        yAxis.values = (_u, splits) =>
+          splits.map((v) => (this.view === 'costs' ? this.costSymbol : '') + fmtCompact(v));
+      }
       const opts: uPlot.Options = {
         width: this.host.clientWidth,
         height: this.canvasHeight(),
@@ -298,8 +314,14 @@ export class Chart {
           },
         },
         axes: [
-          { stroke: accent('--text-muted'), grid: { stroke: accent('--grid-color') } },
-          { stroke: accent('--text-muted'), grid: { stroke: accent('--grid-color') } },
+          {
+            stroke: accent('--text-muted'),
+            grid: { stroke: accent('--grid-color') },
+            label: 'Day',
+            labelSize: 18,
+            labelFont: AXIS_LABEL_FONT,
+          },
+          yAxis,
         ],
         legend: { show: true, live: true },
         cursor: { focus: { prox: 16 } },
@@ -580,6 +602,40 @@ function fmtCountVal(u: uPlot, raw: number | null, seriesIdx: number): string {
 function fmtReffVal(u: uPlot, raw: number | null, seriesIdx: number): string {
   const v = idleValue(u, raw, seriesIdx);
   return v == null ? '--' : v.toFixed(2);
+}
+
+// Axis-title font — small and muted so the titles stay recessive next to data.
+const AXIS_LABEL_FONT = '600 11px ui-sans-serif, system-ui, sans-serif';
+
+// Compact tick formatter for the y axis: 2500 → "2.5k", 1.5e9 → "1.5B".
+function fmtCompact(v: number): string {
+  const a = Math.abs(v);
+  if (a >= 1e12) return trimZeros(v / 1e12) + 'T';
+  if (a >= 1e9) return trimZeros(v / 1e9) + 'B';
+  if (a >= 1e6) return trimZeros(v / 1e6) + 'M';
+  if (a >= 1e3) return trimZeros(v / 1e3) + 'k';
+  return trimZeros(v);
+}
+
+function trimZeros(v: number): string {
+  const a = Math.abs(v);
+  const s = a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2);
+  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+}
+
+// uPlot's axis-autosize recipe: size the y gutter to the widest rendered tick
+// (plus tick mark + gap) so labels never clip regardless of magnitude.
+function autoAxisSize(u: uPlot, values: string[] | null, axisIdx: number, cycleNum: number): number {
+  const axis = u.axes[axisIdx] as uPlot.Axis & { _size?: number; font?: string[] };
+  // Converge: after the first measuring cycle, keep the settled size.
+  if (cycleNum > 1) return axis._size ?? 50;
+  let size = (typeof axis.ticks?.size === 'number' ? axis.ticks.size : 10) + (typeof axis.gap === 'number' ? axis.gap : 5);
+  const longest = (values ?? []).reduce((acc, s) => (s.length > acc.length ? s : acc), '');
+  if (longest !== '') {
+    if (axis.font?.[0]) u.ctx.font = axis.font[0];
+    size += u.ctx.measureText(longest).width / (window.devicePixelRatio || 1);
+  }
+  return Math.ceil(Math.max(40, size));
 }
 
 function rgbCss(varName: string): string {

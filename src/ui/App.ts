@@ -314,6 +314,9 @@ export class App {
       onPresetChange: (p) => { this.loadPresetCost(p); this.onConfigChange(); },
       onCustomNameChange: () => this.persist(),
       onInterventionToggle: (key, on) => this.recordInterventionToggle(key, on),
+      // The R₀ Estimator launches from the Disease panel; r0Modal is
+      // constructed later in this method, before any click can fire.
+      onEstimatorOpen: () => this.r0Modal.open(),
     });
     this.controls.buildLeft(left);
     this.controls.buildRight(right);
@@ -359,9 +362,6 @@ export class App {
       getConfig: () => this.controls.config(),
       onApply: (fitted) => this.applyFit(fitted),
     });
-    // The R₀ Estimator launches from the R₀ stat tile above the petri dish.
-    this.stats.onEstimatorClick(() => this.r0Modal.open());
-
     (this.root.querySelector('[data-act="reset-defaults"]') as HTMLButtonElement)
       .addEventListener('click', () => { localStorage.clear(); location.reload(); });
 

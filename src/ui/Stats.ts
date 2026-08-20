@@ -18,7 +18,7 @@ export class Stats {
       <div class="stat" data-key="r"><span class="stat-label">Recovered</span><span class="stat-value">0%</span></div>
       <div class="stat" data-key="d"><span class="stat-label">Dead</span><span class="stat-value">0%</span></div>
       <div class="stat" data-key="reff"><span class="stat-label">R<sub>eff</sub></span><span class="stat-value">—</span></div>
-      <div class="stat is-clickable" data-key="r0" role="button" tabindex="0" aria-label="Open R₀ Estimator" title="Open the R₀ Estimator — fit an observed outbreak curve back to disease parameters."><span class="stat-label">R<sub>0</sub><span class="stat-launch" aria-hidden="true">📉</span></span><span class="stat-value">—</span></div>
+      <div class="stat" data-key="r0"><span class="stat-label">R<sub>0</sub></span><span class="stat-value">—</span></div>
       <div class="stat" data-key="cost"><span class="stat-label">Cost</span><span class="stat-value">—</span></div>
     `;
     this.el = host;
@@ -32,16 +32,6 @@ export class Stats {
 
   setRNaught(value: number | null): void {
     this.rNaughtVal.textContent = value === null ? '—' : value.toFixed(1);
-  }
-
-  /** Wire the R₀ tile as the R₀ Estimator launcher (click + Enter/Space). */
-  onEstimatorClick(cb: () => void): void {
-    const tile = this.items['r0'].closest('.stat') as HTMLElement | null;
-    if (!tile) return;
-    tile.addEventListener('click', cb);
-    tile.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); cb(); }
-    });
   }
 
   /**

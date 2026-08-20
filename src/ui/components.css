@@ -180,10 +180,27 @@ input[type='range']::-moz-range-thumb {
 }
 .btn:active { transform: translateY(1px); }
 .btn.icon-only {
-  padding: 8px;
-  width: 38px;
-  height: 38px;
+  padding: 0;
+  width: 36px;
+  height: 36px;
   justify-content: center;
+}
+/* Topbar pills: one fixed control height, no shrinking or label wrapping —
+   otherwise multi-word labels ("What is this?", "Cost model") wrap at tight
+   widths and those two buttons grow taller than their siblings. */
+.topbar-actions .btn {
+  flex: none;
+  height: 36px;
+  padding: 0 14px;
+  white-space: nowrap;
+  line-height: 1;
+}
+.topbar-actions .btn.icon-only { padding: 0; }
+/* Fixed-size pills can no longer shrink, so let the action row wrap to a
+   second line before it would overflow-clip against the viewport edge. */
+@media (max-width: 1080px) {
+  .topbar { flex-wrap: wrap; }
+  .topbar-actions { flex-wrap: wrap; justify-content: flex-end; }
 }
 .btn-primary {
   background: var(--accent);
@@ -194,7 +211,17 @@ input[type='range']::-moz-range-thumb {
   background: var(--accent-2);
   border-color: var(--accent-2);
 }
-.btn-icon { font-size: 14px; line-height: 1; }
+/* Fixed icon box so emoji/SVG glyph metrics can't stretch a button's line box. */
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  font-size: 14px;
+  line-height: 1;
+}
 
 /* ==== Toolbar ==== */
 
@@ -386,22 +413,23 @@ input[type='range']::-moz-range-thumb {
 .stat .stat-value.stale { opacity: 0.6; font-style: italic; }
 :root[data-theme='lab'] .stat[data-key='d'] .stat-value { color: var(--text-muted); }
 
-/* R₀ tile doubles as the R₀ Estimator launcher. */
-.stat.is-clickable { cursor: pointer; transition: border-color 120ms ease, background 120ms ease; }
-.stat.is-clickable:hover,
-.stat.is-clickable:focus-visible {
+/* R₀ Estimator launcher — a prominent full-width button in the Disease panel,
+   between the preset card and the strain sliders. */
+.estimator-launch {
+  width: 100%;
+  justify-content: center;
+  margin: 10px 0 4px;
   border-color: var(--accent);
   background: var(--accent-soft);
-  outline: none;
+  color: var(--accent);
+  font-weight: 600;
 }
-.stat-launch {
-  font-size: 10px;
-  margin-left: 4px;
-  opacity: 0.55;
-  vertical-align: middle;
+.estimator-launch:hover,
+.estimator-launch:focus-visible {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
 }
-.stat.is-clickable:hover .stat-launch,
-.stat.is-clickable:focus-visible .stat-launch { opacity: 1; }
 
 /* Cost meter — a mounting-loss readout. Lives in the stats row (slightly wider
    than its siblings) and escalates from amber → deep red with a glow + tremor

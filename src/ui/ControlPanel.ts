@@ -9,6 +9,8 @@ export interface ControlPanelEvents {
   onPresetChange: (preset: DiseasePreset) => void;
   onCustomNameChange?: (name: string | null) => void;
   onInterventionToggle?: (key: InterventionKey, on: boolean) => void;
+  /** Open the R₀ Estimator (launched from the Disease panel). */
+  onEstimatorOpen?: () => void;
 }
 
 export class ControlPanel {
@@ -346,10 +348,15 @@ export class ControlPanel {
         </button>
         <div class="panel-body">
           <div class="preset-host"></div>
+          <button type="button" class="btn estimator-launch" data-act="estimator" data-tip="Fit an observed outbreak curve back to disease parameters — reports the implied R₀ and can apply the fitted disease here.">
+            <span class="btn-icon" aria-hidden="true">📉</span>R₀ Estimator
+          </button>
           <div class="strain-sliders" data-section="strain"></div>
         </div>
       </section>
     `;
+    host.querySelector('[data-act="estimator"]')
+      ?.addEventListener('click', () => this.events.onEstimatorOpen?.());
     const presetHost = host.querySelector('.preset-host') as HTMLElement;
     const strainHost = host.querySelector('[data-section="strain"]') as HTMLElement;
 
