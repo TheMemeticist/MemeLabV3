@@ -19,6 +19,7 @@ import {
   CATEGORY_LABELS,
   FIT_CATEGORIES,
   FIT_PARAMS,
+  effectiveReduction,
   hasDownwardRevisions,
   parseObservedCSV,
   BAND_CENTRAL,
@@ -917,10 +918,8 @@ export class R0Modal {
     }
   }
 
-  /** Keyframe click-through: the main sim's own Slider controls for the
-   *  clicked intervention + keyframe (transmission reduction exactly as the
-   *  lockdown panel presents it, plus this keyframe's intensity and the
-   *  live-sim taxonomy bucket) — one shared object, same sliders both places. */
+  /** Keyframe click-through: this keyframe's intensity as a Slider (the rich
+   *  per-type controls live on the card itself now). */
   private openItvSliders(
     card: HTMLElement,
     iv: InterventionSpec,
@@ -931,20 +930,6 @@ export class R0Modal {
     if (existing) { existing.remove(); return; } // toggle closed
     const host = document.createElement('div');
     host.className = 'r0-itv-sliders';
-    const effectSlider = new Slider({
-      id: `itv-eff-${iv.id}`,
-      label: 'Transmission reduction',
-      min: 0, max: 95, step: 5,
-      value: Math.round(iv.transmissionReduction * 100),
-      unit: '%',
-      hint: 'Same control as the main sim (LockdownSpec.transmissionReduction): the multiplicative cut to transmission at full (100%) intensity.',
-      onChange: (v) => {
-        iv.transmissionReduction = Math.min(0.95, Math.max(0, v / 100));
-        const eff = card.querySelector<HTMLInputElement>('[data-iv="effect"]');
-        if (eff) eff.value = String(Math.round(iv.transmissionReduction * 100));
-        persist();
-      },
-    });
     const intensitySlider = new Slider({
       id: `itv-int-${iv.id}-${frame.tick}`,
       label: `Intensity @ day ${frame.tick}`,
@@ -955,7 +940,6 @@ export class R0Modal {
       onChange: (v) => {
         frame.intensity = Math.min(1, Math.max(0, v / 100));
         persist();
-        // Sync the inline % box without a full re-render (slider keeps focus).
         card.querySelectorAll<HTMLInputElement>('[data-kf="m"]').forEach((inp) => {
           if (Number(inp.closest('.r0-adjust-row')?.querySelector<HTMLInputElement>('[data-kf="day"]')?.value) === frame.tick) {
             inp.value = String(Math.round(frame.intensity * 100));
@@ -963,20 +947,7 @@ export class R0Modal {
         });
       },
     });
-    const tax = document.createElement('label');
-    tax.className = 'r0-check';
-    tax.title = "The live sim's intervention taxonomy (InterventionKey) — main-sim toggles of this key sync this intervention's enabled state.";
-    tax.innerHTML = `type <select class="r0-in" data-iv="tax">
-      ${['custom', 'mask', 'vaccine', 'lockdown', 'quarantine']
-        .map((k) => `<option value="${k}"${iv.intervention === k ? ' selected' : ''}>${k}</option>`).join('')}
-    </select>`;
-    tax.querySelector('select')!.addEventListener('change', (e) => {
-      iv.intervention = (e.target as HTMLSelectElement).value as InterventionSpec['intervention'];
-      persist();
-    });
-    host.appendChild(effectSlider.el);
     host.appendChild(intensitySlider.el);
-    host.appendChild(tax);
     card.appendChild(host);
   }
 
@@ -984,16 +955,22 @@ export class R0Modal {
    *  chart-day coordinates (data day + the given offset shift). */
   private itvWindows(offset: number): { from: number; to: number; label: string }[] {
     return this.interventions
-      .filter((iv) => iv.enabled && iv.transmissionReduction > 0 && iv.events.length > 0)
+      .filter((iv) => iv.enabled && effectiveReduction(iv) > 0 && iv.events.length > 0)
       .map((iv) => {
         const days = iv.events.map((f) => f.tick);
         return { from: Math.min(...days) + offset, to: Math.max(...days) + offset, label: iv.label };
       });
   }
 
-  /** Interventions editor: one card per intervention — enable toggle, name,
-   *  max-effect %, an intensity ramp (day → %, linearly interpolated, clamped
-   *  outside its ends), and remove. All edits persist. */
+  /** Interventions editor: the SAME rich controls as the main sim's
+   *  Interventions panel — per-taxonomy Slider stacks (mask/vaccine: Rate /
+   *  Protection / Source control / Mortality reduction; lockdown: Mobility /
+   *  Transmission reduction / Compliance; quarantine: Detection rate /
+   *  Close-contacts range / Protection / Source control / Duration), plus the
+   *  fit's time dimension (the intensity ramp). Everything edits the shared
+   *  store objects directly. Param-less typed specs (e.g. the calibrated
+   *  Ebola presets) keep their flat strength until the user opts into the
+   *  full controls, so preset calibration is never silently overwritten. */
   private renderInterventions(): void {
     const host = this.el?.querySelector<HTMLElement>('[data-r0="itv-list"]');
     const count = this.el?.querySelector<HTMLElement>('[data-r0="itv-count"]');
@@ -1018,14 +995,22 @@ export class R0Modal {
             <input type="checkbox" data-iv="on" ${iv.enabled ? 'checked' : ''} />
           </label>
           <input class="r0-in r0-itv-name" type="text" value="${iv.label.replace(/"/g, '&quot;')}" data-iv="label" aria-label="Intervention name" />
-          <label class="r0-itv-effect" title="Maximum transmission reduction at full (100%) intensity — the live sim's transmissionReduction. R(t) is multiplied by 1 − transmissionReduction × intensity(t).">
-            −<input class="r0-in tiny" type="number" min="0" max="95" step="5" value="${Math.round(iv.transmissionReduction * 100)}" data-iv="effect" aria-label="Max effect %" />% transmission
-          </label>
+          <select class="r0-in" data-iv="tax" title="The live sim's intervention taxonomy — selecting a type seeds the SAME rich controls the main sim uses (from the current sim config) and main-sim toggles of this key sync the enabled state.">
+            ${['custom', 'mask', 'vaccine', 'lockdown', 'quarantine']
+              .map((k) => `<option value="${k}"${iv.intervention === k ? ' selected' : ''}>${k}</option>`).join('')}
+          </select>
+          <span class="r0-itv-eff r0-muted" data-iv="eff" title="Derived max transmission reduction at full intensity — what the model applies: R(t) = R0 × (1 − this × intensity(t))."></span>
           <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">×</button>
         </div>
+        <div class="r0-itv-params" data-iv="params"></div>
         <div class="r0-itv-frames" data-iv="frames"></div>
       `;
       const persist = (): void => { this.notifyInterventions(); };
+      const effBadge = card.querySelector<HTMLElement>('[data-iv="eff"]')!;
+      const refreshEff = (): void => {
+        effBadge.textContent = `−${Math.round(effectiveReduction(iv) * 100)}% transmission`;
+      };
+      refreshEff();
       card.querySelector<HTMLInputElement>('[data-iv="on"]')!.addEventListener('change', (e) => {
         iv.enabled = (e.target as HTMLInputElement).checked;
         persist();
@@ -1035,18 +1020,71 @@ export class R0Modal {
         iv.label = (e.target as HTMLInputElement).value || 'Intervention';
         persist();
       });
-      card.querySelector<HTMLInputElement>('[data-iv="effect"]')!.addEventListener('change', (e) => {
-        const v = Number((e.target as HTMLInputElement).value);
-        iv.transmissionReduction = Number.isFinite(v) ? Math.min(0.95, Math.max(0, v / 100)) : 0.3;
-        (e.target as HTMLInputElement).value = String(Math.round(iv.transmissionReduction * 100));
+      card.querySelector<HTMLSelectElement>('[data-iv="tax"]')!.addEventListener('change', (e) => {
+        iv.intervention = (e.target as HTMLSelectElement).value as InterventionSpec['intervention'];
+        this.seedParams(iv); // seed the rich fields from the live sim config
         persist();
+        this.renderInterventions();
       });
-      card.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
+      card.querySelector<HTMLButtonElement>('.r0-itv-head .r0-del')!.addEventListener('click', () => {
         this.interventions.splice(idx, 1);
         persist();
         this.renderInterventions();
       });
-      // Intensity ramp rows: day + intensity %, add/remove keyframes.
+
+      // ── Rich per-type controls (the main sim's own Slider component) ──
+      const paramsHost = card.querySelector<HTMLElement>('[data-iv="params"]')!;
+      const pctSlider = (idSuffix: string, label: string, get: () => number, set: (frac: number) => void, hint?: string): void => {
+        paramsHost.appendChild(new Slider({
+          id: `r0-${iv.id}-${idSuffix}`, label, min: 0, max: 100, step: 1, unit: '%',
+          value: Math.round(get() * 100), hint,
+          onChange: (v) => { set(Math.min(1, Math.max(0, v / 100))); refreshEff(); persist(); },
+        }).el);
+      };
+      const rawSlider = (idSuffix: string, label: string, min: number, max: number, unit: '' | 'days' | 'tiles', get: () => number, set: (v: number) => void, hint?: string): void => {
+        paramsHost.appendChild(new Slider({
+          id: `r0-${iv.id}-${idSuffix}`, label, min, max, step: 1, unit,
+          value: get(), hint,
+          onChange: (v) => { set(v); refreshEff(); persist(); },
+        }).el);
+      };
+      const p = iv.params;
+      if (iv.intervention !== 'custom' && !p) {
+        // Calibrated flat-strength spec (e.g. the Ebola presets): keep the
+        // single dial until the user opts into the full typed controls.
+        pctSlider('flat', 'Transmission reduction', () => iv.transmissionReduction, (f) => { iv.transmissionReduction = Math.min(0.95, f); },
+          'Calibrated flat strength. Use the button below to switch to the full main-sim controls for this type (seeded from the current sim config).');
+        const useFull = document.createElement('button');
+        useFull.className = 'btn ghost';
+        useFull.type = 'button';
+        useFull.textContent = `use full ${iv.intervention} controls`;
+        useFull.addEventListener('click', () => {
+          this.seedParams(iv);
+          persist();
+          this.renderInterventions();
+        });
+        paramsHost.appendChild(useFull);
+      } else if (p && (iv.intervention === 'mask' || iv.intervention === 'vaccine')) {
+        pctSlider('rate', 'Rate', () => p.uptake ?? 0, (f) => { p.uptake = f; }, 'Population uptake — same control as the main sim.');
+        pctSlider('prot', 'Protection', () => p.protection ?? 0, (f) => { p.protection = f; }, 'Reduces incoming attack success against the wearer.');
+        pctSlider('src', 'Source control', () => p.sourceControl ?? 0, (f) => { p.sourceControl = f; }, 'Reduces outgoing attack success from the wearer.');
+        pctSlider('mort', 'Mortality reduction', () => p.mortalityReduction ?? 0, (f) => { p.mortalityReduction = f; }, 'Reduces IFR if infected — affects deaths in the live sim; not part of the fitted R(t).');
+      } else if (p && iv.intervention === 'lockdown') {
+        pctSlider('mob', 'Mobility reduction', () => p.mobilityReduction ?? 0, (f) => { p.mobilityReduction = f; }, 'Probabilistically skips neighbor visits for compliant cells.');
+        pctSlider('trans', 'Transmission reduction', () => iv.transmissionReduction, (f) => { iv.transmissionReduction = f; }, 'Global multiplicative reduction on transmission.');
+        pctSlider('comp', 'Compliance', () => p.compliance ?? 0, (f) => { p.compliance = f; }, 'Per-cell adherence to the lockdown.');
+      } else if (p && iv.intervention === 'quarantine') {
+        pctSlider('rate', 'Detection rate', () => p.detectionRate ?? 0, (f) => { p.detectionRate = f; }, 'Per-tick probability an infectious cell is detected.');
+        rawSlider('range', 'Close-contacts range', 1, 5, 'tiles', () => p.contactsRange ?? 1, (v) => { p.contactsRange = v; }, 'Radius of contacts isolated with a detected case (live-sim spatial dynamics; not in the fitted rate).');
+        pctSlider('prot', 'Protection', () => p.protection ?? 0, (f) => { p.protection = f; }, 'Reduces transmission INTO quarantined cells.');
+        pctSlider('src', 'Source control', () => p.sourceControl ?? 0, (f) => { p.sourceControl = f; }, 'Reduces transmission FROM quarantined cells.');
+        rawSlider('dur', 'Duration', 1, 60, 'days', () => p.duration ?? 14, (v) => { p.duration = v; }, 'Quarantine persistence (live-sim dynamics; not in the fitted rate).');
+      } else {
+        pctSlider('flat', 'Transmission reduction', () => iv.transmissionReduction, (f) => { iv.transmissionReduction = Math.min(0.95, f); },
+          'Max multiplicative cut to transmission at full (100%) intensity.');
+      }
+
+      // ── Intensity ramp (the fit's time dimension; main sim has no ramps) ──
       const framesHost = card.querySelector<HTMLElement>('[data-iv="frames"]')!;
       const frames = iv.events.slice().sort((a, b) => a.tick - b.tick);
       iv.events = frames;
@@ -1073,9 +1111,7 @@ export class R0Modal {
           persist();
           this.renderInterventions();
         });
-        // Clicking a keyframe day surfaces the SAME sliders the main sim uses
-        // (the shared Slider component + LockdownSpec-style transmission
-        // reduction), editing the same shared-store object.
+        // Clicking a keyframe row opens this keyframe's intensity as a slider.
         row.addEventListener('click', (ev) => {
           const t = ev.target as HTMLElement;
           if (t.closest('input') || t.closest('button')) return;
@@ -1096,6 +1132,40 @@ export class R0Modal {
       framesHost.appendChild(add);
       host.appendChild(card);
     });
+  }
+
+  /** Seed the rich per-type params from the CURRENT live sim config — true
+   *  crossover: a new mask intervention starts at the main sim's mask sliders. */
+  private seedParams(iv: InterventionSpec): void {
+    const cfg = this.events.getConfig();
+    switch (iv.intervention) {
+      case 'mask':
+      case 'vaccine': {
+        const d = cfg.defenses.find((x) => x.id === iv.intervention);
+        iv.params = {
+          uptake: d?.uptake ?? 0.5,
+          protection: d?.protection ?? 0.3,
+          sourceControl: d?.sourceControl ?? 0.5,
+          mortalityReduction: d?.mortalityReduction ?? 0,
+        };
+        break;
+      }
+      case 'lockdown':
+        iv.params = { mobilityReduction: cfg.lockdown.mobilityReduction, compliance: cfg.lockdown.compliance };
+        if (cfg.lockdown.transmissionReduction > 0) iv.transmissionReduction = cfg.lockdown.transmissionReduction;
+        break;
+      case 'quarantine':
+        iv.params = {
+          detectionRate: cfg.quarantine.detectionRate,
+          contactsRange: cfg.quarantine.contactsRange,
+          protection: cfg.quarantine.protection,
+          sourceControl: cfg.quarantine.sourceControl,
+          duration: cfg.quarantine.duration,
+        };
+        break;
+      default:
+        delete iv.params;
+    }
   }
 
   /** Keyframe editor for the underreporting multipliers: per category, one row

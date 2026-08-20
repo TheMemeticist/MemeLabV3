@@ -22,6 +22,7 @@ import {
   resolutionFitSize,
   revisionEnvelope,
   runFit,
+  effectiveReduction,
   specFromEvents,
   syncSpecsWithToggle,
   transmissionSchedule,
@@ -966,4 +967,50 @@ describe('crossover store, future persistence, future Bayes band, full progress'
     // The post stages actually tick (more reports than the optimizer alone).
     expect(fracs.length).toBeGreaterThan(20);
   }, 30_000);
+});
+
+describe('rich intervention params: the model honors the FULL main-sim spec', () => {
+  const base = (over: Partial<InterventionSpec> = {}): InterventionSpec => ({
+    id: 'iv-r', intervention: 'custom', label: 'r', enabled: true,
+    transmissionReduction: 0.3, events: [{ tick: 0, intensity: 1 }],
+    ...over,
+  });
+
+  it('effectiveReduction derives from per-type params like the engine composes them', () => {
+    // mask/vaccine (DefenseSpec): (1 − u·prot)(1 − u·src) — hand-checked:
+    // u=1, prot=0.5, src=0.5 → 1 − 0.5·0.5 = 0.75 reduction.
+    expect(effectiveReduction(base({ intervention: 'mask', params: { uptake: 1, protection: 0.5, sourceControl: 0.5, mortalityReduction: 1 } })))
+      .toBeCloseTo(0.75, 12);
+    // u=0.5, prot=0.2, src=0.8 → 1 − (0.9)(0.6) = 0.46.
+    expect(effectiveReduction(base({ intervention: 'vaccine', params: { uptake: 0.5, protection: 0.2, sourceControl: 0.8 } })))
+      .toBeCloseTo(0.46, 12);
+    // mortalityReduction alone must NOT reduce transmission.
+    expect(effectiveReduction(base({ intervention: 'mask', params: { uptake: 1, mortalityReduction: 1 } }))).toBe(0);
+    // lockdown: 1 − (1−tr)(1−mob·comp): tr=0.3, mob=0.5, comp=0.8 → 1 − 0.7·0.6 = 0.58.
+    expect(effectiveReduction(base({ intervention: 'lockdown', transmissionReduction: 0.3, params: { mobilityReduction: 0.5, compliance: 0.8 } })))
+      .toBeCloseTo(0.58, 12);
+    // quarantine: detectionRate·sourceControl = 0.6·0.7 = 0.42 (range/duration
+    // shape live-sim spatial dynamics, not this population rate).
+    expect(effectiveReduction(base({ intervention: 'quarantine', params: { detectionRate: 0.6, sourceControl: 0.7, contactsRange: 5, duration: 60 } })))
+      .toBeCloseTo(0.42, 12);
+    // Cap at 0.95; param-less falls back to the flat value (presets/custom).
+    expect(effectiveReduction(base({ intervention: 'mask', params: { uptake: 1, protection: 1, sourceControl: 1 } }))).toBe(0.95);
+    expect(effectiveReduction(base({ intervention: 'quarantine' }))).toBeCloseTo(0.3, 12); // no params → flat
+    expect(effectiveReduction(base())).toBeCloseTo(0.3, 12);
+  });
+
+  it('transmissionSchedule + the fit consume the derived reduction (crossover intact)', () => {
+    const rich = base({ intervention: 'mask', params: { uptake: 1, protection: 0.5, sourceControl: 0.5 } });
+    const sched = transmissionSchedule([rich], 5)!;
+    expect(sched[3]).toBeCloseTo(0.25, 12); // 1 − 0.75 at full intensity
+    // Main-sim toggle still flips the SAME object (crossover with rich params).
+    expect(syncSpecsWithToggle([rich], 'mask', false)).toBe(true);
+    expect(rich.enabled).toBe(false);
+    expect(transmissionSchedule([rich], 5)).toBeUndefined(); // disabled → no schedule
+    // Ebola calibrated presets are param-less → bit-identical behavior retained.
+    expect(EBOLA_INTERVENTIONS.every((iv) => iv.params === undefined)).toBe(true);
+    // Deterministic: same spec → same schedule.
+    rich.enabled = true;
+    expect(transmissionSchedule([rich], 5)).toEqual(sched);
+  });
 });

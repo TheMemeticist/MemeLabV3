@@ -1428,6 +1428,42 @@ export function syncSpecsWithToggle(
   return changed;
 }
 
+/** The intervention's effective max transmission reduction. Typed specs with
+ *  rich `params` derive it the way the live engine composes the same fields —
+ *  the model honors the FULL spec, not just a flat number:
+ *  - mask/vaccine (DefenseSpec): wearers (uptake u) cut incoming success by
+ *    `protection` and outgoing by `sourceControl` → population multiplier
+ *    ≈ (1 − u·prot)(1 − u·src); mortalityReduction affects deaths, not R(t).
+ *  - lockdown (LockdownSpec): global transmission cut × skipped visits →
+ *    (1 − transmissionReduction)(1 − mobilityReduction·compliance).
+ *  - quarantine (QuarantineSpec): detected infectious (detectionRate) emit at
+ *    (1 − sourceControl) → reduction ≈ detectionRate·sourceControl (steady-
+ *    state approximation; contactsRange/duration/protection shape the live
+ *    sim's spatial dynamics but not this population-level rate).
+ *  Param-less specs (custom + calibrated presets) use the flat value. */
+export function effectiveReduction(iv: InterventionSpec): number {
+  const p = iv.params;
+  if (!p) return clamp(iv.transmissionReduction, 0, 0.95);
+  switch (iv.intervention) {
+    case 'mask':
+    case 'vaccine': {
+      const u = clamp(p.uptake ?? 0, 0, 1);
+      const incoming = 1 - u * clamp(p.protection ?? 0, 0, 1);
+      const outgoing = 1 - u * clamp(p.sourceControl ?? 0, 0, 1);
+      return clamp(1 - incoming * outgoing, 0, 0.95);
+    }
+    case 'lockdown': {
+      const global = 1 - clamp(iv.transmissionReduction, 0, 1);
+      const visits = 1 - clamp(p.mobilityReduction ?? 0, 0, 1) * clamp(p.compliance ?? 0, 0, 1);
+      return clamp(1 - global * visits, 0, 0.95);
+    }
+    case 'quarantine':
+      return clamp(clamp(p.detectionRate ?? 0, 0, 1) * clamp(p.sourceControl ?? 0, 0, 1), 0, 0.95);
+    default:
+      return clamp(iv.transmissionReduction, 0, 0.95);
+  }
+}
+
 /** Per-model-tick transmission multiplier for the engine: tick t maps to data
  *  day t − offsetDays (the index-date offset shifts the DATA later, so the
  *  model leads it). Undefined when nothing is active — callers can skip the
@@ -1437,16 +1473,16 @@ export function transmissionSchedule(
   len: number,
   offsetDays = 0,
 ): number[] | undefined {
-  const active = interventions.filter(
-    (iv) => iv.enabled && iv.transmissionReduction > 0 && iv.events.length > 0,
-  );
+  const active = interventions
+    .map((iv) => ({ iv, eff: effectiveReduction(iv) }))
+    .filter(({ iv, eff }) => iv.enabled && eff > 0 && iv.events.length > 0);
   if (active.length === 0) return undefined;
   const out = new Array<number>(len);
   for (let t = 0; t < len; t++) {
     const d = t - offsetDays;
     let f = 1;
-    for (const iv of active) {
-      f *= 1 - clamp(iv.transmissionReduction, 0, 0.95) * intensityAt(iv.events, d);
+    for (const { iv, eff } of active) {
+      f *= 1 - eff * intensityAt(iv.events, d);
     }
     out[t] = f;
   }

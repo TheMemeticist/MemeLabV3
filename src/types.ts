@@ -138,14 +138,41 @@ export interface InterventionTimelinePoint {
  *  here at FULL intensity), and `events` generalizes InterventionEvent (see
  *  InterventionTimelinePoint). R(t) = R₀ × Π(1 − transmissionReduction ×
  *  intensity(t)). */
+/** Per-taxonomy rich parameters mirroring the live sim's own spec objects —
+ *  DefenseSpec fields for mask/vaccine, LockdownSpec for lockdown,
+ *  QuarantineSpec for quarantine — so the fit modal renders the SAME controls
+ *  the main sim's Interventions panel does. When present they DRIVE the
+ *  derived effective transmission reduction (see fit.ts effectiveReduction);
+ *  when absent the flat `transmissionReduction` applies (custom interventions
+ *  and calibrated presets). All fractions 0..1 except contactsRange (cells)
+ *  and duration (days). */
+export interface InterventionParams {
+  // mask / vaccine — DefenseSpec fields ("Rate" in the UI = uptake)
+  uptake?: number;
+  protection?: number;
+  sourceControl?: number;
+  mortalityReduction?: number;
+  // lockdown — LockdownSpec fields (transmissionReduction sits on the spec's
+  // top level, shared with the flat-strength path)
+  mobilityReduction?: number;
+  compliance?: number;
+  // quarantine — QuarantineSpec fields (protection/sourceControl shared above)
+  detectionRate?: number;
+  contactsRange?: number;
+  duration?: number;
+}
+
 export interface InterventionSpec {
   id: string;
   intervention: InterventionKey | 'custom';
   label: string;
   enabled: boolean;
-  /** Max transmission reduction at full intensity — LockdownSpec semantics. */
+  /** Max transmission reduction at full intensity — LockdownSpec semantics.
+   *  Used directly for 'custom' / param-less specs; typed specs with `params`
+   *  derive their effective reduction from the rich fields instead. */
   transmissionReduction: number;
   events: InterventionTimelinePoint[];
+  params?: InterventionParams;
 }
 
 export interface SimStats {
