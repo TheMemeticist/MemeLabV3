@@ -272,6 +272,42 @@ describe('quarantine contact tracing', () => {
   });
 });
 
+describe('reset() buffer reuse (fit-path contract)', () => {
+  // fit-sim reuses ONE engine across all trials of all candidates via reset().
+  // That is only sound if a reset engine is bit-identical to a freshly
+  // constructed one — including when the previous run left arbitrary state in
+  // every buffer, bucket queue, and active list.
+  it('a reused engine is bit-identical to a fresh engine (same size)', () => {
+    const dirty = new Engine(goldenConfig('square'));
+    for (let t = 0; t < 40; t++) dirty.step(); // leave real state everywhere
+    const cfg2 = goldenConfig('triangular');
+    cfg2.seed = 0x0dd5eed >>> 0;
+    dirty.reset(cfg2);
+    const fresh = new Engine(cfg2);
+    for (let t = 0; t < 60; t++) {
+      const sa = dirty.step();
+      const sb = fresh.step();
+      expect([sa.s, sa.e, sa.i, sa.r, sa.d, sa.newInfections, sa.newDeaths]).toEqual(
+        [sb.s, sb.e, sb.i, sb.r, sb.d, sb.newInfections, sb.newDeaths],
+      );
+    }
+  });
+
+  it('a reused engine is bit-identical to a fresh engine (size change reallocates)', () => {
+    const dirty = new Engine(goldenConfig('square'));
+    for (let t = 0; t < 20; t++) dirty.step();
+    const cfg2 = goldenConfig('square');
+    cfg2.size = 32;
+    dirty.reset(cfg2);
+    const fresh = new Engine(cfg2);
+    for (let t = 0; t < 40; t++) {
+      const sa = dirty.step();
+      const sb = fresh.step();
+      expect([sa.s, sa.e, sa.i, sa.r, sa.d]).toEqual([sb.s, sb.e, sb.i, sb.r, sb.d]);
+    }
+  });
+});
+
 describe('buffers() exposes live views', () => {
   it('reflects engine state without copying', () => {
     const cfg = goldenConfig('square');

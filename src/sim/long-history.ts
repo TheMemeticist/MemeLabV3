@@ -41,6 +41,15 @@ export class LongHistory {
     return this.count;
   }
 
+  /** Empty the window in place, keeping the ring buffers. Rows are only ever
+   *  read through [head, head+count), so resetting the indices is a complete
+   *  reset — Engine.reset() uses this to avoid reallocating ~0.5 MB of rings
+   *  per reset (the fit path resets thousands of times per run). */
+  clear(): void {
+    this.head = 0;
+    this.count = 0;
+  }
+
   /**
    * Append one tick's row. When the window is full, the oldest row is retired
    * first: its cost-relevant counts fold into `retired` so the (UI-thread)

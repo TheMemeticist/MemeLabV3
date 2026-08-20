@@ -182,7 +182,13 @@ export class Engine {
       this.geometry = makeGeometry(config.geometry);
     }
     this.rng = new Rng(config.seed);
-    this.pop = allocate(config.size);
+    // Reuse the population buffers when the grid size is unchanged: seed()
+    // rewrites every per-cell buffer completely, so a reused allocation is
+    // bit-identical to a fresh one. The fit path resets thousands of engines
+    // per run, where fresh ~1 MB allocations (not the stepping) dominate.
+    if (this.pop === undefined || this.pop.size !== config.size) {
+      this.pop = allocate(config.size);
+    }
     this.strains = new StrainPool(config.strain);
     this.defenses = resolveDefenses(config.defenses);
     seed(this.pop, this.rng, {
@@ -199,16 +205,23 @@ export class Engine {
 
     // Build the event-driven structures from the freshly seeded buffers.
     // Scheduling draws no randomness, so the reset-time RNG trajectory is
-    // identical to the pre-P1 engine (seed() draws are unchanged).
+    // identical to the pre-P1 engine (seed() draws are unchanged). Like the
+    // population buffers, these are reused (re-filled) when the size matches.
     const n = this.pop.n;
-    this.iList = new Int32Array(n);
-    this.iPos = new Int32Array(n).fill(-1);
+    if (this.iList === undefined || this.iList.length !== n) {
+      this.iList = new Int32Array(n);
+      this.iPos = new Int32Array(n);
+      this.dList = new Int32Array(n);
+      this.dPos = new Int32Array(n);
+      this.exposedAt = new Int32Array(n);
+      this.eventTick = new Int32Array(n);
+    }
+    this.iPos.fill(-1);
+    this.dPos.fill(-1);
+    this.exposedAt.fill(0);
+    this.eventTick.fill(-1);
     this.iCount = 0;
-    this.dList = new Int32Array(n);
-    this.dPos = new Int32Array(n).fill(-1);
     this.dCount = 0;
-    this.exposedAt = new Int32Array(n);
-    this.eventTick = new Int32Array(n).fill(-1);
     this.lifeBuckets.clear();
     this.qBuckets.clear();
     this.census.fill(0);
@@ -244,7 +257,7 @@ export class Engine {
     this.cumInfectious = 0;
     this.cumRecovered = 0;
     this.cumDead = 0;
-    this.history = new LongHistory();
+    this.history.clear(); // reuse the ring buffers (see LongHistory.clear)
     this.retiredCost = emptyRetired();
     // Time-varying transmission multiplier (interventions R(t) hook).
     this.txSchedule = opts?.txSchedule && opts.txSchedule.length > 0 ? opts.txSchedule : null;

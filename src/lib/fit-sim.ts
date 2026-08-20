@@ -3,7 +3,7 @@
 // can never drift. Pure: constructs its own Engine instances and never touches
 // any live simulation state.
 
-import { Engine } from '../sim';
+import { Engine, type EngineOptions } from '../sim';
 import { CellState } from '../types';
 import type { SimConfig, VoronoiTopology } from '../types';
 import { buildVoronoi } from '../sim/voronoi';
@@ -21,6 +21,22 @@ const SEED_STRIDE = 0x9e3779b1;
 // topology cache (`sim.worker.ts:buildAndPostTopology`).
 let cachedTopo: VoronoiTopology | null = null;
 let cachedTopoKey: string | null = null;
+
+// One engine per worker, reset per trial. Engine.reset() reuses every buffer
+// when the grid size is unchanged, and a reset engine is bit-identical to a
+// freshly constructed one — construction (~0.5 ms of allocations at 128²) was
+// the dominant per-trial cost for burnout candidates, paid K× per candidate,
+// thousands of times per fit.
+let cachedEngine: Engine | null = null;
+
+function engineFor(config: SimConfig, topo: VoronoiTopology | undefined, opts: EngineOptions): Engine {
+  if (cachedEngine === null) {
+    cachedEngine = new Engine(config, topo, opts);
+  } else {
+    cachedEngine.reset(config, topo, opts);
+  }
+  return cachedEngine;
+}
 
 function topologyFor(config: SimConfig, baseSeed: number): VoronoiTopology | undefined {
   if ((config.geometry ?? 'square') !== 'voronoi') return undefined;
@@ -70,8 +86,8 @@ export function runTrials(
     // therefore its curves) bit-identical. On Voronoi with range > 1 this is
     // the expensive one — it BFS-expands ~512 cells per engine.
     // Annotated to break the inference cycle: `rNaught` is assigned from
-    // `engine.rNaught` and also feeds the constructor.
-    const engine: Engine = new Engine(
+    // `engine.rNaught` and also feeds the reset options.
+    const engine: Engine = engineFor(
       { ...config, seed: trialSeed },
       topo,
       k === 0 ? { txSchedule: schedule } : { rNaught, txSchedule: schedule },
@@ -151,7 +167,7 @@ export function runTrialEnsemble(
     const indexCell = k === 0
       ? undefined
       : new Rng((trialSeed ^ 0x1dcae511) >>> 0).intRange(cells);
-    const engine: Engine = new Engine(
+    const engine: Engine = engineFor(
       { ...config, seed: trialSeed },
       topo,
       k === 0 ? { indexCell, txSchedule: schedule } : { rNaught, indexCell, txSchedule: schedule },
