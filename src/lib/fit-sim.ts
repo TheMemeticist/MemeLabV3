@@ -37,7 +37,13 @@ function topologyFor(config: SimConfig, baseSeed: number): VoronoiTopology | und
 /** Run K stochastic trials of `config` for `days` days; returns mean per-capita
  *  SEIR curves (fractions in [0..1], length days + 1) plus the engine's analytic
  *  R₀ for the candidate (identical across trials — same genes + topology). */
-export function runTrials(config: SimConfig, days: number, K: number, seed: number): SimResult {
+export function runTrials(
+  config: SimConfig,
+  days: number,
+  K: number,
+  seed: number,
+  schedule?: number[],
+): SimResult {
   const N = config.size * config.size;
   const len = days + 1;
   const sumInf = new Float64Array(len);
@@ -68,7 +74,7 @@ export function runTrials(config: SimConfig, days: number, K: number, seed: numb
     const engine: Engine = new Engine(
       { ...config, seed: trialSeed },
       topo,
-      k === 0 ? undefined : { rNaught },
+      k === 0 ? { txSchedule: schedule } : { rNaught, txSchedule: schedule },
     );
     if (k === 0) rNaught = engine.rNaught;
 
@@ -129,6 +135,7 @@ export function runTrialEnsemble(
   days: number,
   N: number,
   seed: number,
+  schedule?: number[],
 ): { perTrial: SimCurves[]; rNaught: number | null } {
   const cells = config.size * config.size;
   const len = days + 1;
@@ -147,7 +154,7 @@ export function runTrialEnsemble(
     const engine: Engine = new Engine(
       { ...config, seed: trialSeed },
       topo,
-      k === 0 ? { indexCell } : { rNaught, indexCell },
+      k === 0 ? { indexCell, txSchedule: schedule } : { rNaught, indexCell, txSchedule: schedule },
     );
     if (k === 0) rNaught = engine.rNaught;
 

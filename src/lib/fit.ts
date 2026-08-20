@@ -624,9 +624,17 @@ export interface FitRequest extends FitOptions {
    *  curve simulated (pool-memoized), percentiles across draws. Heavier than
    *  the live path — runs once, after the optimum lands. */
   posterior?: { draws?: number; burn?: number };
+  /** Active interventions (time-varying transmission R(t)). Every simulation
+   *  in the fit runs under the resulting per-tick schedule; with an evolved
+   *  index offset the schedule shifts per candidate (the pool cache keys on
+   *  the schedule, so this is safe — but it does mean offsets no longer share
+   *  one sim while interventions are active). */
+  interventions?: InterventionDef[];
   /** Runs K trials of `config` for `days` days and returns mean per-capita curves
-   *  plus the candidate's analytic R₀. */
-  simulate: (config: SimConfig, days: number, K: number, seed: number) => Promise<SimResult>;
+   *  plus the candidate's analytic R₀. `schedule` is the per-tick transmission
+   *  multiplier (interventions); implementations may ignore it only if the
+   *  caller never passes `interventions`. */
+  simulate: (config: SimConfig, days: number, K: number, seed: number, schedule?: number[]) => Promise<SimResult>;
   onProgress?: (frac: number) => void;
   /** Fires whenever a new global-best candidate is found, so the UI can redraw
    *  the overlaid curves live as the optimizer converges. */
@@ -710,12 +718,21 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   // One sim of a candidate at `K` trials, yielding the loss, the engine's R₀, and
   // the curves. The pool memoizes by (genes, K), so the racing rungs, the refine,
   // the final best, and the CI sweeps all share results for free.
+  // Intervention schedules depend only on the candidate's offset (integer),
+  // so memoize per offset instead of rebuilding per eval.
+  const schedCache = new Map<number, number[] | undefined>();
+  const schedFor = (o: number): number[] | undefined => {
+    if (!req.interventions?.length) return undefined;
+    if (!schedCache.has(o)) schedCache.set(o, transmissionSchedule(req.interventions, days + 1, o));
+    return schedCache.get(o);
+  };
+
   const evalAt = async (
     values: number[],
     K: number,
   ): Promise<{ loss: number; r0: number | null; result: SimResult }> => {
     try {
-      const result = await req.simulate(configFor(values), days, K, baseSeed);
+      const result = await req.simulate(configFor(values), days, K, baseSeed, schedFor(offsetOf(values)));
       const shifted = shiftPts(req.observed, offsetOf(values));
       return { loss: lossOf(shifted, result.curves, req.population, req.loss), r0: result.rNaught, result };
     } catch (err) {
@@ -1291,6 +1308,105 @@ export function vintagedAdjust(
   }
   return { upper, central };
 }
+
+// ─── Interventions: time-varying transmission R(t) ───────────────────────────
+// Public-health interventions modulate the MODEL's transmission over time —
+// R(t) = R₀ × Π_i (1 − effect_i × intensity_i(t)) — via a per-tick multiplier
+// on the per-contact attack probability (EngineOptions.txSchedule). This is a
+// separate dimension from the case/death keyframe multipliers above, which
+// correct the reported DATA for under-ascertainment and never touch the model.
+
+export interface InterventionDef {
+  id: string;
+  label: string;
+  enabled: boolean;
+  /** Max fractional transmission reduction at full intensity, 0–0.95. */
+  effect: number;
+  /** Intensity keyframes over DATA days (day 0 = the dataset's day 0): m is
+   *  the intensity in [0, 1], linearly interpolated, clamped outside the end
+   *  keyframes. Days before the data / after it are fine. */
+  intensity: Keyframe[];
+}
+
+/** Per-model-tick transmission multiplier for the engine: tick t maps to data
+ *  day t − offsetDays (the index-date offset shifts the DATA later, so the
+ *  model leads it). Undefined when nothing is active — callers can skip the
+ *  scheduled path entirely, keeping unscheduled runs bit-identical. */
+export function transmissionSchedule(
+  interventions: InterventionDef[],
+  len: number,
+  offsetDays = 0,
+): number[] | undefined {
+  const active = interventions.filter((iv) => iv.enabled && iv.effect > 0 && iv.intensity.length > 0);
+  if (active.length === 0) return undefined;
+  const out = new Array<number>(len);
+  for (let t = 0; t < len; t++) {
+    const d = t - offsetDays;
+    let f = 1;
+    for (const iv of active) {
+      const intensity = clamp(multiplierAt(iv.intensity, d), 0, 1);
+      f *= 1 - clamp(iv.effect, 0, 0.95) * intensity;
+    }
+    out[t] = f;
+  }
+  return out;
+}
+
+/** Default interventions for the current-outbreak Ebola presets, grounded in
+ *  the REAL 2014 West Africa response mapped onto this dataset's day axis
+ *  (day 0 = the May 18 declaration; the data spans ~96 days → mid-August).
+ *  Real anchors: MSF's Kailahun treatment centre opened late June (~day 38);
+ *  Sierra Leone's state of emergency was declared 31 July (day 74) with
+ *  militarily enforced quarantines from 4–6 August (days 78–80); the WHO
+ *  declared a PHEIC on 8 August (day 82); regional airlines began suspending
+ *  flights from late July (~day 72); MSF's ELWA-3 centre in Monrovia opened
+ *  17 August (day 91). Sources: WHO Disease Outbreak News (4 Aug 2014), WHO
+ *  PHEIC statement (8 Aug 2014), CDC MMWR 2016 (65/Su-3) response summary.
+ *  EFFECT SIZES AND COVERAGE RAMPS ARE REASONED ESTIMATES (burial practices
+ *  drove a large transmission share; early tracing coverage was low) — edit
+ *  freely. Ring vaccination ships DISABLED: the rVSV-ZEBOV ring trial only
+ *  began in March 2015 (~day 300), outside this dataset's window. */
+export const EBOLA_INTERVENTIONS: InterventionDef[] = [
+  {
+    id: 'safe-burials',
+    label: 'Safe & dignified burials',
+    enabled: true,
+    effect: 0.3, // burial contact drove a major share of transmission (estimate)
+    intensity: [{ day: 30, m: 0 }, { day: 60, m: 0.4 }, { day: 110, m: 0.8 }], // coverage ramp: estimate
+  },
+  {
+    id: 'contact-tracing',
+    label: 'Contact tracing & case isolation',
+    enabled: true,
+    effect: 0.25,
+    // Tracing ran from the outbreak's confirmation but with low coverage,
+    // scaling after the emergency declarations / PHEIC (days 74–82).
+    intensity: [{ day: 7, m: 0.1 }, { day: 45, m: 0.3 }, { day: 82, m: 0.5 }, { day: 110, m: 0.7 }],
+  },
+  {
+    id: 'treatment-centers',
+    label: 'Treatment centres (ETCs)',
+    enabled: true,
+    effect: 0.3,
+    // Kailahun ETC ~day 38; capacity grows; ELWA-3 (day 91) at the tail.
+    intensity: [{ day: 38, m: 0.3 }, { day: 74, m: 0.5 }, { day: 91, m: 0.7 }, { day: 110, m: 0.8 }],
+  },
+  {
+    id: 'emergency-travel',
+    label: 'Emergency measures & travel restrictions',
+    enabled: true,
+    effect: 0.15,
+    // Airline suspensions ~day 72; SoE day 74; quarantines 78–80; PHEIC day 82.
+    intensity: [{ day: 72, m: 0 }, { day: 74, m: 0.6 }, { day: 82, m: 0.9 }, { day: 110, m: 0.9 }],
+  },
+  {
+    id: 'ring-vaccination',
+    label: 'Ring vaccination (2015 — outside this window)',
+    enabled: false, // rVSV-ZEBOV ring trial began ~day 300; kept for exploration
+    effect: 0.5,
+    intensity: [{ day: 300, m: 0 }, { day: 330, m: 0.8 }],
+  },
+];
 
 // ─── Fit-grid resolution ─────────────────────────────────────────────────────
 // One grid cell represents population/size² real people — the smallest nonzero

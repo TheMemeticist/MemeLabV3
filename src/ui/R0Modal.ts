@@ -22,6 +22,7 @@ import {
   parseObservedCSV,
   BAND_CENTRAL,
   EBOLA_ADJUST,
+  EBOLA_INTERVENTIONS,
   resolutionFitSize,
   revisionEnvelope,
   runFit,
@@ -29,6 +30,7 @@ import {
 } from '../lib/fit';
 import type {
   FitCategory,
+  InterventionDef,
   FitParamDef,
   FitParamName,
   FitProgress,
@@ -102,6 +104,8 @@ interface DemoPreset {
   points: ObservedPoint[];
   /** Default underreporting keyframes loaded (enabled) with the preset. */
   adjust?: { t0: number; cases: Keyframe[]; deaths: Keyframe[] };
+  /** Default interventions (time-varying transmission) loaded with the preset. */
+  interventions?: InterventionDef[];
 }
 
 // Build observed points from [day, value] pairs for a single category.
@@ -154,6 +158,8 @@ const HISTORICAL_PRESETS: DemoPreset[] = [
     // Default sitrep-phase underreporting keyframes (user-provided tables;
     // ranges → midpoints, all ≥ 1). Loaded enabled; fully editable.
     adjust: EBOLA_ADJUST,
+    // Real-2014-response intervention defaults (see EBOLA_INTERVENTIONS).
+    interventions: EBOLA_INTERVENTIONS,
     points: [
       ...series('cumulative_infections', [
         [0, 653], [5, 968], [6, 1010], [10, 1042], [12, 1205], [13, 1038], [14, 1262],
@@ -196,6 +202,10 @@ const HISTORICAL_PRESETS: DemoPreset[] = [
     id: 'ebola-sitrep',
     label: 'Ebola — outbreak sitreps, days 17–96 (cleaned)',
     population: 80_000,
+    // Same current-outbreak defaults as ebola-rev: the user's adjustment
+    // keyframe tables + the real-2014-response interventions.
+    adjust: EBOLA_ADJUST,
+    interventions: EBOLA_INTERVENTIONS,
     points: [
       ...series('cumulative_infections', [
         [17, 352], [18, 359], [20, 378], [21, 397], [22, 471], [23, 507], [24, 534], [25, 569],
@@ -295,6 +305,7 @@ interface R0Snapshot {
   fanTrials?: number; // legacy (index-case ensemble) — ignored
   bayesDraws?: number;
   predictionDays?: number;
+  interventions?: InterventionDef[];
   adjust?: AdjustSettings;
   offsetEvolve?: boolean;
   offsetBounds?: [number, number];
@@ -336,6 +347,10 @@ export class R0Modal {
   private bayesDraws = 120;
   // Days to project the model beyond the data's last day.
   private predictionDays = 0;
+  // Interventions: time-varying transmission R(t) — the MODEL dimension,
+  // separate from the case/death DATA adjustment.
+  private interventions: InterventionDef[] = [];
+  private itvSeq = 0; // display-only id counter (never feeds the sim)
   private adjust: AdjustSettings = { ...DEFAULT_ADJUST };
   private running = false;
   private signal = { aborted: false };
@@ -368,6 +383,8 @@ export class R0Modal {
   // Index-date profile-CI marker for the final chart (x = plausible positions of
   // the first observation given the CI; line = where it actually sits).
   private liveOffsetBand: { lo95: number; hi95: number; lo68: number; hi68: number; at: number } | null = null;
+  // Intervention ramp windows (chart-day coords) for the shaded chart markers.
+  private liveItvWindows: { from: number; to: number; label: string }[] = [];
   private liveDays = 0;
   private livePop = 0;
   private pendingSnapshot: FitProgress | null = null;
@@ -453,6 +470,7 @@ export class R0Modal {
       history: this.history,
       bayesDraws: this.bayesDraws,
       predictionDays: this.predictionDays,
+      interventions: this.interventions.map((iv) => ({ ...iv, intensity: iv.intensity.map((f) => ({ ...f })) })),
       adjust: { ...this.adjust },
       offsetEvolve: this.offsetEvolve,
       offsetBounds: [...this.offsetBounds] as [number, number],
@@ -480,6 +498,7 @@ export class R0Modal {
     if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
     if (Number.isFinite(s.bayesDraws)) this.bayesDraws = Math.min(500, Math.max(0, Math.round(s.bayesDraws!)));
     if (Number.isFinite(s.predictionDays)) this.predictionDays = Math.min(365, Math.max(0, Math.round(s.predictionDays!)));
+    if (Array.isArray(s.interventions)) this.interventions = s.interventions.map((iv) => ({ ...iv, intensity: (iv.intensity ?? []).map((f) => ({ ...f })) }));
     if (s.adjust && typeof s.adjust === 'object') this.adjust = { ...DEFAULT_ADJUST, ...s.adjust };
     if (typeof s.offsetEvolve === 'boolean') this.offsetEvolve = s.offsetEvolve;
     if (Array.isArray(s.offsetBounds) && s.offsetBounds.length === 2) {
@@ -524,6 +543,7 @@ export class R0Modal {
     this.history = [];
     this.bayesDraws = 120;
     this.predictionDays = 0;
+    this.interventions = [];
     this.adjust = { ...DEFAULT_ADJUST };
     this.offsetEvolve = true;
     this.offsetBounds = [0, 28];
@@ -690,6 +710,25 @@ export class R0Modal {
     });
     this.renderAdjust();
 
+    // Interventions editor.
+    q<HTMLButtonElement>('[data-r0="itv-add"]').addEventListener('click', () => {
+      const lastObs = this.observed.length ? Math.max(...this.observed.map((p) => p.day)) : 28;
+      this.itvSeq++;
+      this.interventions.push({
+        id: `iv-${this.itvSeq}`,
+        label: `Intervention ${this.interventions.length + 1}`,
+        enabled: true,
+        effect: 0.3,
+        // Sensible default: a 2-week ramp to full intensity starting mid-data.
+        intensity: [{ day: Math.round(lastObs / 2), m: 0 }, { day: Math.round(lastObs / 2) + 14, m: 1 }],
+      });
+      const details = this.el?.querySelector<HTMLDetailsElement>('[data-r0="itv-details"]');
+      if (details) details.open = true;
+      this.persist();
+      this.renderInterventions();
+    });
+    this.renderInterventions();
+
     const kInput = q<HTMLInputElement>('[data-r0="k"]');
     const kLabel = q<HTMLElement>('[data-r0="k-label"]');
     kInput.value = String(this.K);
@@ -847,6 +886,116 @@ export class R0Modal {
     }
   }
 
+  /** Active interventions' ramp windows (first → last intensity keyframe) in
+   *  chart-day coordinates (data day + the given offset shift). */
+  private itvWindows(offset: number): { from: number; to: number; label: string }[] {
+    return this.interventions
+      .filter((iv) => iv.enabled && iv.effect > 0 && iv.intensity.length > 0)
+      .map((iv) => {
+        const days = iv.intensity.map((f) => f.day);
+        return { from: Math.min(...days) + offset, to: Math.max(...days) + offset, label: iv.label };
+      });
+  }
+
+  /** Interventions editor: one card per intervention — enable toggle, name,
+   *  max-effect %, an intensity ramp (day → %, linearly interpolated, clamped
+   *  outside its ends), and remove. All edits persist. */
+  private renderInterventions(): void {
+    const host = this.el?.querySelector<HTMLElement>('[data-r0="itv-list"]');
+    const count = this.el?.querySelector<HTMLElement>('[data-r0="itv-count"]');
+    if (!host) return;
+    if (count) {
+      const on = this.interventions.filter((iv) => iv.enabled).length;
+      count.textContent = this.interventions.length === 0
+        ? 'none'
+        : `${on} of ${this.interventions.length} active`;
+    }
+    host.innerHTML = '';
+    if (this.interventions.length === 0) {
+      host.innerHTML = '<p class="r0-history-empty">No interventions — the model transmits at full strength for the whole run. The Ebola presets load real-2014-response defaults.</p>';
+      return;
+    }
+    this.interventions.forEach((iv, idx) => {
+      const card = document.createElement('div');
+      card.className = 'r0-itv';
+      card.innerHTML = `
+        <div class="r0-itv-head">
+          <label class="r0-check" title="Include this intervention in the fit's transmission schedule.">
+            <input type="checkbox" data-iv="on" ${iv.enabled ? 'checked' : ''} />
+          </label>
+          <input class="r0-in r0-itv-name" type="text" value="${iv.label.replace(/"/g, '&quot;')}" data-iv="label" aria-label="Intervention name" />
+          <label class="r0-itv-effect" title="Maximum transmission reduction at full (100%) intensity. R(t) is multiplied by 1 − effect × intensity(t).">
+            −<input class="r0-in tiny" type="number" min="0" max="95" step="5" value="${Math.round(iv.effect * 100)}" data-iv="effect" aria-label="Max effect %" />% transmission
+          </label>
+          <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">×</button>
+        </div>
+        <div class="r0-itv-frames" data-iv="frames"></div>
+      `;
+      const persist = (): void => { this.persist(); };
+      card.querySelector<HTMLInputElement>('[data-iv="on"]')!.addEventListener('change', (e) => {
+        iv.enabled = (e.target as HTMLInputElement).checked;
+        persist();
+        this.renderInterventions(); // refresh the active count
+      });
+      card.querySelector<HTMLInputElement>('[data-iv="label"]')!.addEventListener('change', (e) => {
+        iv.label = (e.target as HTMLInputElement).value || 'Intervention';
+        persist();
+      });
+      card.querySelector<HTMLInputElement>('[data-iv="effect"]')!.addEventListener('change', (e) => {
+        const v = Number((e.target as HTMLInputElement).value);
+        iv.effect = Number.isFinite(v) ? Math.min(0.95, Math.max(0, v / 100)) : 0.3;
+        (e.target as HTMLInputElement).value = String(Math.round(iv.effect * 100));
+        persist();
+      });
+      card.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
+        this.interventions.splice(idx, 1);
+        persist();
+        this.renderInterventions();
+      });
+      // Intensity ramp rows: day + intensity %, add/remove keyframes.
+      const framesHost = card.querySelector<HTMLElement>('[data-iv="frames"]')!;
+      const frames = iv.intensity.slice().sort((a, b) => a.day - b.day);
+      iv.intensity = frames;
+      frames.forEach((f, fi) => {
+        const row = document.createElement('div');
+        row.className = 'r0-adjust-row';
+        row.innerHTML = `
+          <label>day <input class="r0-in tiny" type="number" step="1" value="${f.day}" data-kf="day" aria-label="${iv.label} ramp day" /></label>
+          <label>intensity <input class="r0-in tiny" type="number" min="0" max="100" step="5" value="${Math.round(f.m * 100)}" data-kf="m" aria-label="${iv.label} intensity %" />%</label>
+          <button class="r0-del" type="button" aria-label="Delete ramp point" ${frames.length <= 1 ? 'disabled' : ''}>×</button>
+        `;
+        row.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
+          f.day = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
+          persist();
+        });
+        row.querySelector<HTMLInputElement>('[data-kf="m"]')!.addEventListener('change', (e) => {
+          const v = Number((e.target as HTMLInputElement).value);
+          f.m = Number.isFinite(v) ? Math.min(1, Math.max(0, v / 100)) : 0;
+          (e.target as HTMLInputElement).value = String(Math.round(f.m * 100));
+          persist();
+        });
+        row.querySelector<HTMLButtonElement>('.r0-del')!.addEventListener('click', () => {
+          frames.splice(fi, 1);
+          persist();
+          this.renderInterventions();
+        });
+        framesHost.appendChild(row);
+      });
+      const add = document.createElement('button');
+      add.className = 'btn ghost';
+      add.type = 'button';
+      add.textContent = '+ ramp point';
+      add.addEventListener('click', () => {
+        const last = frames[frames.length - 1];
+        frames.push({ day: (last?.day ?? 0) + 14, m: last?.m ?? 1 });
+        persist();
+        this.renderInterventions();
+      });
+      framesHost.appendChild(add);
+      host.appendChild(card);
+    });
+  }
+
   /** Keyframe editor for the underreporting multipliers: per category, one row
    *  per keyframe (day + multiplier ≥ 1, so floor ≤ central ≤ upper always
    *  holds), add/remove, any day allowed including outside the data bounds.
@@ -993,6 +1142,9 @@ export class R0Modal {
     this.lastFan = null; // computed after the fit lands
     this.liveOffsetBand = null;
     this.liveModelShift = 0;
+    // Intervention windows in the LIVE chart's day coordinates (raw data days
+    // while the offset is evolving; manual-shifted otherwise).
+    this.liveItvWindows = this.itvWindows(this.offsetEvolve ? 0 : (this.indexOffset || 0));
     this.renderLive(observed, raw); // persistent chart + provisional metrics, updated live
     if (expanded) this.note('Timing params added (your data spans the peak) — fitting…');
 
@@ -1019,6 +1171,9 @@ export class R0Modal {
     if (liveSize > FIT_GRID_CAP) {
       warnings.push(`fitting on a ${FIT_GRID_CAP}×${FIT_GRID_CAP} grid for speed — on a larger grid the outbreak spreads farther per capita, so deaths may not reproduce exactly`);
     }
+    if (this.interventions.some((iv) => iv.enabled && iv.effect > 0)) {
+      warnings.push('interventions active — model transmission R(t) is modulated over time; Apply to simulation does not carry interventions');
+    }
     if (Number.isFinite(minObs) && cellPeople > minObs) {
       warnings.push(`one grid cell = ${fmtNum(cellPeople)} people — larger than your smallest data point (${fmtNum(minObs)}); raise grid size or lower Population`);
     }
@@ -1034,6 +1189,7 @@ export class R0Modal {
         offset: this.offsetEvolve ? { bounds: [...this.offsetBounds] as [number, number] } : undefined,
         extraDays: this.predictionDays,
         posterior: this.bayesDraws > 1 ? { draws: this.bayesDraws } : undefined,
+        interventions: this.interventions,
         optimizer: this.optimizer,
         gaPopulation: this.ga.population,
         gaGenerations: this.ga.generations,
@@ -1041,7 +1197,7 @@ export class R0Modal {
         gaCrossoverRate: this.ga.crossoverRate,
         gaElitism: this.ga.elitism,
         gaTournament: this.ga.tournament,
-        simulate: (cfg, days, K, seed) => this.pool!.simulate(cfg, days, K, seed),
+        simulate: (cfg, days, K, seed, schedule) => this.pool!.simulate(cfg, days, K, seed, schedule),
         signal: this.signal,
         onProgress: (frac) => {
           const pct = Math.round(frac * 100);
@@ -1075,6 +1231,8 @@ export class R0Modal {
               upper: sh(this.lastAdjust.upper),
             };
           }
+          // Re-anchor the intervention windows to the fitted offset.
+          this.liveItvWindows = this.itvWindows(o);
           const ci = this.result.offsetCI;
           if (ci) {
             const firstRaw = Math.min(...this.result.observed.map((p) => p.day)) - o;
@@ -1260,6 +1418,8 @@ export class R0Modal {
     const adjT0 = this.el?.querySelector<HTMLInputElement>('[data-adj="t0"]');
     if (adjT0) adjT0.value = this.adjust.t0 == null ? '' : String(this.adjust.t0);
     this.renderAdjust();
+    this.interventions = (p.interventions ?? []).map((iv) => ({ ...iv, intensity: iv.intensity.map((f) => ({ ...f })) }));
+    this.renderInterventions();
     this.result = null;
     this.renderTable();
     this.renderOutput();
@@ -1710,7 +1870,7 @@ export class R0Modal {
   private paintOverlays(u: uPlot): void {
     const fan = this.liveFanCols;
     const adj = this.liveAdjustPts;
-    if (!fan && !adj && !this.liveOffsetBand) return;
+    if (!fan && !adj && !this.liveOffsetBand && this.liveItvWindows.length === 0) return;
     const ctx = u.ctx;
     ctx.save();
     ctx.beginPath();
@@ -1718,6 +1878,27 @@ export class R0Modal {
     ctx.clip();
     const X = (d: number): number => u.valToPos(d, 'x', true);
     const Y = (v: number): number => u.valToPos(v, 'y', true);
+    // Intervention ramp windows: violet spans (distinct from the grey offset-CI
+    // band and the category-colored fills) with a dashed start line and the
+    // intervention's name at the top, staggered per row.
+    this.liveItvWindows.forEach((w, wi) => {
+      const x1 = X(w.from);
+      const x2 = X(w.to);
+      ctx.fillStyle = 'rgba(139, 92, 246, 0.06)';
+      ctx.fillRect(x1, u.bbox.top, Math.max(1, x2 - x1), u.bbox.height);
+      ctx.beginPath();
+      ctx.moveTo(x1, u.bbox.top);
+      ctx.lineTo(x1, u.bbox.top + u.bbox.height);
+      ctx.strokeStyle = 'rgba(139, 92, 246, 0.5)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const pr = uPlot.pxRatio || 1;
+      ctx.fillStyle = 'rgba(139, 92, 246, 0.85)';
+      ctx.font = `${11 * pr}px sans-serif`;
+      ctx.fillText(w.label, x1 + 4 * pr, u.bbox.top + (14 + wi * 13) * pr);
+    });
     // Index-date profile-CI marker: the grey band spans the plausible positions
     // of the FIRST OBSERVATION under the CI (darker = 68%), with a dashed line
     // where the fitted offset actually anchors it.
@@ -1933,6 +2114,20 @@ const TEMPLATE = `
     <h3>2 · Parameters to fit</h3>
     <p class="r0-blurb">Start with attack rate + range. Each fitted parameter is searched within its bounds.</p>
     <div class="r0-params" data-r0="params"></div>
+    <details class="r0-details" data-r0="itv-details">
+      <summary>Interventions — time-varying transmission R(t) · <span class="r0-muted" data-r0="itv-count"></span></summary>
+      <p class="r0-blurb">Public-health interventions reduce the <b>MODEL's</b> transmission over time:
+        R(t) = R₀ × Π (1 − effect × intensity(t)), applied per day inside every simulation the fit runs.
+        Each intervention has a max effect and an intensity ramp (keyframes over data days, linearly
+        interpolated, clamped — days before day 0 or beyond the data are fine). This is separate from the
+        <i>case/death adjustment</i> in section 1, which corrects the reported DATA for under-ascertainment
+        and never changes the model. Ramp windows are shaded on the chart. Deterministic; note that
+        "Apply to simulation" carries the fitted genes but not these schedules.</p>
+      <div data-r0="itv-list"></div>
+      <div class="r0-actions">
+        <button class="btn ghost" type="button" data-r0="itv-add">+ Add intervention</button>
+      </div>
+    </details>
   </section>
 
   <section class="r0-section">

@@ -9,6 +9,7 @@ import {
   goodnessOfFit,
   hasDownwardRevisions,
   EBOLA_ADJUST,
+  EBOLA_INTERVENTIONS,
   mse,
   optimize,
   parseObservedCSV,
@@ -21,6 +22,7 @@ import {
   resolutionFitSize,
   revisionEnvelope,
   runFit,
+  transmissionSchedule,
   vintagedAdjust,
 } from '../src/lib/fit';
 import type { ObservedPoint, SimCurves, SimResult } from '../src/lib/fit';
@@ -53,8 +55,8 @@ function baseConfig(overrides: Partial<SimConfig> = {}): SimConfig {
 
 // The same in-process simulate used by both data generation and fitting, so the
 // ground-truth candidate reproduces the observed curve exactly (deterministic).
-const simulate = (cfg: SimConfig, days: number, K: number, seed: number): Promise<SimResult> =>
-  Promise.resolve(runTrials(cfg, days, K, seed));
+const simulate = (cfg: SimConfig, days: number, K: number, seed: number, schedule?: number[]): Promise<SimResult> =>
+  Promise.resolve(runTrials(cfg, days, K, seed, schedule));
 
 describe('loss functions', () => {
   const N = 1000;
@@ -695,5 +697,99 @@ describe('cancel, prediction horizon, Bayesian band, Ebola keyframe defaults', (
       expect(central[i].value).toBeGreaterThanOrEqual(p.value);
       expect(upper[i].value).toBeGreaterThanOrEqual(central[i].value);
     });
+  });
+});
+
+describe('interventions: time-varying transmission R(t)', () => {
+  const ramp = (day: number, m: number) => ({ day, m });
+  const iv = (over: Record<string, unknown> = {}) => ({
+    id: 'iv-1', label: 'test', enabled: true, effect: 0.5,
+    intensity: [ramp(10, 0), ramp(20, 1)],
+    ...over,
+  });
+
+  it('transmissionSchedule: interpolation, clamping, multiplication, offset (hand-checked)', () => {
+    const s = transmissionSchedule([iv()], 31)!;
+    expect(s[0]).toBe(1);                 // before the ramp → intensity clamped to 0
+    expect(s[10]).toBe(1);                // ramp start
+    expect(s[15]).toBeCloseTo(0.75, 12);  // halfway: 1 − 0.5·0.5
+    expect(s[20]).toBeCloseTo(0.5, 12);   // full intensity: 1 − 0.5·1
+    expect(s[30]).toBeCloseTo(0.5, 12);   // clamped past the last keyframe
+    // Two interventions multiply: (1 − 0.5)·(1 − 0.2) at full intensity.
+    const two = transmissionSchedule([iv(), iv({ id: 'iv-2', effect: 0.2 })], 31)!;
+    expect(two[25]).toBeCloseTo(0.4, 12);
+    // Index-date offset shifts the mapping: model tick t ↔ data day t − offset.
+    const shifted = transmissionSchedule([iv()], 31, 5)!;
+    expect(shifted[20]).toBeCloseTo(s[15], 12);
+    // Disabled / zero-effect / empty → undefined (unscheduled fast path).
+    expect(transmissionSchedule([iv({ enabled: false })], 10)).toBeUndefined();
+    expect(transmissionSchedule([iv({ effect: 0 })], 10)).toBeUndefined();
+    expect(transmissionSchedule([], 10)).toBeUndefined();
+  });
+
+  it('engine honors the schedule: all-1s is bit-identical, a reduction lowers spread, deterministic', () => {
+    const cfg = baseConfig({ size: 24, strain: { ...baseConfig().strain, attackRate: 0.35 } });
+    const bare = runTrials(cfg, 40, 4, cfg.seed);
+    const ones = runTrials(cfg, 40, 4, cfg.seed, new Array(41).fill(1));
+    expect(ones.curves).toEqual(bare.curves); // ×1 is IEEE-exact — bit-identical
+    // Strong intervention from day 10: cumulative infections must end lower.
+    const sched = transmissionSchedule(
+      [iv({ effect: 0.8, intensity: [ramp(5, 0), ramp(10, 1)] })], 41)!;
+    const damped = runTrials(cfg, 40, 4, cfg.seed, sched);
+    const bareEnd = bare.curves.cumulative_infections[40];
+    const dampedEnd = damped.curves.cumulative_infections[40];
+    expect(dampedEnd).toBeLessThan(bareEnd * 0.8);
+    // Same inputs → same outputs.
+    expect(runTrials(cfg, 40, 4, cfg.seed, sched).curves).toEqual(damped.curves);
+    // R₀ stays the intervention-free basic number by convention.
+    expect(damped.rNaught).toBe(bare.rNaught);
+  });
+
+  it('runFit with interventions: settles, deterministic, schedule reaches the sims', async () => {
+    const observed = [[0, 5], [10, 60], [20, 200]].map(([day, value]) =>
+      ({ day, value, category: 'cumulative_infections' as const }));
+    const run = () => runFit({
+      observed,
+      baseConfig: baseConfig({ size: 16 }),
+      params: [findFitParam('attackRate')],
+      interventions: [iv({ effect: 0.6, intensity: [ramp(8, 0), ramp(14, 1)] })],
+      population: 1_000,
+      K: 3,
+      loss: 'poisson',
+      simulate,
+      budget: 8,
+      nmIters: 3,
+    });
+    const a = await run();
+    const b = await run();
+    expect(b.params).toEqual(a.params);
+    expect(b.simulated).toEqual(a.simulated);
+    // The same fitted genes WITHOUT the schedule must spread more — proof the
+    // schedule flowed through runFit into the simulations.
+    const bare = await simulate(a.config, a.days, 3, a.config.seed);
+    const last = a.simulated.cumulative_infections.length - 1;
+    expect(a.simulated.cumulative_infections[last])
+      .toBeLessThan(bare.curves.cumulative_infections[last]);
+  }, 20_000);
+
+  it('EBOLA_INTERVENTIONS defaults are sane and grounded on the dataset day axis', () => {
+    expect(EBOLA_INTERVENTIONS.length).toBeGreaterThanOrEqual(4);
+    for (const d of EBOLA_INTERVENTIONS) {
+      expect(d.effect).toBeGreaterThan(0);
+      expect(d.effect).toBeLessThanOrEqual(0.95);
+      expect(d.intensity.length).toBeGreaterThanOrEqual(2);
+      for (const f of d.intensity) {
+        expect(f.m).toBeGreaterThanOrEqual(0);
+        expect(f.m).toBeLessThanOrEqual(1);
+      }
+    }
+    // Ring vaccination is real but outside this dataset's window → disabled.
+    const ring = EBOLA_INTERVENTIONS.find((d) => d.id === 'ring-vaccination')!;
+    expect(ring.enabled).toBe(false);
+    expect(Math.min(...ring.intensity.map((f) => f.day))).toBeGreaterThan(96);
+    // The enabled defaults act within/around the ~96-day data window.
+    for (const d of EBOLA_INTERVENTIONS.filter((x) => x.enabled)) {
+      expect(Math.min(...d.intensity.map((f) => f.day))).toBeLessThan(96);
+    }
   });
 });

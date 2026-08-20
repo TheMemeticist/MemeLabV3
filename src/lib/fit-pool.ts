@@ -37,11 +37,25 @@ function toResult(r: FitWorkerResult): SimResult {
 // Quantize the fit-relevant fields so near-identical candidates (and grid/refine
 // overlaps) hit the cache. Only strain genes vary during a fit; seed/size/days/K
 // are constant per run, but we include them so the key is self-contained.
+// FNV-1a over a transmission schedule so scheduled and unscheduled runs (and
+// runs under different schedules) can never collide in the cache.
+function scheduleHash(s?: number[]): string {
+  if (!s || s.length === 0) return '0';
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    const v = Math.round(s[i] * 1e6);
+    h ^= v & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+    h ^= (v >> 8) & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return (h >>> 0).toString(16);
+}
+
 function cacheKey(cmd: FitWorkerCommand): string {
   const g = cmd.config.strain;
   const q = (x: number, p = 1e4) => Math.round(x * p) / p;
   return [
     cmd.ensemble ? 'E' : 'M', // ensemble and mean results must never collide
+    scheduleHash(cmd.schedule),
     cmd.days,
     cmd.K,
     cmd.seed,
@@ -75,8 +89,8 @@ export class FitPool {
 
   /** Run K trials of `config` for `days` days; resolves to mean per-capita curves
    *  plus the candidate's analytic R₀. */
-  simulate(config: SimConfig, days: number, K: number, seed: number): Promise<SimResult> {
-    return this.enqueue({ id: this.nextId++, config, days, K, seed });
+  simulate(config: SimConfig, days: number, K: number, seed: number, schedule?: number[]): Promise<SimResult> {
+    return this.enqueue({ id: this.nextId++, config, days, K, seed, schedule });
   }
 
   /** Run N trials each from a different index case; resolves with `perTrial`

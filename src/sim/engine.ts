@@ -52,10 +52,21 @@ export interface EngineOptions {
    * apart from the seeding location itself.
    */
   indexCell?: number;
+  /**
+   * Per-tick multiplier on transmission (index = tick, clamped to the last
+   * entry; 1 = no effect) — the R₀ Estimator's time-varying interventions
+   * R(t) hook. Multiplies the per-contact attack probability in both the
+   * spatial and mean-field transmission passes. Omitted/empty ⇒ bit-identical
+   * to the unscheduled engine (x·1 === x in IEEE). Deliberately NOT part of
+   * SimConfig (no permalink impact) and ignored by estimateR0 — R₀ stays the
+   * intervention-free basic number by convention.
+   */
+  txSchedule?: number[];
 }
 
 export class Engine {
   private rng!: Rng;
+  private txSchedule: number[] | null = null;
   private pop!: PopulationBuffers;
   private strains!: StrainPool;
   private defenses!: ResolvedDefenses;
@@ -141,11 +152,20 @@ export class Engine {
     this.cumDead = 0;
     this.history = new LongHistory();
     this.retiredCost = emptyRetired();
+    // Time-varying transmission multiplier (interventions R(t) hook).
+    this.txSchedule = opts?.txSchedule && opts.txSchedule.length > 0 ? opts.txSchedule : null;
     // `undefined` (field omitted) means compute; an explicit number|null is a
     // caller-supplied estimate for an identical config — see EngineOptions.
     this.rNaught = opts !== undefined && opts.rNaught !== undefined
       ? opts.rNaught
       : this.estimateR0(config);
+  }
+
+  /** Current tick's transmission multiplier (1 when no schedule is set). */
+  private txMulNow(): number {
+    const s = this.txSchedule;
+    if (s === null) return 1;
+    return s[this.tick < s.length ? this.tick : s.length - 1];
   }
 
   /**
@@ -279,7 +299,8 @@ export class Engine {
       const dominantStrain = strains.get(0);
       // k=2: mean-field sits below triangular (3) in the R0 hierarchy.
       const k = 2;
-      const baseAttack = dominantStrain.attackRate;
+      // ×1 when unscheduled — bit-identical (IEEE x·1 === x).
+      const baseAttack = dominantStrain.attackRate * this.txMulNow();
 
       for (let j = 0; j < n; j++) {
         if (state[j] !== ST_S) continue;
@@ -468,11 +489,14 @@ export class Engine {
     let newRecovered = 0;
 
     // 2) Transmission pass.
+    // Hoisted per-step transmission multiplier (interventions R(t) schedule);
+    // 1 when unscheduled, so the multiply below is bit-identical (x·1 === x).
+    const txMul = this.txMulNow();
     for (let i = 0; i < n; i++) {
       if (state[i] !== ST_I) continue;
       const attackerStrain = solo !== null ? solo : strains.get(strainId[i]);
       const range = attackerStrain.range;
-      const baseAttack = attackerStrain.attackRate;
+      const baseAttack = attackerStrain.attackRate * txMul;
       let srcMul = srcByMask[defenses[i] & MASK_ALL];
       if (quarantineOn && quarantined[i]) srcMul *= qSrcMul;
       srcMul *= lockdownTransMul;

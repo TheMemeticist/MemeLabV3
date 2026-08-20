@@ -315,6 +315,8 @@ export interface FitWorkerCommand {
   K: number;
   /** Base seed; trial k uses a decorrelated derivative of it. */
   seed: number;
+  /** Per-tick transmission multiplier (interventions R(t)); omitted = none. */
+  schedule?: number[];
   /** When true, run K trials each from a DIFFERENT index case and return the
    *  per-trial curves (for percentile bands) alongside nothing else — the
    *  `curves` field then carries trial 0 for convenience. */
