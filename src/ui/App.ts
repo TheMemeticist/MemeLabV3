@@ -1,4 +1,4 @@
-import type { CostConfig, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
+import type { BackendMessage, CostConfig, EngineBackend, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { findPreset, baseSimConfig, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
 import { Petri } from './Petri';
 import { Chart, type ChartView, type CostChartData } from './Chart';
@@ -35,6 +35,12 @@ export class App {
   private toolbarBtns: Record<string, HTMLButtonElement> = {};
   private speedBtn!: HTMLButtonElement;
   private mutateBtn!: HTMLButtonElement;
+  private engineBtn!: HTMLButtonElement;
+  // Engine backend preference (runtime setting, NOT part of SimConfig or
+  // permalinks — see EngineBackend in types.ts). Default wasm: bit-identical
+  // to the TS engine, just faster; the worker falls back automatically.
+  private requestedBackend: EngineBackend = read<EngineBackend>('backend', 'wasm');
+  private activeBackend: EngineBackend | null = null;
   private themeBtn!: HTMLButtonElement;
   private shareBtn!: HTMLButtonElement;
   private shareMenu!: ShareMenu;
@@ -123,14 +129,22 @@ export class App {
 
     // Worker
     this.worker = new Worker(new URL('../worker/sim.worker.ts', import.meta.url), { type: 'module' });
-    this.worker.onmessage = (ev: MessageEvent<FrameMessage | TopologyMessage>) => {
+    this.worker.onmessage = (ev: MessageEvent<FrameMessage | TopologyMessage | BackendMessage>) => {
       const msg = ev.data;
       if (msg.type === 'topology') {
         this.petri.setVoronoiTopology(msg.topo);
+      } else if (msg.type === 'backend') {
+        this.activeBackend = msg.active;
+        this.refreshEngineLabel();
+        if (msg.reason && msg.active !== msg.requested) {
+          this.toast(`Engine: ${msg.active.toUpperCase()} (${msg.reason})`);
+        }
       } else {
         this.onFrame(msg);
       }
     };
+    // Backend preference travels before init so the first build uses it.
+    this.send({ cmd: 'setBackend', backend: this.requestedBackend });
     this.send({ cmd: 'init', config: initialConfig });
     if ((initialConfig.geometry ?? 'square') !== 'voronoi') {
       this.petri.setVoronoiTopology(null);
@@ -244,6 +258,7 @@ export class App {
         <span class="tb-divider"></span>
         <button class="tb-btn" data-act="speed" aria-label="Cycle speed" title="Speed">1×</button>
         <button class="tb-btn" data-act="mutate" aria-label="Toggle natural selection" title="Natural selection">🧬 off</button>
+        <button class="tb-btn" data-act="engine" aria-label="Cycle engine backend" data-tip="Engine backend: CPU (reference), WASM (identical results, faster), or GPU (WebGPU compute — its own random stream; huge grids). Switching resets the run.">⚙ WASM</button>
         <span class="tb-spacer"></span>
         <span class="tb-meta" data-meta="rN">R<sub>0</sub> = —</span>
         <span class="tb-meta" data-meta="strains">Strains: 1</span>
@@ -338,6 +353,8 @@ export class App {
     });
     this.speedBtn = this.toolbarBtns['speed'];
     this.mutateBtn = this.toolbarBtns['mutate'];
+    this.engineBtn = this.toolbarBtns['engine'];
+    this.refreshEngineLabel();
 
     // Topbar buttons
     this.shareBtn = this.root.querySelector('[data-act="share"]') as HTMLButtonElement;
@@ -704,7 +721,31 @@ export class App {
       case 'reset': this.handleReset(); break;
       case 'speed': this.cycleSpeed(); break;
       case 'mutate': this.toggleMutate(); break;
+      case 'engine': this.cycleBackend(); break;
     }
+  }
+
+  private cycleBackend(): void {
+    const order: EngineBackend[] = ['wasm', 'gpu', 'cpu'];
+    const gpuAvailable = typeof navigator !== 'undefined' && 'gpu' in navigator;
+    let next = order[(order.indexOf(this.requestedBackend) + 1) % order.length];
+    if (next === 'gpu' && !gpuAvailable) next = 'cpu';
+    this.requestedBackend = next;
+    write('backend', next);
+    // The worker rebuilds (and pauses) on a backend switch.
+    this.playing = false;
+    this.refreshPlayLabel();
+    this.send({ cmd: 'setBackend', backend: next });
+    this.toast(`Engine backend: ${next.toUpperCase()} — run reset`);
+  }
+
+  private refreshEngineLabel(): void {
+    const shown = this.activeBackend ?? this.requestedBackend;
+    const icon = shown === 'gpu' ? '⚡' : '⚙';
+    this.engineBtn.textContent = `${icon} ${shown.toUpperCase()}`;
+    this.engineBtn.classList.toggle('active', shown === 'gpu');
+    const pending = this.activeBackend !== null && this.activeBackend !== this.requestedBackend;
+    this.engineBtn.classList.toggle('fallback', pending);
   }
 
   private handlePlay(): void {

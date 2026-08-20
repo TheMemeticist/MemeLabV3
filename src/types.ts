@@ -374,6 +374,24 @@ export interface CostConfig {
   currencyRate: number; // editable; defaults to the currency's rateVsUsd
 }
 
+/** Simulation engine backend. `cpu` = the TypeScript reference engine.
+ *  `wasm` is bit-identical to `cpu` (tests/wasm-engine.test.ts), just faster.
+ *  `gpu` runs the WebGPU compute kernel — deterministic per (config, seed) in
+ *  its own trajectory family. Runtime preference, deliberately NOT part of
+ *  SimConfig: permalinks stay backend-agnostic, and unsupported backends fall
+ *  back (gpu → wasm → cpu) with a `backend` status message. */
+export type EngineBackend = 'cpu' | 'wasm' | 'gpu';
+
+export interface BackendMessage {
+  type: 'backend';
+  /** What the worker is actually running (after fallback). */
+  active: EngineBackend;
+  /** The backend that was requested. */
+  requested: EngineBackend;
+  /** Human-readable fallback reason when active !== requested. */
+  reason?: string;
+}
+
 export type WorkerCommand =
   | { cmd: 'init'; config: SimConfig }
   | { cmd: 'play'; tps: number }
@@ -381,7 +399,8 @@ export type WorkerCommand =
   | { cmd: 'step'; n: number }
   | { cmd: 'reset'; config: SimConfig }
   | { cmd: 'updateConfig'; config: SimConfig }
-  | { cmd: 'patchConfig'; config: SimConfig };
+  | { cmd: 'patchConfig'; config: SimConfig }
+  | { cmd: 'setBackend'; backend: EngineBackend };
 
 // ─── R₀ Estimator fitting-worker protocol ────────────────────────────────────
 // A separate, isolated worker pool (`src/worker/fit.worker.ts`) runs headless

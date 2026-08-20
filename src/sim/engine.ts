@@ -1000,53 +1000,7 @@ export class Engine {
   }
 
   private estimateR0(config: SimConfig): number | null {
-    if (config.size < 8) return null;
-    const strain = config.strain;
-    const days = strain.infectious;
-    if (days <= 0) return 0;
-    const p = Math.max(0, Math.min(1, strain.attackRate));
-    const pInfected = 1 - Math.pow(1 - p, days);
-
-    if (config.geometry === 'meanfield') {
-      return 2 * pInfected; // k=2 matches transmitMeanField
-    }
-
-    if (config.geometry === 'voronoi' && this.voronoiTopo) {
-      // Average reachable-neighbour count, not a single cell's degree: Voronoi
-      // degrees vary cell-to-cell, so one sample is noisy. For range 1 the mean
-      // degree is exact from the CSR (total directed edges / cells); for larger
-      // ranges we sample cells and BFS-expand so R0 scales with strain.range,
-      // mirroring how the lattice geometries grow their neighbourhood.
-      const n = config.size * config.size;
-      let avgDegree: number;
-      if (strain.range <= 1) {
-        avgDegree = this.voronoiTopo.adjList.length / n;
-      } else {
-        const geo = this.geometry;
-        const stride = Math.max(1, Math.floor(n / 512));
-        let total = 0, samples = 0;
-        for (let i = 0; i < n; i += stride) {
-          total += geo.getNeighborIndices!(i, strain.range).length;
-          samples++;
-        }
-        avgDegree = samples > 0 ? total / samples : 6;
-      }
-      return avgDegree * pInfected;
-    }
-
-    const size = Math.min(config.size, 80);
-    const cx = size >> 1;
-    const cy = size >> 1;
-    const geo = makeGeometry(config.geometry);
-    const offsets = geo.getOffsets(strain.range, cx, cy);
-    const reachable = new Set<number>();
-    for (let k = 0; k < offsets.length; k += 2) {
-      const nx = torus(cx + offsets[k], size);
-      const ny = torus(cy + offsets[k + 1], size);
-      const j = ny * size + nx;
-      if (j !== cy * size + cx) reachable.add(j);
-    }
-    return reachable.size * pInfected;
+    return estimateAnalyticR0(config, this.geometry, this.voronoiTopo);
   }
 
   buffers(): { state: Uint8Array; defenses: Uint8Array; quarantined: Uint8Array; size: number } {
@@ -1057,6 +1011,62 @@ export class Engine {
       size: this.pop.size,
     };
   }
+}
+
+/** Analytic R₀ for a config. Pure — draws no randomness; depends only on the
+ *  strain genes, the geometry, and (for voronoi) the topology. Shared by the
+ *  TS engine and the WASM engine wrapper so both report identical values. */
+export function estimateAnalyticR0(
+  config: SimConfig,
+  geometry: LatticeGeometry,
+  voronoiTopo: VoronoiTopology | null,
+): number | null {
+  if (config.size < 8) return null;
+  const strain = config.strain;
+  const days = strain.infectious;
+  if (days <= 0) return 0;
+  const p = Math.max(0, Math.min(1, strain.attackRate));
+  const pInfected = 1 - Math.pow(1 - p, days);
+
+  if (config.geometry === 'meanfield') {
+    return 2 * pInfected; // k=2 matches transmitMeanField
+  }
+
+  if (config.geometry === 'voronoi' && voronoiTopo) {
+    // Average reachable-neighbour count, not a single cell's degree: Voronoi
+    // degrees vary cell-to-cell, so one sample is noisy. For range 1 the mean
+    // degree is exact from the CSR (total directed edges / cells); for larger
+    // ranges we sample cells and BFS-expand so R0 scales with strain.range,
+    // mirroring how the lattice geometries grow their neighbourhood.
+    const n = config.size * config.size;
+    let avgDegree: number;
+    if (strain.range <= 1) {
+      avgDegree = voronoiTopo.adjList.length / n;
+    } else {
+      const stride = Math.max(1, Math.floor(n / 512));
+      let total = 0, samples = 0;
+      for (let i = 0; i < n; i += stride) {
+        total += geometry.getNeighborIndices!(i, strain.range).length;
+        samples++;
+      }
+      avgDegree = samples > 0 ? total / samples : 6;
+    }
+    return avgDegree * pInfected;
+  }
+
+  const size = Math.min(config.size, 80);
+  const cx = size >> 1;
+  const cy = size >> 1;
+  const geo = makeGeometry(config.geometry);
+  const offsets = geo.getOffsets(strain.range, cx, cy);
+  const reachable = new Set<number>();
+  for (let k = 0; k < offsets.length; k += 2) {
+    const nx = torus(cx + offsets[k], size);
+    const ny = torus(cy + offsets[k + 1], size);
+    const j = ny * size + nx;
+    if (j !== cy * size + cx) reachable.add(j);
+  }
+  return reachable.size * pInfected;
 }
 
 function neighborAliveFraction(state: Uint8Array, i: number, size: number, geo: LatticeGeometry): number {

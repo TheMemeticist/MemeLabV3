@@ -3,7 +3,8 @@
 // can never drift. Pure: constructs its own Engine instances and never touches
 // any live simulation state.
 
-import { Engine, type EngineOptions } from '../sim';
+import { type EngineOptions } from '../sim';
+import { WasmEngine, createEngine, wasmAvailable, wasmCompatible, type AnyEngine } from '../sim/wasm-engine';
 import { CellState } from '../types';
 import type { SimConfig, VoronoiTopology } from '../types';
 import { buildVoronoi } from '../sim/voronoi';
@@ -27,11 +28,17 @@ let cachedTopoKey: string | null = null;
 // freshly constructed one — construction (~0.5 ms of allocations at 128²) was
 // the dominant per-trial cost for burnout candidates, paid K× per candidate,
 // thousands of times per fit.
-let cachedEngine: Engine | null = null;
+//
+// Backend: the WASM engine when the config is inside its feature space (it is
+// BIT-IDENTICAL to the TS engine — tests/wasm-engine.test.ts — so fits produce
+// the same results either way, just faster); the TS engine for voronoi /
+// mutation configs or when wasm is unavailable.
+let cachedEngine: AnyEngine | null = null;
 
-function engineFor(config: SimConfig, topo: VoronoiTopology | undefined, opts: EngineOptions): Engine {
-  if (cachedEngine === null) {
-    cachedEngine = new Engine(config, topo, opts);
+function engineFor(config: SimConfig, topo: VoronoiTopology | undefined, opts: EngineOptions): AnyEngine {
+  const wantWasm = wasmCompatible(config) && wasmAvailable();
+  if (cachedEngine === null || (cachedEngine instanceof WasmEngine) !== wantWasm) {
+    cachedEngine = createEngine(config, topo ?? null, opts, wantWasm);
   } else {
     cachedEngine.reset(config, topo, opts);
   }
@@ -87,7 +94,7 @@ export function runTrials(
     // the expensive one — it BFS-expands ~512 cells per engine.
     // Annotated to break the inference cycle: `rNaught` is assigned from
     // `engine.rNaught` and also feeds the reset options.
-    const engine: Engine = engineFor(
+    const engine: AnyEngine = engineFor(
       { ...config, seed: trialSeed },
       topo,
       k === 0 ? { txSchedule: schedule } : { rNaught, txSchedule: schedule },
@@ -167,7 +174,7 @@ export function runTrialEnsemble(
     const indexCell = k === 0
       ? undefined
       : new Rng((trialSeed ^ 0x1dcae511) >>> 0).intRange(cells);
-    const engine: Engine = engineFor(
+    const engine: AnyEngine = engineFor(
       { ...config, seed: trialSeed },
       topo,
       k === 0 ? { indexCell, txSchedule: schedule } : { rNaught, indexCell, txSchedule: schedule },

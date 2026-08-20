@@ -7,3 +7,4 @@ dist/
 .env.local
 coverage/
 tsconfig.tsbuildinfo
+rust/engine-core/target/

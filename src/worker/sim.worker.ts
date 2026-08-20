@@ -1,12 +1,26 @@
 /// <reference lib="webworker" />
-import { Engine } from '../sim';
-import type { FrameMessage, SimConfig, TopologyMessage, WorkerCommand } from '../types';
+import type { EngineBackend, FrameMessage, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { buildVoronoi } from '../sim/voronoi';
 import { Rng } from '../sim/rng';
+import { WasmEngine, createEngine, wasmAvailable, wasmCompatible, type AnyEngine } from '../sim/wasm-engine';
+import { GpuEngine, gpuCompatible, gpuSupported } from '../sim/gpu-engine';
 
 declare const self: DedicatedWorkerGlobalScope;
 
-let engine: Engine | null = null;
+// ── Backend selection ────────────────────────────────────────────────────────
+// `requested` is the user's preference (UI toggle; default wasm — it is
+// bit-identical to the TS engine, just faster, so switching it on silently is
+// safe). The worker falls back gpu → wasm → cpu per config/runtime support and
+// reports what actually runs via a `backend` message.
+let requestedBackend: EngineBackend = wasmAvailable() ? 'wasm' : 'cpu';
+
+let engine: AnyEngine | null = null; // cpu / wasm backends (synchronous)
+let gpu: GpuEngine | null = null; // gpu backend (asynchronous)
+// All GPU work is serialized through this chain — commands never interleave
+// with an in-flight batch.
+let gpuChain: Promise<void> = Promise.resolve();
+let currentConfig: SimConfig | null = null;
+
 let playing = false;
 let tps = 30;
 let scheduled = false;
@@ -21,17 +35,21 @@ let lastLongTick = -1;
 // useful up to display refresh. Cap posted frames at ~60/s so high speeds
 // don't flood the UI thread with repaints it can't keep up with.
 const POST_INTERVAL = 1000 / 60;
+// GPU batch bound per loop turn (matches GpuEngine's stats window).
+const GPU_MAX_BATCH = 2048;
 
-function ensure(config?: SimConfig): Engine {
-  if (engine) return engine;
-  if (!config) throw new Error('engine not initialized');
-  engine = new Engine(config);
-  return engine;
+function activeSource(): AnyEngine | GpuEngine | null {
+  return gpu ?? engine;
+}
+
+function postBackend(active: EngineBackend, reason?: string): void {
+  self.postMessage({ type: 'backend', active, requested: requestedBackend, reason });
 }
 
 function postFrame(): void {
-  if (!engine) return;
-  const { state, defenses, quarantined, size } = engine.buffers();
+  const src = activeSource();
+  if (!src) return;
+  const { state, defenses, quarantined, size } = src.buffers();
   // Copy buffers so we can transfer ownership without losing the engine state.
   const stateCopy = new Uint8Array(state);
   const defCopy = new Uint8Array(defenses);
@@ -47,24 +65,24 @@ function postFrame(): void {
 
   const msg: FrameMessage = {
     type: 'frame',
-    tick: engine.tick,
+    tick: src.tick,
     state: stateCopy,
     defenses: defCopy,
     quarantined: qCopy,
     size,
     stats,
-    retiredCost: { ...engine.retiredCost },
-    rNaught: engine.rNaught,
+    retiredCost: { ...src.retiredCost },
+    rNaught: src.rNaught,
   };
   // Send only the rows the UI hasn't seen; fall back to a full snapshot after
   // a rebuild/reset or if more ticks elapsed than the window still holds.
-  const newRows = engine.tick - lastLongTick;
-  if (lastLongTick < 0 || newRows < 0 || newRows > engine.history.length) {
-    msg.longFull = engine.history.toLongStats();
+  const newRows = src.tick - lastLongTick;
+  if (lastLongTick < 0 || newRows < 0 || newRows > src.history.length) {
+    msg.longFull = src.history.toLongStats();
   } else {
-    msg.longDelta = engine.history.lastRows(newRows);
+    msg.longDelta = src.history.lastRows(newRows);
   }
-  lastLongTick = engine.tick;
+  lastLongTick = src.tick;
   const transfer: Transferable[] = [stateCopy.buffer, defCopy.buffer];
   if (qCopy) transfer.push(qCopy.buffer);
   self.postMessage(msg, transfer);
@@ -114,6 +132,68 @@ function buildAndPostTopology(config: SimConfig): import('../types').VoronoiTopo
   return topo;
 }
 
+function disposeGpu(): void {
+  const g = gpu;
+  gpu = null;
+  if (g) gpuChain = gpuChain.then(() => g.dispose()).catch(() => {});
+}
+
+/** (Re)build the simulation for `config` under the requested backend, with
+ *  automatic fallback gpu → wasm → cpu. */
+function rebuild(config: SimConfig): void {
+  currentConfig = config;
+  const topo = buildAndPostTopology(config);
+  disposeGpu();
+  engine = null;
+  lastStats = null;
+  lastLongTick = -1;
+  lastFrame = performance.now();
+
+  if (requestedBackend === 'gpu') {
+    if (!gpuSupported()) {
+      buildCpuEngine(config, topo, 'WebGPU not available in this browser');
+      return;
+    }
+    if (!gpuCompatible(config)) {
+      buildCpuEngine(config, topo, 'voronoi / mutation / reseed configs run on the CPU engines');
+      return;
+    }
+    gpuChain = gpuChain
+      .then(async () => {
+        const g = await GpuEngine.create(config);
+        // A newer rebuild may have raced us; only install if still current.
+        if (currentConfig === config && requestedBackend === 'gpu') {
+          gpu = g;
+          postBackend('gpu');
+          postFrame();
+        } else {
+          g.dispose();
+        }
+      })
+      .catch(() => {
+        if (currentConfig === config) buildCpuEngine(config, topo, 'WebGPU init failed');
+      });
+    return;
+  }
+  buildCpuEngine(config, topo);
+}
+
+function buildCpuEngine(config: SimConfig, topo: import('../types').VoronoiTopology | null, fallbackReason?: string): void {
+  const wantWasm = requestedBackend !== 'cpu';
+  engine = createEngine(config, topo, undefined, wantWasm);
+  const active: EngineBackend = engine instanceof WasmEngine ? 'wasm' : 'cpu';
+  let reason = fallbackReason;
+  if (!reason && wantWasm && active === 'cpu') {
+    reason = wasmCompatible(config) ? 'wasm unavailable in this browser' : 'voronoi / mutation configs run on the TS engine';
+  }
+  postBackend(active, reason);
+  lastStats = null;
+  lastLongTick = -1;
+  postFrame();
+}
+
+// ── CPU/WASM loop (synchronous stepping, tps-paced) ──────────────────────────
+
 function loop(): void {
   scheduled = false;
   if (!playing || !engine) return;
@@ -136,54 +216,92 @@ function loop(): void {
   }
 }
 
+// ── GPU loop (asynchronous batches through gpuChain) ─────────────────────────
+
+let gpuLoopScheduled = false;
+
+function scheduleGpuLoop(delay: number): void {
+  if (gpuLoopScheduled) return;
+  gpuLoopScheduled = true;
+  setTimeout(gpuLoop, delay);
+}
+
+function gpuLoop(): void {
+  gpuLoopScheduled = false;
+  if (!playing || !gpu) return;
+  const now = performance.now();
+  const interval = 1000 / Math.max(1, tps);
+  let due = Math.floor((now - lastFrame) / interval);
+  if (due > GPU_MAX_BATCH) {
+    // Deep stall: drop the backlog instead of replaying it.
+    lastFrame = now - GPU_MAX_BATCH * interval;
+    due = GPU_MAX_BATCH;
+  }
+  if (due > 0) {
+    lastFrame += due * interval;
+    gpuChain = gpuChain
+      .then(async () => {
+        if (!gpu) return;
+        const s = await gpu.run(due);
+        if (s) lastStats = s;
+        const t = performance.now();
+        if (t - lastPost >= POST_INTERVAL) {
+          postFrame();
+          lastPost = t;
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (playing && gpu) scheduleGpuLoop(Math.max(4, interval / 4));
+      });
+  } else {
+    scheduleGpuLoop(Math.max(4, interval / 4));
+  }
+}
+
 self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
   const m = ev.data;
   switch (m.cmd) {
-    case 'init': {
-      const topo = buildAndPostTopology(m.config);
-      engine = new Engine(m.config, topo);
-      lastLongTick = -1;
-      lastFrame = performance.now();
-      lastStats = null;
-      postFrame();
+    case 'init':
+    case 'updateConfig': {
+      rebuild(m.config);
       break;
     }
     case 'reset': {
-      const topo = buildAndPostTopology(m.config);
-      engine = new Engine(m.config, topo);
-      lastLongTick = -1;
-      lastFrame = performance.now();
       playing = false;
-      lastStats = null;
-      postFrame();
-      break;
-    }
-    case 'updateConfig': {
-      // Hard update: rebuild for changes that alter sim shape (size, seed,
-      // strain genes). Resets RNG trajectory + population.
-      const topo = buildAndPostTopology(m.config);
-      engine = new Engine(m.config, topo);
-      lastLongTick = -1;
-      lastFrame = performance.now();
-      lastStats = null;
-      postFrame();
+      rebuild(m.config);
       break;
     }
     case 'patchConfig': {
-      // Soft update: change intervention / defense parameters mid-run without
-      // a reset. Engine applies minimal stochastic adjustment.
-      if (!engine) { engine = new Engine(m.config); lastLongTick = -1; }
-      else engine.patchConfig(m.config);
-      postFrame();
+      if (gpu) {
+        const cfg = m.config;
+        currentConfig = cfg;
+        gpuChain = gpuChain
+          .then(async () => {
+            if (!gpu) return;
+            await gpu.patchConfig(cfg);
+            postFrame();
+          })
+          .catch(() => {});
+        break;
+      }
+      if (!engine) {
+        rebuild(m.config);
+      } else {
+        currentConfig = m.config;
+        engine.patchConfig(m.config);
+        postFrame();
+      }
       break;
     }
     case 'play': {
-      ensure();
       tps = m.tps;
       playing = true;
       lastFrame = performance.now();
       lastPost = 0; // post the first frame of this run immediately
-      if (!scheduled) {
+      if (gpu) {
+        scheduleGpuLoop(0);
+      } else if (engine && !scheduled) {
         scheduled = true;
         setTimeout(loop, 0);
       }
@@ -192,15 +310,39 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
     case 'pause': {
       playing = false;
       // Flush the exact stopped state — the throttled loop may have skipped
-      // posting the last few steps.
-      if (engine) postFrame();
+      // posting the last few steps (or a GPU batch may still be in flight).
+      if (gpu) {
+        gpuChain = gpuChain.then(() => postFrame()).catch(() => {});
+      } else if (engine) {
+        postFrame();
+      }
       break;
     }
     case 'step': {
-      const e = ensure();
       const n = Math.max(1, m.n);
-      for (let k = 0; k < n; k++) lastStats = e.step();
-      postFrame();
+      if (gpu) {
+        gpuChain = gpuChain
+          .then(async () => {
+            if (!gpu) return;
+            const s = await gpu.run(n);
+            if (s) lastStats = s;
+            postFrame();
+          })
+          .catch(() => {});
+      } else if (engine) {
+        for (let k = 0; k < n; k++) lastStats = engine.step();
+        postFrame();
+      }
+      break;
+    }
+    case 'setBackend': {
+      if (m.backend === requestedBackend) {
+        break;
+      }
+      requestedBackend = m.backend;
+      // Backend switch is a structural change: rebuild (tick resets), paused.
+      playing = false;
+      if (currentConfig) rebuild(currentConfig);
       break;
     }
   }

@@ -187,6 +187,31 @@ plain workers today, no shared memory needed.
 P3 also delivered the grid-tier target: 2048² (4.19M cells) at 476 t/s.
 Every phase met or beat its bull target; every gate passed.
 
+## 7. Integration status — 2026-08-20 (same day)
+
+All three phases are now INTEGRATED in the app, not just spiked:
+
+- **Phase 2 committed port**: `rust/engine-core` (full single-strain feature
+  surface: square/tri/hex/mean-field, defenses, lockdown, quarantine, births,
+  waning, txSchedule, reseed, patchConfig ops) behind
+  `src/sim/wasm-engine.ts`. **Bit-identical to the TS engine** — the TS seed()
+  seeds wasm memory directly and hands over the RNG state, so there is no
+  digest family split. The fit path (`lib/fit-sim.ts`) uses it automatically;
+  measured fit total vs the pre-P1 engine: 30.6 s → 6.8 s (4.5×).
+- **Phase 3 committed backend**: `src/sim/gpu-engine.ts` + async loop in
+  `sim.worker.ts`. The WGSL was validated headlessly on real hardware before
+  shipping (compile + pipeline + 100-tick conservation run), which caught a
+  portability bug the spike missed: baseline WebGPU allows only 8 storage
+  bindings per stage, so per-cell words are packed (state+age,
+  defenses+compliance).
+- **UI**: toolbar backend button (⚙ CPU / ⚙ WASM / ⚡ GPU), localStorage
+  preference, automatic fallback with a status toast. Verified in headless
+  Chrome (Vulkan WebGPU): all three backends step, render, and chart with
+  zero console errors.
+- Determinism contract: cpu ≡ wasm (bit-exact, golden digests shared); gpu is
+  its own deterministic family per (config, seed). Backend choice is a runtime
+  preference, never part of SimConfig or permalinks.
+
 Sequencing is strict: P1 first (cheapest, benefits every path, and P2/P3 port
 the *right* algorithm); P2 and P3 are then independent — P3 can skip P2
 entirely if the GPU spike clears its gate. Every phase lands behind the golden

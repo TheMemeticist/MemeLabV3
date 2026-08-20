@@ -1,0 +1,17 @@
+[package]
+name = "engine-core"
+version = "1.0.0"
+edition = "2021"
+
+# WASM port of the event-driven SEIR-D engine hot core (docs/perf-plan.md
+# Phase 2). Build with rust/build.sh; the artifact is committed as a base64
+# module so the web build needs no Rust toolchain.
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
