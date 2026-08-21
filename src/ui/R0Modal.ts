@@ -74,6 +74,14 @@ const CAT_COLOR: Record<FitCategory, string> = {
 // Greyed ink for raw points superseded by the revision cleaning.
 const RAW_INK = 'rgba(148, 163, 184, 0.55)';
 
+// Chart overlay layers the user can show/hide from the chip legend under the
+// chart. 'raw' toggles the greyed raw-revision uPlot series; the rest gate
+// their canvas-painted sections in paintOverlays.
+type OverlayKey = 'itv' | 'raw' | 'adjust' | 'bayes' | 'ensemble' | 'offset';
+const DEFAULT_OVERLAY_VIS: Record<OverlayKey, boolean> = {
+  itv: true, raw: true, adjust: true, bayes: true, ensemble: true, offset: true,
+};
+
 /** 'rgb(r, g, b)' → 'rgba(r, g, b, a)' for the canvas-painted overlays. */
 function withAlpha(rgb: string, a: number): string {
   return rgb.replace('rgb(', 'rgba(').replace(')', `, ${a})`);
@@ -325,6 +333,7 @@ interface R0Snapshot {
   adjust?: AdjustSettings;
   offsetEvolve?: boolean;
   offsetBounds?: [number, number];
+  overlayVis?: Partial<Record<OverlayKey, boolean>>;
 }
 
 export class R0Modal {
@@ -430,6 +439,13 @@ export class R0Modal {
   private liveOffsetBand: { lo95: number; hi95: number; lo68: number; hi68: number; at: number } | null = null;
   // Intervention ramp windows (chart-day coords) for the shaded chart markers.
   private liveItvWindows: { from: number; to: number; label: string }[] = [];
+  // Overlay-layer visibility, driven by the chip legend under the chart.
+  // Survives chart rebuilds (renderOutput/createChart recreate the plot) and
+  // persists in the panel snapshot.
+  private overlayVis: Record<OverlayKey, boolean> = { ...DEFAULT_OVERLAY_VIS };
+  // uPlot series indexes of the greyed raw-revision dot columns — the 'raw'
+  // chip toggles these via setSeries (and setSeries syncs the chip back).
+  private liveRawSeriesIdx: number[] = [];
   private liveDays = 0;
   private livePop = 0;
   private pendingSnapshot: FitProgress | null = null;
@@ -519,6 +535,7 @@ export class R0Modal {
       adjust: { ...this.adjust },
       offsetEvolve: this.offsetEvolve,
       offsetBounds: [...this.offsetBounds] as [number, number],
+      overlayVis: { ...this.overlayVis },
     });
   }
 
@@ -544,6 +561,7 @@ export class R0Modal {
     if (Number.isFinite(s.bayesDraws)) this.bayesDraws = Math.min(500, Math.max(0, Math.round(s.bayesDraws!)));
     if (Number.isFinite(s.predictionDays)) this.predictionDays = Math.min(365, Math.max(0, Math.round(s.predictionDays!)));
     if (Number.isFinite(s.fanTrials)) this.ensembleTrials = Math.min(256, Math.max(0, Math.round(s.fanTrials!)));
+    if (s.overlayVis && typeof s.overlayVis === 'object') this.overlayVis = { ...DEFAULT_OVERLAY_VIS, ...s.overlayVis };
     if (Array.isArray(s.interventions) && this.interventions.length === 0) {
       // Migration: interventions used to live in this snapshot (older shapes
       // incl. the removed 'intensity' scalar). Seed the App-owned store once.
@@ -1810,6 +1828,7 @@ export class R0Modal {
         </div>
       </div>
       <div class="r0-chart" data-r0="chart"></div>
+      <div class="r0-ovl-legend" data-r0="ovl-legend" hidden></div>
     `;
     this.createChart(observed, days, this.population, raw, this.lastAdjust);
   }
@@ -1868,7 +1887,7 @@ export class R0Modal {
         </table>
       </div>
       <div class="r0-chart" data-r0="chart"></div>
-      ${chartHint(this.lastEnsemble, this.lastFan)}
+      <div class="r0-ovl-legend" data-r0="ovl-legend" hidden></div>
     `;
     this.createChart(r.observed, r.days, r.population, this.lastRaw, this.lastAdjust, this.lastFan, this.lastEnsemble);
     this.updateChartData(r.simulated);
@@ -2022,6 +2041,7 @@ export class R0Modal {
     // dots-only column per category that has any point differing from the cleaned
     // value at the same day. Columns are cached so updateChartData can rebuild
     // the exact same data shape on every live frame.
+    this.liveRawSeriesIdx = [];
     this.liveRawCols = this.liveCats.map(() => null);
     if (raw) {
       const cleaned = new Map<string, number>();
@@ -2070,9 +2090,11 @@ export class R0Modal {
       const rawCol = this.liveRawCols[ci];
       if (rawCol) {
         data.push(rawCol);
+        this.liveRawSeriesIdx.push(series.length);
         series.push({
           label: `${CAT_SHORT[cat]} · raw`,
           stroke: RAW_INK,
+          show: this.overlayVis.raw,
           paths: () => null, // dots only — superseded values, greyed
           points: { show: true, size: 6, stroke: RAW_INK, fill: 'transparent' },
           value: legendVal,
@@ -2123,6 +2145,9 @@ export class R0Modal {
           ready: [(u) => this.pinLegendToEnd(u)],
           setData: [(u) => this.pinLegendToEnd(u)],
           setCursor: [(u) => { if (u.cursor.idx == null) this.pinLegendToEnd(u); }],
+          // Keep the 'raw' chip in sync when the user toggles a raw series via
+          // the uPlot legend directly (both directions stay coherent).
+          setSeries: [(u, si) => { if (si != null && this.liveRawSeriesIdx.includes(si)) this.syncRawChip(u); }],
         },
         axes: [
           axisOpts('Day', { space: 56, values: (_u, splits) => splits.map((v) => String(Math.round(v))) }),
@@ -2135,6 +2160,100 @@ export class R0Modal {
       data as uPlot.AlignedData,
       host,
     );
+    this.annotateSeriesLegend();
+    this.renderOverlayLegend();
+  }
+
+  /** Colored toggle dots on the uPlot legend rows (the modal hides uPlot's
+   *  default markers globally, so without this the entries have no color and
+   *  no visible affordance). Line series get a filled dot, dot-series a ring,
+   *  matching how they draw on the canvas. */
+  private annotateSeriesLegend(): void {
+    const host = this.el?.querySelector<HTMLElement>('[data-r0="chart"]');
+    const plot = this.plot;
+    if (!host || !plot) return;
+    host.querySelectorAll('.u-legend .u-series').forEach((row, idx) => {
+      if (idx === 0) return; // x row
+      const th = row.querySelector('th') as HTMLElement | null;
+      if (!th || th.querySelector('.u-toggle-dot')) return;
+      th.title = 'Click to show/hide this series';
+      const dot = document.createElement('span');
+      dot.className = 'u-toggle-dot';
+      dot.setAttribute('aria-hidden', 'true');
+      const s = plot.series[idx] as { stroke?: unknown; paths?: unknown; label?: string };
+      const stroke = typeof s.stroke === 'string' ? s.stroke : null;
+      if (stroke) dot.style.setProperty('--dot-color', stroke);
+      // Dots-only series (data / raw) render as a ring, matching the chart.
+      if (typeof s.label === 'string' && !s.label.endsWith('· model')) dot.classList.add('ring');
+      th.prepend(dot);
+    });
+  }
+
+  /** Chip legend for the canvas-painted overlay layers (and the raw-revision
+   *  series): one chip per layer actually present, colored to match its paint;
+   *  clicking hides/shows the layer. State lives in overlayVis (persisted). */
+  private renderOverlayLegend(): void {
+    const host = this.el?.querySelector<HTMLElement>('[data-r0="ovl-legend"]');
+    if (!host) return;
+    const catTint = CAT_COLOR[this.liveCats[0] ?? 'cumulative_infections'];
+    const chips: { key: OverlayKey; label: string; color: string; tip: string }[] = [];
+    if (this.liveItvWindows.length > 0) {
+      chips.push({ key: 'itv', label: 'Interventions', color: 'rgb(139, 92, 246)', tip: 'Violet spans: intervention windows — the time-varying transmission R(t) reductions the fit ran under.' });
+    }
+    if (this.liveRawCols.some((c) => c)) {
+      chips.push({ key: 'raw', label: 'Raw data', color: 'rgb(148, 163, 184)', tip: 'Greyed hollow dots: reported values later revised downward (the fit targets the cleaned series).' });
+    }
+    if (this.liveAdjustPts && Object.keys(this.liveAdjustPts).length > 0) {
+      chips.push({ key: 'adjust', label: 'Adjusted data', color: 'rgb(100, 116, 139)', tip: 'Underreporting-adjustment envelope: reported floor, central estimate, vintaged upper bound (category-colored dashes).' });
+    }
+    if (this.liveEnsembleCols && Object.keys(this.liveEnsembleCols).length > 0) {
+      chips.push({ key: 'ensemble', label: 'Ensemble density', color: catTint, tip: 'Soft density: index-case ensemble — the best-fit disease re-run from many different starting cells. Predictive spread (stochastic path + starting cell); naturally wider than the Bayes band.' });
+    }
+    if (this.liveFanCols && Object.keys(this.liveFanCols).length > 0) {
+      chips.push({ key: 'bayes', label: 'Bayes band', color: catTint, tip: 'Saturated band: Bayesian posterior-predictive 5/50/95 — parameter uncertainty only, so it is narrow by design.' });
+    }
+    if (this.liveOffsetBand) {
+      chips.push({ key: 'offset', label: 'Index-date CI', color: 'rgb(148, 163, 184)', tip: 'Grey band: profile-likelihood CI for where the first observation sits (dashed line = the fitted index date).' });
+    }
+    host.hidden = chips.length === 0;
+    if (chips.length === 0) { host.innerHTML = ''; return; }
+    host.innerHTML = `<span class="r0-ovl-caption">Layers</span>` + chips.map((c) => {
+      const on = this.overlayVis[c.key];
+      return `<button type="button" class="r0-ovl-chip${on ? '' : ' off'}" data-ovl="${c.key}" aria-pressed="${on}" title="${c.tip} Click to ${on ? 'hide' : 'show'}.">
+        <span class="r0-ovl-dot" style="--c:${c.color}"></span>${c.label}
+      </button>`;
+    }).join('');
+    host.querySelectorAll<HTMLButtonElement>('[data-ovl]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const key = btn.dataset['ovl'] as OverlayKey;
+        this.overlayVis[key] = !this.overlayVis[key];
+        if (key === 'raw') {
+          // Raw is a real uPlot series set — toggle through setSeries so the
+          // uPlot legend rows stay coherent (its hook re-syncs the chip).
+          for (const si of this.liveRawSeriesIdx) this.plot?.setSeries(si, { show: this.overlayVis.raw });
+        } else {
+          this.repaintOverlays();
+        }
+        this.renderOverlayLegend();
+      });
+    });
+  }
+
+  /** Repaint the canvas overlays after a visibility toggle. uPlot 1.x
+   *  redraw() can wipe cached series paths (documented pitfall in Chart.ts),
+   *  so re-push the current data instead — setData refires hooks.draw. */
+  private repaintOverlays(): void {
+    if (this.plot) this.plot.setData(this.plot.data);
+  }
+
+  /** setSeries hook target: reflect the raw series' actual visibility back
+   *  onto overlayVis + the chip (covers toggles made via the uPlot legend). */
+  private syncRawChip(u: uPlot): void {
+    const anyShown = this.liveRawSeriesIdx.some((si) => (u.series[si] as { show?: boolean }).show !== false);
+    if (this.overlayVis.raw !== anyShown) {
+      this.overlayVis.raw = anyShown;
+      this.renderOverlayLegend();
+    }
   }
 
   /** Push fresh simulated curves into the existing plot (observed dots unchanged).
@@ -2206,6 +2325,11 @@ export class R0Modal {
     ctx.clip();
     const X = (d: number): number => u.valToPos(d, 'x', true);
     const Y = (v: number): number => u.valToPos(v, 'y', true);
+    // Overlay labels are collected here and painted LAST, unclipped and
+    // clamped fully inside the plot, so their text is always complete and
+    // always in the foreground (see the label pass after ctx.restore()).
+    const labels: { text: string; x: number; y: number; color: string }[] = [];
+    const pr = uPlot.pxRatio || 1;
     // Evolving index-date marker: a vertical amber line where data day 0
     // currently sits in sim days, updated live as the optimizer mutates the
     // offset. (Post-fit charts show the grey profile-CI band instead.)
@@ -2219,19 +2343,17 @@ export class R0Modal {
       ctx.setLineDash([6, 4]);
       ctx.stroke();
       ctx.setLineDash([]);
-      const pr = uPlot.pxRatio || 1;
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.95)';
-      ctx.font = `600 ${11 * pr}px sans-serif`;
-      // uPlot leaves ctx.textAlign right-aligned after axis rendering — set
-      // alignment explicitly or the label draws mirrored across the marker.
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillText(`index date · day ${this.liveIndexMarker}`, xm + 4 * pr, u.bbox.top + u.bbox.height - 6 * pr);
+      labels.push({
+        text: `index date · day ${this.liveIndexMarker}`,
+        x: xm + 4 * pr,
+        y: u.bbox.top + u.bbox.height - 14 * pr,
+        color: 'rgb(245, 158, 11)',
+      });
     }
     // Intervention ramp windows: violet spans (distinct from the grey offset-CI
     // band and the category-colored fills) with a dashed start line and the
     // intervention's name at the top, staggered per row.
-    this.liveItvWindows.forEach((w, wi) => {
+    if (this.overlayVis.itv) this.liveItvWindows.forEach((w, wi) => {
       const x1 = X(w.from);
       const x2 = Number.isFinite(w.to) ? X(w.to) : u.bbox.left + u.bbox.width;
       ctx.fillStyle = 'rgba(139, 92, 246, 0.06)';
@@ -2244,15 +2366,17 @@ export class R0Modal {
       ctx.setLineDash([3, 4]);
       ctx.stroke();
       ctx.setLineDash([]);
-      const pr = uPlot.pxRatio || 1;
-      ctx.fillStyle = 'rgba(139, 92, 246, 0.85)';
-      ctx.font = `${11 * pr}px sans-serif`;
-      ctx.fillText(w.label, x1 + 4 * pr, u.bbox.top + (14 + wi * 13) * pr);
+      labels.push({
+        text: w.label,
+        x: x1 + 4 * pr,
+        y: u.bbox.top + (4 + wi * 19) * pr,
+        color: 'rgb(139, 92, 246)',
+      });
     });
     // Index-date profile-CI marker: the grey band spans the plausible positions
     // of the FIRST OBSERVATION under the CI (darker = 68%), with a dashed line
     // where the fitted offset actually anchors it.
-    const ob = this.liveOffsetBand;
+    const ob = this.overlayVis.offset ? this.liveOffsetBand : null;
     if (ob) {
       ctx.fillStyle = 'rgba(148, 163, 184, 0.10)';
       ctx.fillRect(X(ob.lo95), u.bbox.top, Math.max(1, X(ob.hi95) - X(ob.lo95)), u.bbox.height);
@@ -2271,7 +2395,7 @@ export class R0Modal {
     // series draw on top. Layered fills (broad 5–95 wash + darker 25–75 core)
     // read as a density; the ensemble median is dotted so it can't be
     // mistaken for the fitted line.
-    if (ens) {
+    if (ens && this.overlayVis.ensemble) {
       for (const cat of this.liveCats) {
         const rows = ens[cat];
         if (!rows || rows.length < ENSEMBLE_PROBS.length) continue;
@@ -2297,7 +2421,7 @@ export class R0Modal {
     }
     for (const cat of this.liveCats) {
       const color = CAT_COLOR[cat];
-      const rows = fan?.[cat];
+      const rows = this.overlayVis.bayes ? fan?.[cat] : undefined;
       if (rows) {
         // BAND_PROBS = [5, 50, 95] → LOW..HIGH posterior-predictive fill with
         // explicit dashed edge lines so even a narrow band reads as a band.
@@ -2317,7 +2441,7 @@ export class R0Modal {
           ctx.setLineDash([]);
         }
       }
-      const a = adj?.[cat];
+      const a = this.overlayVis.adjust ? adj?.[cat] : undefined;
       if (a && a.upper.length > 1) {
         // The envelope vertices are anchored to the data days, so they ride
         // with the dots during an offset-evolving fit (shift is 0 otherwise).
@@ -2347,6 +2471,46 @@ export class R0Modal {
       }
     }
     ctx.restore();
+
+    // Label pass — after the clip is released so nothing truncates the text.
+    // Each label gets a translucent theme-colored chip and is clamped so the
+    // FULL text always sits inside the plot area, even for windows starting
+    // near (or past) the right edge or off-view to the left.
+    if (labels.length > 0) {
+      const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated').trim() || '#ffffff';
+      ctx.save();
+      ctx.font = `600 ${11 * pr}px sans-serif`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const chipH = 16 * pr;
+      const padX = 5 * pr;
+      const left = u.bbox.left;
+      const right = u.bbox.left + u.bbox.width;
+      for (const L of labels) {
+        const tw = ctx.measureText(L.text).width;
+        const w = tw + padX * 2;
+        const x = Math.max(left + 2 * pr, Math.min(L.x, right - w - 2 * pr));
+        const y = Math.max(u.bbox.top + 2 * pr, Math.min(L.y, u.bbox.top + u.bbox.height - chipH - 2 * pr));
+        ctx.beginPath();
+        const r = 3 * pr;
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + chipH, r);
+        ctx.arcTo(x + w, y + chipH, x, y + chipH, r);
+        ctx.arcTo(x, y + chipH, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+        ctx.globalAlpha = 0.85;
+        ctx.fillStyle = bg;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = withAlpha(L.color, 0.55);
+        ctx.stroke();
+        ctx.fillStyle = L.color;
+        ctx.fillText(L.text, x + padX, y + chipH / 2 + 0.5 * pr);
+      }
+      ctx.restore();
+    }
   }
 
   private chartXs(days: number): number[] {
@@ -2399,15 +2563,6 @@ function ensembleRows(r: FitResult, ens: Record<FitCategory, number[][]> | null)
     </tr>`;
   }
   return out;
-}
-
-/** One-line chart legend for the painted layers, shown only when present. */
-function chartHint(ens: Record<FitCategory, number[][]> | null, fan: Record<FitCategory, number[][]> | null): string {
-  const parts: string[] = [];
-  if (ens) parts.push('soft density = index-case ensemble (predictive spread: stochastic path + starting cell)');
-  if (fan) parts.push('saturated band = Bayes parameter uncertainty');
-  if (parts.length === 0) return '';
-  return `<p class="r0-chart-hint">${parts.join(' · ')}</p>`;
 }
 
 function fmtParam(name: FitParamName, v: number): string {

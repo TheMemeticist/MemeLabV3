@@ -217,9 +217,46 @@ function resumeIfPlaying(): void {
   }
 }
 
+// ── Rebuild debouncing ───────────────────────────────────────────────────────
+// A slider drag emits a rebuild-triggering config update per animation frame;
+// each rebuild is synchronous, and on voronoi it triangulates a full topology
+// at a NEW size (the cache never hits). Rebuilding every message blocks this
+// worker's event loop for the whole backlog — tens of seconds of frozen board
+// on a fast drag, which reads as a hang. Trailing debounce: the rebuild fires
+// only once the values stop for a beat, so a drag costs exactly ONE rebuild of
+// the final config (the old engine keeps running and painting meanwhile).
+// Commands that need the built engine to match the latest config
+// (step/patchConfig/setBackend/probe) flush first; play/pause deliberately do
+// NOT flush — App sends `play` after every config update while running, and
+// flushing there would defeat the debounce. The very first build (no engine
+// yet) fires immediately.
+let pendingRebuild: SimConfig | null = null;
+let rebuildTimer: ReturnType<typeof setTimeout> | null = null;
+const REBUILD_DEBOUNCE_MS = 120;
+
+function scheduleRebuild(config: SimConfig): void {
+  pendingRebuild = config;
+  if (rebuildTimer !== null) clearTimeout(rebuildTimer);
+  const delay = engine === null && gpu === null ? 0 : REBUILD_DEBOUNCE_MS;
+  rebuildTimer = setTimeout(flushRebuild, delay);
+}
+
+function flushRebuild(): void {
+  if (rebuildTimer !== null) {
+    clearTimeout(rebuildTimer);
+    rebuildTimer = null;
+  }
+  const cfg = pendingRebuild;
+  pendingRebuild = null;
+  if (cfg) rebuild(cfg);
+}
+
 /** (Re)build the simulation for `config` under the requested backend, with
  *  automatic fallback gpu → wasm → cpu. */
 function rebuild(config: SimConfig): void {
+  // A direct rebuild (backend switch, patch compat-crossing) supersedes any
+  // pending debounced one — never rebuild twice.
+  pendingRebuild = null;
   currentConfig = config;
   const topo = buildAndPostTopology(config);
   disposeGpu();
@@ -350,15 +387,16 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
   switch (m.cmd) {
     case 'init':
     case 'updateConfig': {
-      rebuild(m.config);
+      scheduleRebuild(m.config);
       break;
     }
     case 'reset': {
       playing = false;
-      rebuild(m.config);
+      scheduleRebuild(m.config);
       break;
     }
     case 'patchConfig': {
+      flushRebuild(); // compat checks below need the engine at the latest config
       const cfg = m.config;
       // Soft params can cross a backend's compatibility boundary (the 🧬
       // mutate toggle is a patch): an engine that can't represent the patched
@@ -409,6 +447,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
       break;
     }
     case 'probeBackends': {
+      flushRebuild(); // probe against the latest config
       void probeBackends();
       break;
     }
@@ -437,6 +476,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
       break;
     }
     case 'step': {
+      flushRebuild(); // step the engine the user sees, not a stale one
       const n = Math.max(1, m.n);
       if (gpu) {
         gpuChain = gpuChain
@@ -454,6 +494,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
       break;
     }
     case 'setBackend': {
+      flushRebuild(); // the rebuild below must start from the latest config
       if (m.backend === requestedBackend) {
         break;
       }

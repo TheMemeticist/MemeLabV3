@@ -486,7 +486,14 @@ export class App {
       this.renderScheduled = true;
       requestAnimationFrame(() => {
         this.renderScheduled = false;
-        if (this.lastFrame) this.renderFrame(this.lastFrame);
+        if (!this.lastFrame) return;
+        // One inconsistent frame (mid-rebuild races) must never kill the
+        // paint pipeline silently — log, skip it, and let the next one paint.
+        try {
+          this.renderFrame(this.lastFrame);
+        } catch (err) {
+          console.error('frame render failed (frame skipped):', err);
+        }
       });
     }
     this.schedulePersist();

@@ -2434,11 +2434,75 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 .r0-params-table th, .r0-params-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 .r0-params-table th { color: var(--text-muted); font-weight: 600; }
 .r0-chart { width: 100%; }
-.r0-chart-hint { margin: 6px 2px 0; font-size: 11px; line-height: 1.4; color: var(--text-muted); }
 /* Estimator chart legend: compact, centered, and never clipping the value readout. */
-.r0-chart .u-legend { justify-content: center; }
+.r0-chart .u-legend { justify-content: center; margin-top: 6px; }
+.r0-chart .u-legend tbody { justify-content: center; }
 .r0-chart .u-legend th { white-space: nowrap; }
 .r0-chart .u-legend .u-value { min-width: 0; white-space: nowrap; }
+/* Dots-only series (data / raw) get a ring dot, matching how they draw. */
+.u-legend .u-toggle-dot.ring {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--dot-color, var(--accent));
+}
+.u-legend .u-series.u-off .u-toggle-dot.ring {
+  box-shadow: inset 0 0 0 1.5px var(--border-strong);
+}
+
+/* Overlay-layer chip legend — one row under the series legend; each chip
+   toggles a canvas-painted layer (or the raw-revision series) on/off. */
+.r0-ovl-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 6px;
+  margin: 6px 2px 0;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.r0-ovl-legend[hidden] { display: none; }
+.r0-ovl-caption {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-right: 4px;
+}
+.r0-ovl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 100ms ease, border-color 100ms ease, color 100ms ease, opacity 100ms ease;
+}
+.r0-ovl-chip:hover { border-color: var(--accent); background: var(--accent-soft); }
+.r0-ovl-chip .r0-ovl-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c, var(--accent));
+  flex-shrink: 0;
+}
+.r0-ovl-chip.off {
+  background: transparent;
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+.r0-ovl-chip.off .r0-ovl-dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--c, var(--border-strong));
+}
 
 /* Goodness-of-fit: plain-language, color-coded rating instead of a bare R². */
 .r0-gof { gap: 6px; }

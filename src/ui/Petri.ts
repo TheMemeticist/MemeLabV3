@@ -91,9 +91,14 @@ export class Petri {
   /** Call whenever the engine rebuilds with geometry=voronoi. Pass null to clear. */
   setVoronoiTopology(topo: VoronoiTopology | null): void {
     this.voronoiTopo = topo;
-    // Invalidate LUT so resize() rebuilds it with the new topology.
+    // Invalidate LUT so resize() rebuilds it with the new topology. Only
+    // rebuild eagerly when the topology matches the current grid — during a
+    // size change the new topology arrives BEFORE the first new-size frame,
+    // and a LUT built from it would index past a stale old-size frame's
+    // buffers (undefined → channels clamp to 0 → a solid-black board). The
+    // first matching paint() resizes and builds the LUT instead.
     this.geoLut = null;
-    if (topo !== null && this.geometry === 'voronoi') {
+    if (topo !== null && this.geometry === 'voronoi' && topo.n === this.size * this.size) {
       this.resize(this.size, 'voronoi');
     }
   }
@@ -147,7 +152,7 @@ export class Petri {
           this.geoLut = buildHexLut(size, canvasPx, canvasPx);
         } else if (geometry === 'triangular') {
           this.geoLut = buildTriLut(size, canvasPx, canvasPx);
-        } else if (geometry === 'voronoi' && this.voronoiTopo) {
+        } else if (geometry === 'voronoi' && this.voronoiTopo && this.voronoiTopo.n === size * size) {
           this.geoLut = buildVoronoiLut(this.voronoiTopo, canvasPx, canvasPx);
         } else {
           this.geoLut = null;
@@ -160,6 +165,12 @@ export class Petri {
   }
 
   paint(state: Uint8Array, defenses: Uint8Array, quarantined: Uint8Array | null, size: number, geometry: GeometryType): void {
+    // Stale-pair guard: during a size/geometry rebuild, frames and topology
+    // messages from the old and new engines can interleave. A voronoi LUT
+    // whose topology doesn't match this frame's cell count reads out of
+    // bounds (undefined → 0,0,0 = black board). Skip the frame — a
+    // consistent one follows within a tick.
+    if (geometry === 'voronoi' && (this.voronoiTopo === null || this.voronoiTopo.n !== size * size)) return;
     if (size !== this.size || geometry !== this.geometry) this.resize(size, geometry);
 
     if (geometry === 'meanfield') {
