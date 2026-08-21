@@ -54,6 +54,10 @@ export class Chart {
   // Fitted mean curves (per-capita) × grid cells — dashed reference lines the
   // live run should track after "Apply to simulation".
   private fitOverlay: { deaths: number[]; active: number[]; cumInf: number[] } | null = null;
+  // Sim day where the fitted dataset's day 0 sits (the fit's index-date
+  // offset): the outbreak ran this many days before the data began, so the
+  // marker maps "data day d" ↔ "live day d + origin" for the user.
+  private fitDataOrigin: number | null = null;
   private markerTip: HTMLElement | null = null;
   private mouseHandler: ((ev: MouseEvent) => void) | null = null;
   private leaveHandler: (() => void) | null = null;
@@ -105,6 +109,12 @@ export class Chart {
           cumInf: curves.cumulative_infections.map((v) => v * cells),
         }
       : null;
+  }
+
+  /** Sim day of the fitted dataset's day 0 (the fit's index-date offset), or
+   *  null to hide the marker. Same repaint contract as setMarkers. */
+  setFitOrigin(day: number | null): void {
+    this.fitDataOrigin = day !== null && day > 0 ? day : null;
   }
 
   setView(view: ChartView): void {
@@ -354,6 +364,7 @@ export class Chart {
         hooks: {
           draw: [
             (u) => this.paintFitWindows(u),
+            (u) => this.paintFitOrigin(u),
             (u) => { if (isReff) this.paintReffThreshold(u); },
             (u) => { if (this.view === 'compartments') this.paintFitOverlay(u); },
             (u) => this.paintMarkers(u),
@@ -498,6 +509,36 @@ export class Chart {
   /** Dashed fitted-curve references: Dead in both modes; Infectious (active)
    *  in Active mode, cumulative infections (ecum) in Total mode. The live
    *  traces should ride these when the applied fit reproduces. */
+  /** Dashed vertical at the sim day where the fitted dataset began ("data
+   *  day 0"): with an evolved index-date offset the outbreak ran that many
+   *  days before the data, so this is the anchor for comparing the
+   *  estimator's day axis against the live run's. */
+  private paintFitOrigin(u: uPlot): void {
+    const day = this.fitDataOrigin;
+    if (day === null) return;
+    const x = u.valToPos(day, 'x', true);
+    const left = u.bbox.left;
+    const right = left + u.bbox.width;
+    if (!Number.isFinite(x) || x < left || x > right) return;
+    const ctx = u.ctx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(100, 116, 139, 0.65)'; // slate — neutral vs series colors
+    ctx.lineWidth = 1 * dpr;
+    ctx.setLineDash([3 * dpr, 3 * dpr]);
+    ctx.beginPath();
+    ctx.moveTo(x, u.bbox.top);
+    ctx.lineTo(x, u.bbox.top + u.bbox.height);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = `600 ${9 * dpr}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillStyle = 'rgba(100, 116, 139, 0.9)';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('data day 0', x + 3 * dpr, u.bbox.top + 2 * dpr);
+    ctx.restore();
+  }
+
   private paintFitOverlay(u: uPlot): void {
     const ov = this.fitOverlay;
     if (!ov) return;

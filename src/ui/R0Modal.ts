@@ -23,9 +23,12 @@ import {
   hasDownwardRevisions,
   interventionWindows,
   parseObservedCSV,
+  percentileBands,
   BAND_CENTRAL,
   EBOLA_ADJUST,
   EBOLA_INTERVENTIONS,
+  ENSEMBLE_CENTRAL,
+  ENSEMBLE_PROBS,
   migrateInterventionSpecs,
   resolutionFitSize,
   revisionEnvelope,
@@ -315,7 +318,7 @@ interface R0Snapshot {
   indexOffset?: number;
   honorRevisions?: boolean;
   history?: FitHistoryEntry[];
-  fanTrials?: number; // legacy (index-case ensemble) — ignored
+  fanTrials?: number; // index-case ensemble trial count (key kept for compat)
   bayesDraws?: number;
   predictionDays?: number;
   interventions?: InterventionSpec[];
@@ -360,6 +363,10 @@ export class R0Modal {
   private bayesDraws = 120;
   // Days to project the model beyond the data's last day.
   private predictionDays = 0;
+  // Index-case ensemble trials for the post-fit density band (0/1 = off): the
+  // winning config re-simulated N times, each trial seeding the outbreak at a
+  // DIFFERENT board cell — predictive spread, distinct from the Bayes band.
+  private ensembleTrials = 48;
   // Interventions: time-varying transmission R(t) — the MODEL dimension,
   // separate from the case/death DATA adjustment. The store is SHARED with the
   // main sim (App owns it + persistence); this getter always reads the live
@@ -388,6 +395,9 @@ export class R0Modal {
   private lastAdjust: { floor: ObservedPoint[]; central: ObservedPoint[]; upper: ObservedPoint[] } | null = null;
   // Percentile fan of the last fit's best config (transient — not persisted).
   private lastFan: Record<FitCategory, number[][]> | null = null;
+  // Index-case ensemble percentiles of the last fit (ENSEMBLE_PROBS rows,
+  // per-capita; transient) — painted as the density layer under the series.
+  private lastEnsemble: Record<FitCategory, number[][]> | null = null;
 
   // Live-chart state (set by createChart, read by updateChartData) + an rAF
   // throttle so a burst of optimizer improvements coalesces into one redraw.
@@ -400,12 +410,21 @@ export class R0Modal {
   // sparse floor/central/upper vertices for the adjustment envelope — painted by
   // a custom uPlot draw hook so the chart's data columns / legend stay untouched.
   private liveFanCols: Partial<Record<FitCategory, number[][]>> | null = null;
+  // Ensemble density rows (people-scaled, ENSEMBLE_PROBS order) per category.
+  private liveEnsembleCols: Partial<Record<FitCategory, number[][]>> | null = null;
   private liveAdjustPts: Partial<Record<FitCategory, { floor: [number, number][]; central: [number, number][]; upper: [number, number][] }>> | null = null;
   // Highest overlay value (people) so y-autoscale includes bands above the data.
   private overlayMax = 0;
-  // During an offset-evolving fit the dots sit at raw days; slide the model line
-  // right by the current best candidate's offset so the two stay aligned.
-  private liveModelShift = 0;
+  // During an offset-evolving fit the chart lives in SIM days: the model curve
+  // plots unshifted from outbreak day 0, and the DATA DOTS slide right by the
+  // current best candidate's offset (data day d → sim day d + offset). This
+  // keeps the head-start portion of every candidate visible instead of
+  // clipping it off-canvas (the old approach shifted the model left).
+  private liveDotShift = 0;
+  // Vertical marker at the evolving index date (x = current offset, i.e. where
+  // data day 0 sits in sim days). Null hides it — post-fit charts use the
+  // profile-CI band (liveOffsetBand) instead.
+  private liveIndexMarker: number | null = null;
   // Index-date profile-CI marker for the final chart (x = plausible positions of
   // the first observation given the CI; line = where it actually sits).
   private liveOffsetBand: { lo95: number; hi95: number; lo68: number; hi68: number; at: number } | null = null;
@@ -496,6 +515,7 @@ export class R0Modal {
       history: this.history,
       bayesDraws: this.bayesDraws,
       predictionDays: this.predictionDays,
+      fanTrials: this.ensembleTrials,
       adjust: { ...this.adjust },
       offsetEvolve: this.offsetEvolve,
       offsetBounds: [...this.offsetBounds] as [number, number],
@@ -523,6 +543,7 @@ export class R0Modal {
     if (Array.isArray(s.history)) this.history = s.history.slice(0, HISTORY_CAP);
     if (Number.isFinite(s.bayesDraws)) this.bayesDraws = Math.min(500, Math.max(0, Math.round(s.bayesDraws!)));
     if (Number.isFinite(s.predictionDays)) this.predictionDays = Math.min(365, Math.max(0, Math.round(s.predictionDays!)));
+    if (Number.isFinite(s.fanTrials)) this.ensembleTrials = Math.min(256, Math.max(0, Math.round(s.fanTrials!)));
     if (Array.isArray(s.interventions) && this.interventions.length === 0) {
       // Migration: interventions used to live in this snapshot (older shapes
       // incl. the removed 'intensity' scalar). Seed the App-owned store once.
@@ -568,6 +589,7 @@ export class R0Modal {
     this.history = [];
     this.bayesDraws = 120;
     this.predictionDays = 0;
+    this.ensembleTrials = 48;
     this.interventions.length = 0; // shared store: clear contents in place
     this.notifyInterventions();
     this.adjust = { ...DEFAULT_ADJUST };
@@ -576,6 +598,7 @@ export class R0Modal {
     this.lastRaw = null;
     this.lastAdjust = null;
     this.lastFan = null;
+    this.lastEnsemble = null;
     this.liveOffsetBand = null;
     // close() persists by default — that would immediately re-save the state we
     // just wiped, so gate it off for this teardown, then reopen after the 200ms
@@ -694,6 +717,16 @@ export class R0Modal {
       const v = Number(fanInput.value);
       this.bayesDraws = Number.isFinite(v) ? Math.min(500, Math.max(0, Math.round(v))) : 120;
       fanInput.value = String(this.bayesDraws);
+      this.persist();
+    });
+
+    // Index-case ensemble trials for the post-fit density band (0/1 = off).
+    const ensInput = q<HTMLInputElement>('[data-r0="ens"]');
+    ensInput.value = String(this.ensembleTrials);
+    ensInput.addEventListener('change', () => {
+      const v = Number(ensInput.value);
+      this.ensembleTrials = Number.isFinite(v) ? Math.min(256, Math.max(0, Math.round(v))) : 48;
+      ensInput.value = String(this.ensembleTrials);
       this.persist();
     });
 
@@ -1354,8 +1387,9 @@ export class R0Modal {
     this.lastRaw = raw;
     this.lastAdjust = adjustBands;
     this.lastFan = null; // computed after the fit lands
+    this.lastEnsemble = null; // ditto — post-fit density layer
     this.liveOffsetBand = null;
-    this.liveModelShift = 0;
+    this.liveDotShift = 0;
     // Intervention windows in the LIVE chart's day coordinates (raw data days
     // while the offset is evolving; manual-shifted otherwise).
     this.liveItvWindows = this.itvWindows(this.offsetEvolve ? 0 : (this.indexOffset || 0));
@@ -1477,7 +1511,10 @@ export class R0Modal {
         this.persist();
         this.renderOutput();
         this.renderHistory();
-        this.note(warnings.length ? `Fit complete. ⚠ ${warnings.join(' · ')}` : 'Fit complete.');
+        const doneNote = warnings.length ? `Fit complete. ⚠ ${warnings.join(' · ')}` : 'Fit complete.';
+        this.note(doneNote);
+        // Post-fit density layer — async; repaints the chart when it lands.
+        void this.computeEnsemble(this.result, doneNote);
       }
     } catch (err) {
       this.note(`Fit failed: ${(err as Error).message}`);
@@ -1486,6 +1523,32 @@ export class R0Modal {
       this.pendingSnapshot = null;
       this.running = false;
       this.setRunning(false);
+    }
+  }
+
+  /** Post-fit index-case ensemble: the WINNING config re-simulated N times,
+   *  each trial seeding the outbreak at a DIFFERENT board cell (deterministic
+   *  sample of index-case locations), under the same fitted R(t) schedule.
+   *  Per-day percentiles across trials shade the final chart as a density —
+   *  PREDICTIVE spread (stochastic path + starting cell), the honest sibling
+   *  of the Bayes band's parameter uncertainty. Async and abort-safe: paints
+   *  when ready, never blocks renderOutput. */
+  private async computeEnsemble(result: FitResult, doneNote: string): Promise<void> {
+    if (!this.pool || this.ensembleTrials < 2) return;
+    const sig = this.signal;
+    const N = this.ensembleTrials;
+    this.note(`${doneNote} · simulating index-case ensemble (${N} trials)…`);
+    try {
+      const schedule = transmissionSchedule(this.interventions, result.days + 1, result.indexOffset ?? 0);
+      const sim = await this.pool.simulateEnsemble(result.config, result.days, N, result.config.seed, schedule);
+      // Stale guards: cancelled, modal closed, or a newer result landed.
+      if (sig.aborted || !this.el || this.result !== result) return;
+      if (!sim.perTrial?.length) { this.note(doneNote); return; }
+      this.lastEnsemble = percentileBands(sim.perTrial, ENSEMBLE_PROBS);
+      this.renderOutput();
+      this.note(`${doneNote} · density = ${N}-trial index-case ensemble (predictive spread); saturated band = Bayes parameter uncertainty.`);
+    } catch {
+      // Pool cancelled/respawned mid-flight — leave the chart without the layer.
     }
   }
 
@@ -1532,9 +1595,16 @@ export class R0Modal {
       const s = this.pendingSnapshot;
       this.pendingSnapshot = null;
       if (!s) return;
-      // Slide the model line to the candidate's index-date offset so it aligns
-      // with the raw-day data dots while the offset is being evolved.
-      this.liveModelShift = s.indexOffset ?? 0;
+      // Offset-evolving fit: slide the DATA DOTS to the candidate's index-date
+      // offset (the model stays anchored at sim day 0, fully visible), move
+      // the intervention windows with them (they're keyframed in data days),
+      // and mark where the evolving index date currently sits.
+      if (this.offsetEvolve) {
+        const off = s.indexOffset ?? 0;
+        if (off !== this.liveDotShift) this.liveItvWindows = this.itvWindows(off);
+        this.liveDotShift = off;
+        this.liveIndexMarker = off;
+      }
       this.updateChartData(s.curves);
       const r0El = this.el?.querySelector<HTMLElement>('[data-r0="live-r0"]');
       if (r0El) r0El.textContent = `R₀ = ${s.r0 == null ? '—' : s.r0.toFixed(2)}`;
@@ -1717,9 +1787,14 @@ export class R0Modal {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="output"]')!;
     const applyBtn = this.el!.querySelector<HTMLButtonElement>('[data-r0="apply"]')!;
     applyBtn.disabled = true;
-    // Chart domain includes the prediction horizon so the live line already
-    // draws into the projected future.
-    const days = Math.max(1, ...observed.map((p) => Math.round(p.day))) + this.predictionDays;
+    // Chart domain matches the fit's sim horizon exactly: observed span, plus
+    // the offset search's upper bound when the index date is being evolved
+    // (candidates can slide the data that far right), plus the prediction
+    // horizon — so no candidate curve or dot position ever clips.
+    const offHi = this.offsetEvolve
+      ? Math.max(0, Math.round(Math.max(this.offsetBounds[0], this.offsetBounds[1])))
+      : 0;
+    const days = Math.max(1, ...observed.map((p) => Math.round(p.day))) + offHi + this.predictionDays;
 
     host.innerHTML = `
       <div class="r0-result-grid">
@@ -1770,7 +1845,8 @@ export class R0Modal {
               : ` <span class="r0-muted">(95% CI ${r.offsetCI.ci95[0]}–${r.offsetCI.ci95[1]} · 68% ${r.offsetCI.ci68[0]}–${r.offsetCI.ci68[1]})</span>`)
             : ''}</td>
         </tr>`)
-      + bayesRows(r);
+      + bayesRows(r)
+      + ensembleRows(r, this.lastEnsemble);
 
     host.innerHTML = `
       <div class="r0-result-grid">
@@ -1792,8 +1868,9 @@ export class R0Modal {
         </table>
       </div>
       <div class="r0-chart" data-r0="chart"></div>
+      ${chartHint(this.lastEnsemble, this.lastFan)}
     `;
-    this.createChart(r.observed, r.days, r.population, this.lastRaw, this.lastAdjust, this.lastFan);
+    this.createChart(r.observed, r.days, r.population, this.lastRaw, this.lastAdjust, this.lastFan, this.lastEnsemble);
     this.updateChartData(r.simulated);
   }
 
@@ -1858,6 +1935,7 @@ export class R0Modal {
           this.lastRaw = null;
           this.lastAdjust = null;
           this.lastFan = null;
+          this.lastEnsemble = null;
           this.liveOffsetBand = null;
           this.renderOutput();
           this.note('Loaded fit from history.');
@@ -1885,6 +1963,7 @@ export class R0Modal {
     raw: ObservedPoint[] | null = null,
     adjustBands: { floor: ObservedPoint[]; central: ObservedPoint[]; upper: ObservedPoint[] } | null = null,
     fan: Record<FitCategory, number[][]> | null = null,
+    ensemble: Record<FitCategory, number[][]> | null = null,
   ): void {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="chart"]')!;
     this.plot?.destroy();
@@ -1896,9 +1975,11 @@ export class R0Modal {
 
     // Cache the hook-painted overlays (people-scaled) + the y-range they need.
     // A fresh chart is aligned (dots and model in the same day coordinates);
-    // only onImprove sets a nonzero shift while an offset-evolving fit runs.
-    this.liveModelShift = 0;
+    // only onImprove sets a nonzero dot shift while an offset-evolving fit runs.
+    this.liveDotShift = 0;
+    this.liveIndexMarker = null;
     this.liveFanCols = null;
+    this.liveEnsembleCols = null;
     this.liveAdjustPts = null;
     this.overlayMax = 0;
     if (fan) {
@@ -1908,6 +1989,16 @@ export class R0Modal {
         if (!rows?.length) continue;
         this.liveFanCols[cat] = rows;
         const top = rows[rows.length - 1]; // highest percentile row
+        for (const v of top) if (v > this.overlayMax) this.overlayMax = v;
+      }
+    }
+    if (ensemble) {
+      this.liveEnsembleCols = {};
+      for (const cat of this.liveCats) {
+        const rows = ensemble[cat]?.map((row) => row.map((v) => v * population));
+        if (!rows?.length) continue;
+        this.liveEnsembleCols[cat] = rows;
+        const top = rows[rows.length - 1]; // 95th-percentile row
         for (const v of top) if (v > this.overlayMax) this.overlayMax = v;
       }
     }
@@ -2053,24 +2144,33 @@ export class R0Modal {
     if (!this.plot) return;
     const xs = this.chartXs(this.liveDays);
     const data: (number | null)[][] = [xs];
+    // Offset-evolving fit: the model stays at sim days (unshifted, fully
+    // visible from outbreak day 0) and the DATA DOTS slide right by the
+    // current candidate's offset. Zero outside an evolving fit.
+    const dotShift = this.liveDotShift;
     this.liveCats.forEach((cat, ci) => {
-      // When a percentile fan is cached, the central line is the MEDIAN (p50)
-      // of the ensemble — for N=1 that is exactly the single trial — instead
-      // of the fit's mean curve, so the line always sits inside its bands.
+      // When the Bayes fan is cached, the central line is its MEDIAN (p50) so
+      // the line always sits inside that band. Deliberate: the index-case
+      // ensemble does NOT replace the main line — its median paints as its own
+      // dotted line inside the density layer (paintOverlays), keeping the
+      // legend's "model" label honest.
       const p50 = this.liveFanCols?.[cat]?.[BAND_CENTRAL];
       const arr = p50 ?? curves[cat] ?? [];
       const scale = p50 ? 1 : this.livePop; // fan rows are already people-scaled
-      const shift = p50 ? 0 : this.liveModelShift; // fan renders post-fit, already aligned
-      const sim = xs.map((d) => (arr[Math.min(d + shift, arr.length - 1)] ?? 0) * scale);
+      const sim = xs.map((d) => (arr[Math.min(d, arr.length - 1)] ?? 0) * scale);
       const obs: (number | null)[] = xs.map(() => null);
       for (const pt of this.liveObserved) {
         if (pt.category !== cat) continue;
-        const d = Math.round(pt.day);
+        const d = Math.round(pt.day) + dotShift;
         if (d >= 0 && d <= this.liveDays) obs[d] = pt.value;
       }
       data.push(sim, obs);
       const rawCol = this.liveRawCols[ci];
-      if (rawCol) data.push(rawCol);
+      if (rawCol) {
+        // Greyed raw dots ride with the data: remap the cached raw-day column
+        // by the same shift.
+        data.push(dotShift === 0 ? rawCol : xs.map((d) => (d - dotShift >= 0 ? rawCol[d - dotShift] ?? null : null)));
+      }
     });
     this.plot.setData(data as uPlot.AlignedData);
   }
@@ -2096,8 +2196,9 @@ export class R0Modal {
    *  each category. Runs as a uPlot draw hook; series redraw on top. */
   private paintOverlays(u: uPlot): void {
     const fan = this.liveFanCols;
+    const ens = this.liveEnsembleCols;
     const adj = this.liveAdjustPts;
-    if (!fan && !adj && !this.liveOffsetBand && this.liveItvWindows.length === 0) return;
+    if (!fan && !ens && !adj && !this.liveOffsetBand && this.liveIndexMarker == null && this.liveItvWindows.length === 0) return;
     const ctx = u.ctx;
     ctx.save();
     ctx.beginPath();
@@ -2105,6 +2206,28 @@ export class R0Modal {
     ctx.clip();
     const X = (d: number): number => u.valToPos(d, 'x', true);
     const Y = (v: number): number => u.valToPos(v, 'y', true);
+    // Evolving index-date marker: a vertical amber line where data day 0
+    // currently sits in sim days, updated live as the optimizer mutates the
+    // offset. (Post-fit charts show the grey profile-CI band instead.)
+    if (this.liveIndexMarker != null) {
+      const xm = X(this.liveIndexMarker);
+      ctx.beginPath();
+      ctx.moveTo(xm, u.bbox.top);
+      ctx.lineTo(xm, u.bbox.top + u.bbox.height);
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.75)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const pr = uPlot.pxRatio || 1;
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.95)';
+      ctx.font = `600 ${11 * pr}px sans-serif`;
+      // uPlot leaves ctx.textAlign right-aligned after axis rendering — set
+      // alignment explicitly or the label draws mirrored across the marker.
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(`index date · day ${this.liveIndexMarker}`, xm + 4 * pr, u.bbox.top + u.bbox.height - 6 * pr);
+    }
     // Intervention ramp windows: violet spans (distinct from the grey offset-CI
     // band and the category-colored fills) with a dashed start line and the
     // intervention's name at the top, staggered per row.
@@ -2144,6 +2267,34 @@ export class R0Modal {
       ctx.stroke();
       ctx.setLineDash([]);
     }
+    // Index-case ensemble density — painted FIRST so the Bayes band and the
+    // series draw on top. Layered fills (broad 5–95 wash + darker 25–75 core)
+    // read as a density; the ensemble median is dotted so it can't be
+    // mistaken for the fitted line.
+    if (ens) {
+      for (const cat of this.liveCats) {
+        const rows = ens[cat];
+        if (!rows || rows.length < ENSEMBLE_PROBS.length) continue;
+        const color = CAT_COLOR[cat];
+        const band = (lo: number[], hi: number[], alpha: number): void => {
+          ctx.beginPath();
+          hi.forEach((v, d) => { if (d === 0) ctx.moveTo(X(0), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+          for (let d = lo.length - 1; d >= 0; d--) ctx.lineTo(X(d), Y(lo[d]));
+          ctx.closePath();
+          ctx.fillStyle = withAlpha(color, alpha);
+          ctx.fill();
+        };
+        band(rows[0], rows[4], 0.10); // 5–95
+        band(rows[1], rows[3], 0.14); // 25–75 (stacks on the wash)
+        ctx.beginPath();
+        rows[ENSEMBLE_CENTRAL].forEach((v, d) => { if (d === 0) ctx.moveTo(X(0), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+        ctx.strokeStyle = withAlpha(color, 0.5);
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
     for (const cat of this.liveCats) {
       const color = CAT_COLOR[cat];
       const rows = fan?.[cat];
@@ -2168,16 +2319,19 @@ export class R0Modal {
       }
       const a = adj?.[cat];
       if (a && a.upper.length > 1) {
+        // The envelope vertices are anchored to the data days, so they ride
+        // with the dots during an offset-evolving fit (shift is 0 otherwise).
+        const XS = (d: number): number => X(d + this.liveDotShift);
         ctx.beginPath();
-        a.upper.forEach(([d, v], i) => { if (i === 0) ctx.moveTo(X(d), Y(v)); else ctx.lineTo(X(d), Y(v)); });
-        for (let i = a.floor.length - 1; i >= 0; i--) ctx.lineTo(X(a.floor[i][0]), Y(a.floor[i][1]));
+        a.upper.forEach(([d, v], i) => { if (i === 0) ctx.moveTo(XS(d), Y(v)); else ctx.lineTo(XS(d), Y(v)); });
+        for (let i = a.floor.length - 1; i >= 0; i--) ctx.lineTo(XS(a.floor[i][0]), Y(a.floor[i][1]));
         ctx.closePath();
         ctx.fillStyle = withAlpha(color, 0.08);
         ctx.fill();
         const stroke = (pts: [number, number][], alpha: number, dash: number[]): void => {
           if (pts.length < 2) return;
           ctx.beginPath();
-          pts.forEach(([d, v], i) => { if (i === 0) ctx.moveTo(X(d), Y(v)); else ctx.lineTo(X(d), Y(v)); });
+          pts.forEach(([d, v], i) => { if (i === 0) ctx.moveTo(XS(d), Y(v)); else ctx.lineTo(XS(d), Y(v)); });
           ctx.strokeStyle = withAlpha(color, alpha);
           ctx.lineWidth = 1;
           ctx.setLineDash(dash);
@@ -2226,6 +2380,34 @@ function bayesRows(r: FitResult): string {
     </tr>`;
   }
   return out;
+}
+
+/** 5 / median / 95 readout rows for the index-case ensemble at the projection
+ *  end — the predictive-spread sibling of bayesRows. */
+function ensembleRows(r: FitResult, ens: Record<FitCategory, number[][]> | null): string {
+  if (!ens) return '';
+  let out = '';
+  for (const cat of FIT_CATEGORIES) {
+    const rows = ens[cat];
+    if (!rows?.[0]?.length) continue;
+    if (!r.observed.some((p) => p.category === cat)) continue;
+    const last = rows[0].length - 1;
+    const f = (i: number): string => fmtNum(rows[i][last] * r.population);
+    out += `<tr>
+      <td title="Index-case ensemble at the projection end — the best-fit disease re-simulated from many DIFFERENT starting cells (deterministic sample), percentiles across trials. This is PREDICTIVE spread (stochastic path + index-case location) and is naturally wider than the Bayes band, which only propagates parameter uncertainty.">${CAT_SHORT[cat]} @ day ${last} (ensemble)</td>
+      <td>5% ${f(0)} · <b>median ${f(ENSEMBLE_CENTRAL)}</b> · 95% ${f(ENSEMBLE_PROBS.length - 1)}</td>
+    </tr>`;
+  }
+  return out;
+}
+
+/** One-line chart legend for the painted layers, shown only when present. */
+function chartHint(ens: Record<FitCategory, number[][]> | null, fan: Record<FitCategory, number[][]> | null): string {
+  const parts: string[] = [];
+  if (ens) parts.push('soft density = index-case ensemble (predictive spread: stochastic path + starting cell)');
+  if (fan) parts.push('saturated band = Bayes parameter uncertainty');
+  if (parts.length === 0) return '';
+  return `<p class="r0-chart-hint">${parts.join(' · ')}</p>`;
 }
 
 function fmtParam(name: FitParamName, v: number): string {
@@ -2400,6 +2582,10 @@ const TEMPLATE = `
       <label class="r0-field r0-field-inline" title="After the fit, sample the parameter posterior with a SEEDED Metropolis chain (flat priors within the search bounds), simulate each draw's curve, and shade the 5–95% posterior-predictive band with LOW / CENTRAL / HIGH readouts. This is calibrated parameter-uncertainty propagation — distinct from the index-date profile-likelihood CI (a parameter interval), and it replaces the old uncalibrated index-case ensemble band. Deterministic: same seed → same band. 0 = off.">
         <span>Posterior draws (Bayes band)</span>
         <input class="r0-in tiny" type="number" min="0" max="500" step="10" data-r0="fan" />
+      </label>
+      <label class="r0-field r0-field-inline" title="After the fit, re-simulate the best-fit disease N times, each trial seeding the outbreak at a DIFFERENT board cell (a deterministic sample of index-case locations — the practical equivalent of trying every other cell), under the same fitted R(t) schedule. The 5–95% and 25–75% spread shades the chart as a soft density with a dotted median. This is PREDICTIVE spread (stochastic path + starting point) — naturally wider than the Bayes band, which only propagates parameter uncertainty. Deterministic: same settings → same band. 0 = off.">
+        <span>Index-case ensemble (density)</span>
+        <input class="r0-in tiny" type="number" min="0" max="256" step="8" data-r0="ens" />
       </label>
       <label class="r0-field r0-field-inline" title="Project the fitted model this many days beyond the data's last day — the curve (and the Bayesian band) extends into the future. Deterministic.">
         <span>Predict (days ahead)</span>

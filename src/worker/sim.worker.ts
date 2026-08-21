@@ -176,9 +176,7 @@ async function probeBackends(): Promise<void> {
       ? { ok: false, reason: wasmBlockReason(cfg) }
       : { ok: true };
   let gpuAvail: import('../types').BackendAvailability;
-  if (txSchedule) {
-    gpuAvail = { ok: false, reason: 'the fitted R(t) schedule runs on the CPU/WASM engines — clear it (chart chip ✕) to use GPU' };
-  } else if (!gpuSupported()) {
+  if (!gpuSupported()) {
     gpuAvail = {
       ok: false,
       reason: self.isSecureContext
@@ -231,10 +229,6 @@ function rebuild(config: SimConfig): void {
   lastFrame = performance.now();
 
   if (requestedBackend === 'gpu') {
-    if (txSchedule) {
-      buildCpuEngine(config, topo, 'the fitted R(t) schedule runs on the CPU/WASM engines — clear it (chart chip ✕) to use GPU');
-      return;
-    }
     if (!gpuSupported()) {
       // WebGPU is a secure-context API: on a plain-http origin navigator.gpu
       // does not exist at all, and no browser flag can change that.
@@ -249,7 +243,7 @@ function rebuild(config: SimConfig): void {
     }
     gpuChain = gpuChain
       .then(async () => {
-        const g = await GpuEngine.create(config, topo);
+        const g = await GpuEngine.create(config, topo, txSchedule);
         // A newer rebuild may have raced us; only install if still current.
         if (currentConfig === config && requestedBackend === 'gpu') {
           gpu = g;

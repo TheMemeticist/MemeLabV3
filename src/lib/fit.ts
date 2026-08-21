@@ -686,6 +686,11 @@ export interface FitResult {
 export const BAND_PROBS = [5, 50, 95];
 export const BAND_CENTRAL = 1; // index of the central row in BAND_PROBS order
 
+/** Index-case ensemble density percentiles: broad 5–95 wash, darker 25–75
+ *  core, dotted median — layered so the spread reads as a density. */
+export const ENSEMBLE_PROBS = [5, 25, 50, 75, 95];
+export const ENSEMBLE_CENTRAL = 2; // index of the median row in ENSEMBLE_PROBS order
+
 export async function runFit(req: FitRequest): Promise<FitResult> {
   const maxObsDay = Math.max(1, ...req.observed.map((p) => Math.round(p.day)));
   // With an evolved index offset the sim horizon must cover the data at the

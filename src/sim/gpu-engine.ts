@@ -18,12 +18,14 @@
 // defenses word carries the flag bits (0..1) plus the lockdown-compliance bit
 // (bit 8). Seven storage bindings total; never exceed eight here.
 //
-// Determinism family: the GPU engine is deterministic per (config, seed) but
-// runs the classic per-cell sweep semantics with its own RNG — its
-// trajectories are their own family, NOT bit-comparable with the TS/WASM
+// Determinism family: the GPU engine is deterministic per (config, seed,
+// txSchedule) but runs the classic per-cell sweep semantics with its own RNG —
+// its trajectories are their own family, NOT bit-comparable with the TS/WASM
 // engines (which are bit-identical to each other). The census-conservation
 // invariant (ΣS..D = N) holds exactly. The compatibility gate routes mutation
-// and extinction-reseed configs back to the CPU backends.
+// and extinction-reseed configs back to the CPU backends. The fitted R(t)
+// transmission schedule rides the per-tick uniform (Tick.tx) and scales the
+// attack rate only, exactly where the CPU engines apply txMul.
 //
 // Voronoi (geometry 4) rides the same single tables buffer as the lattice
 // parity tables, reinterpreted as per-cell CSR: seg.x = base of the offsets
@@ -93,8 +95,11 @@ struct Params {
 }
 
 // tick = absolute tick (RNG streams, quarantine expiry); row = batch-relative
-// stats row (the stats buffer holds one batch window plus the carry row 0).
-struct Tick { tick: u32, row: u32 }
+// stats row (the stats buffer holds one batch window plus the carry row 0);
+// tx = this tick's R(t) transmission multiplier (fitted intervention schedule,
+// clamped to its last entry; 1 when no schedule) — applied to the attack rate
+// only, exactly where the CPU engines apply txMul.
+struct Tick { tick: u32, row: u32, tx: f32 }
 
 // Packed cell words — see the storage-binding budget note at the top.
 // cells:    bits 0..7 = SEIR state, bits 8.. = infection-age counter
@@ -184,6 +189,9 @@ fn tick_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (s == ST_S) {
     var p_inf = 0.0;
+    // Per-tick transmission multiplier (fitted R(t) schedule) scales the
+    // attack rate only — mirrors the TS engines' baseAttack = attack * txMul.
+    let atk = P.attack * T.tx;
     var prot = P.prot_mask[defenses[i] & 3u];
     if (self_quar) { prot = prot * P.q_prot; }
     if (P.geometry == 3u) {
@@ -191,7 +199,7 @@ fn tick_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let i_count = f32(atomicLoad(&stats[T.row * STRIDE + 2u]));
       if (i_count > 0.0) {
         let mob_keep = select(1.0, 1.0 - P.mobility, P.lockdown_on != 0u);
-        let p = P.attack * P.trans_mul * P.q_src * prot;
+        let p = atk * P.trans_mul * P.q_src * prot;
         if (p > 0.0) {
           p_inf = mob_keep * (1.0 - pow(1.0 - p, i_count * 2.0 / f32(P.n)));
         }
@@ -210,7 +218,7 @@ fn tick_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           if (P.quarantine_on != 0u && q_active(quarIn[j], tick)) { src = src * P.q_src; }
           src = src * P.trans_mul;
           if (P.lockdown_on != 0u && (dj & COMPLIANT_BIT) != 0u) { src = src * (1.0 - P.mobility); }
-          miss = miss * (1.0 - P.attack * src * prot);
+          miss = miss * (1.0 - atk * src * prot);
         }
       }
       p_inf = 1.0 - miss;
@@ -226,7 +234,7 @@ fn tick_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           if (P.quarantine_on != 0u && q_active(quarIn[j], tick)) { src = src * P.q_src; }
           src = src * P.trans_mul;
           if (P.lockdown_on != 0u && (dj & COMPLIANT_BIT) != 0u) { src = src * (1.0 - P.mobility); }
-          miss = miss * (1.0 - P.attack * src * prot);
+          miss = miss * (1.0 - atk * src * prot);
         }
       }
       p_inf = 1.0 - miss;
@@ -359,6 +367,12 @@ export class GpuEngine {
   private lastDefenses!: Uint8Array;
   private lastQuarantined!: Uint8Array;
   private ring: Uint32Array<ArrayBuffer> | null = null;
+  // f32 view over the same ring buffer — the Tick uniform's tx word.
+  private ringF: Float32Array | null = null;
+  // Fitted R(t) transmission schedule (per-tick multiplier, clamped to its
+  // last entry — tx_mul_now semantics). Arrives at reset; patchConfig leaves
+  // it unchanged (schedule changes always come via a full rebuild).
+  private txSchedule: number[] | null = null;
 
   tick = 0;
   history: LongHistory = new LongHistory();
@@ -378,7 +392,7 @@ export class GpuEngine {
 
   /** Async constructor — adapter/device acquisition and first upload. Throws
    *  when WebGPU is unavailable; the worker falls back to a CPU backend. */
-  static async create(config: SimConfig, prebuiltTopo?: VoronoiTopology | null): Promise<GpuEngine> {
+  static async create(config: SimConfig, prebuiltTopo?: VoronoiTopology | null, txSchedule?: number[] | null): Promise<GpuEngine> {
     if (!gpuSupported()) throw new Error('WebGPU not available');
     if (!gpuCompatible(config)) throw new Error('config outside gpu engine feature space');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -394,7 +408,7 @@ export class GpuEngine {
     const e = new GpuEngine();
     e.device = device;
     e.buildPipeline();
-    e.reset(config, prebuiltTopo);
+    e.reset(config, prebuiltTopo, txSchedule);
     return e;
   }
 
@@ -419,9 +433,10 @@ export class GpuEngine {
     });
   }
 
-  reset(config: SimConfig, prebuiltTopo?: VoronoiTopology | null): void {
+  reset(config: SimConfig, prebuiltTopo?: VoronoiTopology | null, txSchedule?: number[] | null): void {
     if (!gpuCompatible(config)) throw new Error('config outside gpu engine feature space');
     this.config = config;
+    this.txSchedule = txSchedule && txSchedule.length > 0 ? txSchedule : null;
     const device = this.device;
     const n = config.size * config.size;
     this.n = n;
@@ -684,7 +699,7 @@ export class GpuEngine {
           { binding: 5, resource: { buffer: b.stats } },
           { binding: 6, resource: { buffer: b.tables } },
           { binding: 7, resource: { buffer: b.params } },
-          { binding: 8, resource: { buffer: b.tickRing, offset: 0, size: 8 } },
+          { binding: 8, resource: { buffer: b.tickRing, offset: 0, size: 16 } },
         ],
       });
     this.bgPing = mk(b.cellsA, b.cellsB, b.quarA, b.quarB);
@@ -761,12 +776,20 @@ export class GpuEngine {
     const zero = new Uint32Array(n * STATS_STRIDE);
     device.queue.writeBuffer(this.bufs.stats, STATS_STRIDE * 4, zero);
 
-    // Per-tick uniform ring: absolute tick (RNG + expiry) and batch-relative
-    // stats row, at the 256-byte dynamic-offset stride.
-    if (!this.ring) this.ring = new Uint32Array((MAX_BATCH * 256) / 4);
+    // Per-tick uniform ring: absolute tick (RNG + expiry), batch-relative
+    // stats row, and this tick's R(t) multiplier, at the 256-byte
+    // dynamic-offset stride. Schedule indexes the ABSOLUTE tick and clamps to
+    // its last entry — identical to the CPU engines' tx_mul_now.
+    if (!this.ring) {
+      this.ring = new Uint32Array((MAX_BATCH * 256) / 4);
+      this.ringF = new Float32Array(this.ring.buffer);
+    }
+    const sched = this.txSchedule;
     for (let r = 0; r < n; r++) {
-      this.ring[(r * 256) / 4] = startTick + r;
+      const abs = startTick + r;
+      this.ring[(r * 256) / 4] = abs;
       this.ring[(r * 256) / 4 + 1] = r;
+      this.ringF![(r * 256) / 4 + 2] = sched ? sched[Math.min(abs, sched.length - 1)] : 1;
     }
     device.queue.writeBuffer(this.bufs.tickRing, 0, this.ring, 0, (n * 256) / 4);
 

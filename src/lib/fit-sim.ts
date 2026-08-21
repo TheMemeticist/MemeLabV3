@@ -219,7 +219,9 @@ export function bestTrialSeed(
     for (let d = 0; d < len; d++) {
       const ed = (deaths[k][d] - meanD[d]) * dScale;
       const ei = (infs[k][d] - meanI[d]) * iScale;
-      score += ed * ed + ei * ei;
+      // Deaths weigh 3×: they are what users read the fit against, and their
+      // small counts leave the most visible per-trial wiggle around the mean.
+      score += 3 * ed * ed + ei * ei;
     }
     if (score < bestScore) { bestScore = score; bestK = k; }
   }

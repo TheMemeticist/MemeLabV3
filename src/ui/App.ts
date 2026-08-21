@@ -187,6 +187,7 @@ export class App {
       if (this.fitSchedule) this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
       this.chart.setFitWindows(this.fitWindows);
       if (this.fitMeta?.overlay) this.chart.setFitOverlay(this.fitMeta.overlay, this.fitMeta.cells);
+      if (this.fitMeta) this.chart.setFitOrigin(this.fitMeta.offset);
     }
     this.refreshFitChip();
     this.renderFitPanel();
@@ -748,6 +749,7 @@ export class App {
     this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
     this.chart.setFitWindows(this.fitWindows);
     this.chart.setFitOverlay(extras.overlay, this.fitMeta.cells);
+    this.chart.setFitOrigin(extras.offset);
     this.persistFitRt();
     this.refreshFitChip();
     this.renderFitPanel();
@@ -758,6 +760,7 @@ export class App {
     const notes: string[] = [];
     if (cfg.size !== liveSize) notes.push(`grid → ${cfg.size}×${cfg.size} (the fit's grid — timing is size-dependent)`);
     notes.push('replaying the fit’s representative trial (dashed line = fitted curve)');
+    if (extras.offset > 0) notes.push(`the fitted index date means your data's day 0 = live day ${extras.offset} (marked on the chart)`);
     if (extras.schedule) notes.push('interventions as the fitted R(t) schedule — toggle them in the Interventions panel');
     this.toast(`Applied fitted outbreak: ${notes.join(' · ')}.`);
   }
@@ -869,6 +872,7 @@ export class App {
     this.send({ cmd: 'setSchedule', schedule: null });
     this.chart.setFitWindows([]);
     this.chart.setFitOverlay(null);
+    this.chart.setFitOrigin(null);
     this.persistFitRt();
     this.refreshFitChip();
     this.renderFitPanel();

@@ -2434,6 +2434,7 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 .r0-params-table th, .r0-params-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 .r0-params-table th { color: var(--text-muted); font-weight: 600; }
 .r0-chart { width: 100%; }
+.r0-chart-hint { margin: 6px 2px 0; font-size: 11px; line-height: 1.4; color: var(--text-muted); }
 /* Estimator chart legend: compact, centered, and never clipping the value readout. */
 .r0-chart .u-legend { justify-content: center; }
 .r0-chart .u-legend th { white-space: nowrap; }

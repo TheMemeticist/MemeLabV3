@@ -95,9 +95,11 @@ export class FitPool {
   }
 
   /** Run N trials each from a different index case; resolves with `perTrial`
-   *  populated (for percentile/fan-chart aggregation). */
-  simulateEnsemble(config: SimConfig, days: number, N: number, seed: number): Promise<SimResult> {
-    return this.enqueue({ id: this.nextId++, config, days, K: N, seed, ensemble: true });
+   *  populated (for percentile/fan-chart aggregation). `schedule` is the same
+   *  per-tick R(t) multiplier the fit ran under, so the ensemble spreads the
+   *  ACTUAL fitted model, interventions included. */
+  simulateEnsemble(config: SimConfig, days: number, N: number, seed: number, schedule?: number[]): Promise<SimResult> {
+    return this.enqueue({ id: this.nextId++, config, days, K: N, seed, schedule, ensemble: true });
   }
 
   /** Representative-trial seed for Apply: resolves with `bestSeed` set to the
