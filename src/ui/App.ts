@@ -394,11 +394,11 @@ export class App {
     this.controls.buildLeft(left);
     this.controls.buildRight(right);
 
-    // Fitted-R(t) block sits at the top of the Interventions panel so applied
-    // fit interventions are visible (and toggleable) beside the mechanical
-    // defaults. Hidden until a fit is applied.
+    // Fitted interventions render at the top of the Interventions panel as
+    // cards identical to the mechanical ones (display:contents so they sit in
+    // the stack's own flow). Hidden until a fit is applied.
     this.fitPanel = document.createElement('div');
-    this.fitPanel.className = 'fit-itv-block';
+    this.fitPanel.className = 'fit-itv-cards';
     this.fitPanel.hidden = true;
     left.querySelector('.intervention-stack')?.prepend(this.fitPanel);
 
@@ -794,10 +794,11 @@ export class App {
     this.handleReset();
   }
 
-  /** Fitted-interventions block inside the Interventions side panel: lists the
-   *  estimator's specs (the SHARED store) with toggles while a fit is applied,
-   *  so the fitted R(t) windows are visible and controllable where the
-   *  mechanical intervention defaults live. */
+  /** Fitted interventions in the Interventions side panel, rendered with the
+   *  EXACT same card markup as the mechanical Mask/Vaccine/Lockdown/Quarantine
+   *  cards (panel-head, rate badge, switch, collapsible body) so they read as
+   *  interchangeable. Backed by the estimator's SHARED store; the switch flips
+   *  `enabled` and rebuilds the R(t) schedule. */
   private renderFitPanel(): void {
     if (!this.fitPanel) return;
     const specs = this.interventions;
@@ -807,23 +808,36 @@ export class App {
       return;
     }
     this.fitPanel.hidden = false;
-    const rows = specs.map((iv, idx) => {
+    const ICONS: Record<string, string> = { mask: '😷', vaccine: '💉', lockdown: '🚧', quarantine: '🚷' };
+    const cards = specs.map((iv, idx) => {
       const red = Math.round(effectiveReduction(iv) * 100);
       const ticks = (iv.keyframes ?? []).map((k) => k.tick);
-      const span = ticks.length
-        ? `day ${Math.min(...ticks) + this.fitMeta!.offset}+`
-        : 'whole run';
+      const off = this.fitMeta!.offset;
+      const span = ticks.length ? `day ${Math.min(...ticks) + off}–${Math.max(...ticks) + off}` : 'whole run';
+      const label = escapeHtml(iv.label);
       return `
-        <label class="fit-itv-row">
-          <input type="checkbox" data-fit-itv="${idx}" ${iv.enabled ? 'checked' : ''} />
-          <span class="fit-itv-name">${escapeHtml(iv.label)}</span>
-          <span class="fit-itv-sub">−${red}% transmission · ${span}</span>
-        </label>`;
+      <section class="panel collapsible intervention-item" aria-label="${label} (fitted)" data-collapsed="true" data-fit-card="${idx}">
+        <button type="button" class="panel-head" aria-expanded="false" data-fit-head="${idx}">
+          <h3>${label} <span class="rate-badge">${red}%</span></h3>
+          <span class="panel-summary">fitted R(t) · ${span}</span>
+          <span class="panel-icon" aria-hidden="true">${ICONS[iv.intervention] ?? '📈'}</span>
+          <label class="panel-switch" data-stop title="Enable / disable ${label}">
+            <input type="checkbox" data-fit-itv="${idx}" aria-label="${label} enabled" ${iv.enabled ? 'checked' : ''} />
+            <span class="panel-switch-track" aria-hidden="true"></span>
+          </label>
+          <span class="panel-chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body">
+          <p class="fit-card-note">From the R₀ Estimator — replayed as the fitted time-varying transmission schedule: −${red}% transmission over ${span}. Toggling restarts the run so the schedule applies from day 0.</p>
+          <button type="button" class="btn ghost fit-card-edit" data-fit-edit="${idx}">Edit in R₀ Estimator</button>
+        </div>
+      </section>`;
     }).join('');
-    this.fitPanel.innerHTML = `
-      <div class="fit-itv-head" data-tip="Interventions from the R₀ Estimator, replayed as a time-varying transmission schedule R(t) — not the mechanical toggles below. Toggling restarts the run.">📈 Fitted R(t) interventions</div>
-      ${rows}`;
+    this.fitPanel.innerHTML = cards;
     this.fitPanel.querySelectorAll<HTMLInputElement>('[data-fit-itv]').forEach((box) => {
+      // Keep the head's collapse handler from firing on switch clicks (same
+      // data-stop contract as the mechanical cards).
+      (box.closest('[data-stop]') as HTMLElement)?.addEventListener('click', (e) => e.stopPropagation());
       box.addEventListener('change', () => {
         const iv = this.interventions[Number(box.dataset['fitItv'])];
         if (!iv) return;
@@ -834,6 +848,17 @@ export class App {
         this.renderFitPanel();
         this.toast(`${iv.label} ${box.checked ? 'restored to' : 'removed from'} the fitted R(t) schedule — run restarted.`);
       });
+    });
+    this.fitPanel.querySelectorAll<HTMLButtonElement>('[data-fit-head]').forEach((head) => {
+      head.addEventListener('click', () => {
+        const card = head.closest('.intervention-item') as HTMLElement;
+        const collapsed = card.dataset['collapsed'] !== 'false';
+        card.dataset['collapsed'] = collapsed ? 'false' : 'true';
+        head.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
+      });
+    });
+    this.fitPanel.querySelectorAll<HTMLButtonElement>('[data-fit-edit]').forEach((btn) => {
+      btn.addEventListener('click', () => this.r0Modal.open());
     });
   }
 

@@ -674,6 +674,12 @@ export interface FitResult {
    *  Parameter-uncertainty propagation (calibrated), distinct from the
    *  index-date profile-likelihood CI. Null when not requested/aborted. */
   bayes?: Record<FitCategory, number[][]> | null;
+  /** Held-out seed check: the winner re-simulated at K trials on a DIFFERENT
+   *  seed family (fresh RNG draws; for voronoi a fresh topology too). All
+   *  candidates are compared on common random numbers by design — this guards
+   *  against the optimizer exploiting those specific K draws. A holdout loss
+   *  far above the fit loss means the fit is riding its seed set: raise K. */
+  holdout?: { loss: number } | null;
 }
 
 /** Posterior-predictive band percentiles: LOW / CENTRAL / HIGH. */
@@ -944,6 +950,17 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   const ciEval = (values: number[]) => evalAt(values, req.K).then((r) => ({ loss: r.loss, r0: r.r0 }));
   const { ci: r0CI, kind: r0CIKind } = await profileR0CI({ values: bestValues, loss: bestLossFinal }, req, ciEval);
 
+  // Held-out seed validation of the winner (see FitResult.holdout).
+  let holdout: { loss: number } | null = null;
+  try {
+    if (!req.signal?.aborted) {
+      const hv = await req.simulate(bestConfig, days, req.K, (baseSeed ^ 0x484f4c44) >>> 0, schedFor(bestOffset));
+      holdout = { loss: lossOf(shiftedObserved, hv.curves, req.population, req.loss) };
+    }
+  } catch {
+    holdout = null;
+  }
+
   return {
     params: req.params.map((p, i) => ({
       name: p.name,
@@ -965,6 +982,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     indexOffset: offsetDef ? bestOffset : undefined,
     offsetCI,
     bayes,
+    holdout,
   };
 }
 

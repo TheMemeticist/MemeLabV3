@@ -1784,6 +1784,7 @@ export class R0Modal {
           <span class="r0-gof-rating"><span class="r0-gof-badge ${rating.cls}">${rating.label}</span></span>
           <span class="r0-gof-bar"><span style="width:${barPct.toFixed(1)}%"></span></span>
           <span class="r0-metric-sub">R² ${r.gof.r2.toFixed(3)} · RMSE ${fmtNum(r.gof.rmse)}</span>
+          ${holdoutLine(r)}
         </div>
         <table class="r0-params-table">
           <thead><tr><th>Fitted parameter</th><th>Value</th></tr></thead>
@@ -2246,6 +2247,20 @@ function fmtLoss(v: number): string {
   const a = Math.abs(v);
   if (a >= 1e3) return (v < 0 ? '-' : '') + fmtNum(a);
   return v.toFixed(2);
+}
+
+// Held-out seed check line: the winner was re-simulated on a fresh seed family
+// (candidates are compared on COMMON random numbers by design — fair, cached,
+// deterministic — so this is the guard against exploiting those K draws).
+// Flag when the holdout loss is meaningfully worse than the fit loss.
+function holdoutLine(r: FitResult): string {
+  if (!r.holdout) return '';
+  const h = r.holdout.loss;
+  const f = r.loss;
+  // Poisson NLL can be negative; compare on the difference scaled by |fit|.
+  const worse = Number.isFinite(h) && Number.isFinite(f) && (h - f) > 0.5 * Math.max(1, Math.abs(f));
+  const tip = 'The best-fit disease re-simulated at K trials on a DIFFERENT seed set (fresh RNG draws; a fresh topology on Voronoi). Candidates are compared on shared seeds (common random numbers) for fair, deterministic ranking — this checks the winner generalizes beyond those specific draws. A much worse holdout loss means the fit was riding its seed set: raise K (trials).';
+  return `<span class="r0-metric-sub ${worse ? 'r0-holdout-warn' : ''}" data-tip="${tip}">held-out seeds: loss ${fmtLoss(h)} (fit ${fmtLoss(f)})${worse ? ' ⚠ raise K' : ' ✓'}</span>`;
 }
 
 // Turns the R² goodness-of-fit number into a plain-language, color-coded rating
