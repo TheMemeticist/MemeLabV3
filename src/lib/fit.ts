@@ -62,6 +62,8 @@ export interface SimResult {
   rNaught: number | null;
   /** Per-trial curves — present only for ensemble (fan-chart) simulations. */
   perTrial?: SimCurves[];
+  /** Representative trial seed — present only for pickSeed simulations. */
+  bestSeed?: number;
 }
 
 export type LossType = 'poisson' | 'mse';
@@ -1610,6 +1612,28 @@ export function syncSpecsWithToggle(
  *  day t − offsetDays. Undefined when nothing is active (or every day is a
  *  no-op) — callers skip the scheduled path, keeping unscheduled runs
  *  bit-identical. */
+/** Chart-shading spans for the enabled keyframed interventions, in sim-day
+ *  coordinates (`offset` maps data days → sim days). A span whose end state
+ *  never keyframes back to zero effect extends to +Infinity. Shared by the
+ *  estimator's live chart and the main chart's applied-fit windows. */
+export function interventionWindows(
+  interventions: InterventionSpec[],
+  offset: number,
+): { from: number; to: number; label: string }[] {
+  return interventions
+    .filter((iv) => iv.enabled && (iv.keyframes?.length ?? 0) > 0)
+    .map((iv) => {
+      const ticks = iv.keyframes!.map((k) => k.tick);
+      const holds = effectiveReductionAt(iv, Number.MAX_SAFE_INTEGER) > 0;
+      return {
+        from: Math.min(...ticks) + offset,
+        to: holds ? Number.POSITIVE_INFINITY : Math.max(...ticks) + offset,
+        label: iv.label,
+      };
+    })
+    .filter((w) => Number.isFinite(w.from));
+}
+
 export function transmissionSchedule(
   interventions: InterventionSpec[],
   len: number,

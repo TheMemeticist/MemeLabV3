@@ -1697,6 +1697,35 @@ button.panel-head:focus-visible { outline-offset: -2px; }
 }
 .share-pop.share-out { animation: fade-out 150ms ease forwards; }
 
+/* Fitted-R(t) interventions block — top of the Interventions side panel. */
+.fit-itv-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-radius: var(--radius-md);
+  background: rgba(245, 158, 11, 0.08);
+}
+.fit-itv-block[hidden] { display: none; }
+.fit-itv-head {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+.fit-itv-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  align-items: center;
+  cursor: pointer;
+  font-size: 12px;
+}
+.fit-itv-row input { grid-row: span 2; accent-color: rgb(245, 158, 11); }
+.fit-itv-name { font-weight: 600; }
+.fit-itv-sub { font-size: 10.5px; color: var(--text-muted); }
+
 /* Engine backend picker — anchored under the toolbar ⚙/⚡ button. */
 .backend-pop {
   position: fixed;

@@ -416,6 +416,24 @@ export interface FitWindow {
   label: string;
 }
 
+/** Everything beyond the config the live sim needs to reproduce a fit:
+ *  the R(t) schedule + window spans, the fitted index offset and sim horizon
+ *  (so toggling interventions later can rebuild the schedule), the
+ *  representative trial seed, and the fitted mean curves for the live-chart
+ *  overlay (per-capita fractions, length days+1). */
+export interface FitApplyExtras {
+  schedule: number[] | null;
+  windows: FitWindow[];
+  offset: number;
+  days: number;
+  seed: number;
+  overlay: {
+    cumulative_infections: number[];
+    cumulative_deaths: number[];
+    active_infections: number[];
+  } | null;
+}
+
 export type WorkerCommand =
   | { cmd: 'init'; config: SimConfig }
   | { cmd: 'play'; tps: number }
@@ -455,10 +473,16 @@ export interface FitWorkerCommand {
    *  per-trial curves (for percentile bands) alongside nothing else — the
    *  `curves` field then carries trial 0 for convenience. */
   ensemble?: boolean;
+  /** Re-run the K trials and return the representative trial's seed (the one
+   *  closest to the K-mean) as `bestSeed` — used by the estimator's Apply so
+   *  the live sim replays a real fit trial instead of a fresh random draw. */
+  pickSeed?: boolean;
 }
 
 export interface FitWorkerResult {
   id: number;
+  /** Present only for pickSeed commands. */
+  bestSeed?: number;
   /** Per-capita fractions in [0..1], averaged over K trials, length days + 1. */
   curves: {
     cumulative_infections: number[];

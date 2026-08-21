@@ -31,6 +31,7 @@ function toResult(r: FitWorkerResult): SimResult {
     },
     rNaught: r.rNaught,
     perTrial: r.perTrial,
+    bestSeed: r.bestSeed,
   };
 }
 
@@ -54,7 +55,7 @@ function cacheKey(cmd: FitWorkerCommand): string {
   const g = cmd.config.strain;
   const q = (x: number, p = 1e4) => Math.round(x * p) / p;
   return [
-    cmd.ensemble ? 'E' : 'M', // ensemble and mean results must never collide
+    cmd.pickSeed ? 'S' : cmd.ensemble ? 'E' : 'M', // modes must never collide
     scheduleHash(cmd.schedule),
     cmd.days,
     cmd.K,
@@ -97,6 +98,12 @@ export class FitPool {
    *  populated (for percentile/fan-chart aggregation). */
   simulateEnsemble(config: SimConfig, days: number, N: number, seed: number): Promise<SimResult> {
     return this.enqueue({ id: this.nextId++, config, days, K: N, seed, ensemble: true });
+  }
+
+  /** Representative-trial seed for Apply: resolves with `bestSeed` set to the
+   *  trial (of the fit's own K) whose curves sit closest to the K-mean. */
+  bestSeed(config: SimConfig, days: number, K: number, seed: number, schedule?: number[]): Promise<SimResult> {
+    return this.enqueue({ id: this.nextId++, config, days, K, seed, schedule, pickSeed: true });
   }
 
   private enqueue(cmd: FitWorkerCommand): Promise<SimResult> {

@@ -1,4 +1,4 @@
-import type { BackendMessage, BackendProbeMessage, CostConfig, EngineBackend, FitWindow, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
+import type { BackendMessage, BackendProbeMessage, CostConfig, EngineBackend, FitApplyExtras, FitWindow, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { findPreset, baseSimConfig, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
 import { Petri } from './Petri';
 import { Chart, type ChartView, type CostChartData } from './Chart';
@@ -12,7 +12,7 @@ import { ShareMenu } from './ShareMenu';
 import { BackendMenu } from './BackendMenu';
 import { installTooltip } from './Tooltip';
 import { read, write } from '../lib/storage';
-import { migrateInterventionSpecs, syncSpecsWithToggle } from '../lib/fit';
+import { effectiveReduction, interventionWindows, migrateInterventionSpecs, syncSpecsWithToggle, transmissionSchedule } from '../lib/fit';
 import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
 import { computeLedger, costConfigFromProfile, findCurrency, formatMoney } from '../lib/cost';
 import { appendLongDelta, emptyLongStats } from '../sim/long-history';
@@ -50,6 +50,12 @@ export class App {
   private fitSchedule: number[] | null = null;
   private fitWindows: FitWindow[] = [];
   private fitChip: HTMLButtonElement | null = null;
+  // Fit metadata that outlives the schedule itself: the fitted index offset +
+  // sim horizon (so side-panel toggles can rebuild the schedule from the
+  // shared intervention store), the applied grid's cell count, and the fitted
+  // mean curves for the chart overlay.
+  private fitMeta: { offset: number; days: number; cells: number; overlay: FitApplyExtras['overlay'] } | null = null;
+  private fitPanel: HTMLElement | null = null;
   private themeBtn!: HTMLButtonElement;
   private shareBtn!: HTMLButtonElement;
   private shareMenu!: ShareMenu;
@@ -166,17 +172,24 @@ export class App {
     };
     // Backend preference travels before init so the first build uses it.
     this.send({ cmd: 'setBackend', backend: this.requestedBackend });
-    // Restore an applied fitted R(t) schedule (and its chart windows) so a
+    // Restore an applied fit (R(t) schedule, windows, overlay, meta) so a
     // reload keeps reproducing the fitted outbreak instead of silently
     // diverging from what the estimator showed.
-    const fitRt = read<{ schedule: number[] | null; windows: FitWindow[] } | null>('fitRt', null);
-    if (fitRt?.schedule?.length) {
-      this.fitSchedule = fitRt.schedule;
+    const fitRt = read<{
+      schedule: number[] | null;
+      windows: Array<{ from: number; to: number | null; label: string }>;
+      meta?: { offset: number; days: number; cells: number; overlay: FitApplyExtras['overlay'] } | null;
+    } | null>('fitRt', null);
+    if (fitRt && (fitRt.schedule?.length || fitRt.meta)) {
+      this.fitSchedule = fitRt.schedule?.length ? fitRt.schedule : null;
       this.fitWindows = (fitRt.windows ?? []).map((w) => ({ ...w, to: w.to === null ? Number.POSITIVE_INFINITY : w.to }));
-      this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
+      this.fitMeta = fitRt.meta ?? null;
+      if (this.fitSchedule) this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
       this.chart.setFitWindows(this.fitWindows);
+      if (this.fitMeta?.overlay) this.chart.setFitOverlay(this.fitMeta.overlay, this.fitMeta.cells);
     }
     this.refreshFitChip();
+    this.renderFitPanel();
     this.send({ cmd: 'init', config: initialConfig });
     if ((initialConfig.geometry ?? 'square') !== 'voronoi') {
       this.petri.setVoronoiTopology(null);
@@ -380,6 +393,14 @@ export class App {
     });
     this.controls.buildLeft(left);
     this.controls.buildRight(right);
+
+    // Fitted-R(t) block sits at the top of the Interventions panel so applied
+    // fit interventions are visible (and toggleable) beside the mechanical
+    // defaults. Hidden until a fit is applied.
+    this.fitPanel = document.createElement('div');
+    this.fitPanel.className = 'fit-itv-block';
+    this.fitPanel.hidden = true;
+    left.querySelector('.intervention-stack')?.prepend(this.fitPanel);
 
     // Toolbar buttons
     this.toolbarBtns = {};
@@ -711,36 +732,44 @@ export class App {
    *  process, so Apply installs all of it; the previous genes-only apply left
    *  the live grid/seeding in place and the death curve could lag the fit by
    *  the grid-size ratio (e.g. 2× slower on a 2×-side board). */
-  private applyFit(fitted: SimConfig, extras: { schedule: number[] | null; windows: FitWindow[] }): void {
+  private applyFit(fitted: SimConfig, extras: FitApplyExtras): void {
     const liveSize = this.controls.config().size;
     const cfg = structuredClone(fitted);
+    // The fitted mean averages K trials at derived seeds — the base seed is a
+    // world the fit never simulated. Replay the representative trial instead,
+    // so the live deaths curve tracks the overlay (bit-exact on CPU/WASM).
+    cfg.seed = extras.seed >>> 0;
     this.controls.hydrate(cfg, this.controls.currentPresetId());
     this.prevConfig = structuredClone(cfg);
 
     this.fitSchedule = extras.schedule;
     this.fitWindows = extras.schedule ? extras.windows : [];
+    this.fitMeta = { offset: extras.offset, days: extras.days, cells: cfg.size * cfg.size, overlay: extras.overlay };
     this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
     this.chart.setFitWindows(this.fitWindows);
+    this.chart.setFitOverlay(extras.overlay, this.fitMeta.cells);
     this.persistFitRt();
     this.refreshFitChip();
+    this.renderFitPanel();
 
     // Fresh run from the fitted world's day 0 (handleReset re-sends the config).
     this.handleReset();
 
     const notes: string[] = [];
     if (cfg.size !== liveSize) notes.push(`grid → ${cfg.size}×${cfg.size} (the fit's grid — timing is size-dependent)`);
-    notes.push('patient-zero start');
-    notes.push(extras.schedule ? 'interventions replayed as the fitted R(t) schedule (shaded on the chart)' : 'interventions off (as fitted)');
+    notes.push('replaying the fit’s representative trial (dashed line = fitted curve)');
+    if (extras.schedule) notes.push('interventions as the fitted R(t) schedule — toggle them in the Interventions panel');
     this.toast(`Applied fitted outbreak: ${notes.join(' · ')}.`);
   }
 
-  /** Persist the applied schedule/windows (JSON has no Infinity — open-ended
-   *  windows round-trip as null in `to`). */
+  /** Persist the applied schedule/windows/meta (JSON has no Infinity —
+   *  open-ended windows round-trip as null in `to`). */
   private persistFitRt(): void {
-    if (this.fitSchedule) {
+    if (this.fitSchedule || this.fitMeta) {
       write('fitRt', {
         schedule: this.fitSchedule,
         windows: this.fitWindows.map((w) => ({ ...w, to: Number.isFinite(w.to) ? w.to : null })),
+        meta: this.fitMeta,
       });
     } else {
       write('fitRt', null);
@@ -748,18 +777,78 @@ export class App {
   }
 
   private refreshFitChip(): void {
-    if (this.fitChip) this.fitChip.hidden = this.fitSchedule === null;
+    if (this.fitChip) this.fitChip.hidden = this.fitSchedule === null && this.fitMeta === null;
+  }
+
+  /** Rebuild the R(t) schedule from the SHARED intervention store (side-panel
+   *  toggles flip `enabled` there) using the applied fit's offset + horizon,
+   *  push it to the worker, and restart so it applies from day 0. */
+  private rebuildFitSchedule(): void {
+    if (!this.fitMeta) return;
+    this.fitSchedule = transmissionSchedule(this.interventions, this.fitMeta.days + 1, this.fitMeta.offset) ?? null;
+    this.fitWindows = this.fitSchedule ? interventionWindows(this.interventions, this.fitMeta.offset) : [];
+    this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
+    this.chart.setFitWindows(this.fitWindows);
+    this.persistFitRt();
+    this.refreshFitChip();
+    this.handleReset();
+  }
+
+  /** Fitted-interventions block inside the Interventions side panel: lists the
+   *  estimator's specs (the SHARED store) with toggles while a fit is applied,
+   *  so the fitted R(t) windows are visible and controllable where the
+   *  mechanical intervention defaults live. */
+  private renderFitPanel(): void {
+    if (!this.fitPanel) return;
+    const specs = this.interventions;
+    if (!this.fitMeta || specs.length === 0) {
+      this.fitPanel.hidden = true;
+      this.fitPanel.innerHTML = '';
+      return;
+    }
+    this.fitPanel.hidden = false;
+    const rows = specs.map((iv, idx) => {
+      const red = Math.round(effectiveReduction(iv) * 100);
+      const ticks = (iv.keyframes ?? []).map((k) => k.tick);
+      const span = ticks.length
+        ? `day ${Math.min(...ticks) + this.fitMeta!.offset}+`
+        : 'whole run';
+      return `
+        <label class="fit-itv-row">
+          <input type="checkbox" data-fit-itv="${idx}" ${iv.enabled ? 'checked' : ''} />
+          <span class="fit-itv-name">${escapeHtml(iv.label)}</span>
+          <span class="fit-itv-sub">−${red}% transmission · ${span}</span>
+        </label>`;
+    }).join('');
+    this.fitPanel.innerHTML = `
+      <div class="fit-itv-head" data-tip="Interventions from the R₀ Estimator, replayed as a time-varying transmission schedule R(t) — not the mechanical toggles below. Toggling restarts the run.">📈 Fitted R(t) interventions</div>
+      ${rows}`;
+    this.fitPanel.querySelectorAll<HTMLInputElement>('[data-fit-itv]').forEach((box) => {
+      box.addEventListener('change', () => {
+        const iv = this.interventions[Number(box.dataset['fitItv'])];
+        if (!iv) return;
+        iv.enabled = box.checked;
+        write('interventions', this.interventions);
+        this.r0Modal.refreshInterventions();
+        this.rebuildFitSchedule();
+        this.renderFitPanel();
+        this.toast(`${iv.label} ${box.checked ? 'restored to' : 'removed from'} the fitted R(t) schedule — run restarted.`);
+      });
+    });
   }
 
   private clearFitSchedule(): void {
     this.fitSchedule = null;
     this.fitWindows = [];
+    this.fitMeta = null;
     this.send({ cmd: 'setSchedule', schedule: null });
     this.chart.setFitWindows([]);
+    this.chart.setFitOverlay(null);
     this.persistFitRt();
     this.refreshFitChip();
+    this.renderFitPanel();
     this.handleReset();
-    this.toast('Cleared the fitted R(t) schedule — run restarted without it.');
+    this.toast('Cleared the applied fit (schedule + overlay) — run restarted without it.');
   }
 
   private needsRebuild(prev: SimConfig | null, next: SimConfig): boolean {
@@ -1048,6 +1137,10 @@ export class App {
       costConfig: this.costConfig,
     });
   }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 }
 
 function clampInt(v: number, lo: number, hi: number): number {

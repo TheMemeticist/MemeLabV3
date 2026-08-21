@@ -21,6 +21,7 @@ import {
   FIT_PARAMS,
   effectiveReductionAt,
   hasDownwardRevisions,
+  interventionWindows,
   parseObservedCSV,
   BAND_CENTRAL,
   EBOLA_ADJUST,
@@ -50,9 +51,9 @@ interface R0ModalEvents {
   getConfig: () => SimConfig;
   /** Push the fitted WORLD back into the simulation: the full fitted config
    *  (fit grid, patient-zero seeding, interventions-off baseline) plus the
-   *  fitted R(t) schedule and its chart windows, so the live run reproduces
-   *  the curve the estimator showed. */
-  onApply: (config: SimConfig, extras: { schedule: number[] | null; windows: { from: number; to: number; label: string }[] }) => void;
+   *  fitted R(t) schedule, its chart windows, the representative trial seed,
+   *  and the fitted mean curves for the live-chart overlay. */
+  onApply: (config: SimConfig, extras: import('../types').FitApplyExtras) => void;
   /** The SHARED intervention store (owned by App; same array/objects as the
    *  main sim). Optional so the modal still works standalone (local fallback). */
   getInterventions?: () => InterventionSpec[];
@@ -822,19 +823,41 @@ export class R0Modal {
     });
     q<HTMLButtonElement>('[data-r0="apply"]').addEventListener('click', () => {
       if (!this.result) return;
-      this.events.onApply(this.result.config, this.applyExtras(this.result));
-      this.close(); // dismiss so the user lands back on the running simulation
+      const result = this.result;
+      void (async () => {
+        this.note('Selecting the representative trial seed…');
+        const extras = await this.applyExtras(result);
+        this.events.onApply(result.config, extras);
+        this.close(); // dismiss so the user lands back on the running simulation
+      })();
     });
   }
 
   /** Everything beyond the config that the live sim needs to reproduce the
    *  fitted curve: the exact R(t) schedule the winning candidate ran under
-   *  (same builder + fitted index offset the fit used) and its window spans
-   *  for chart shading. */
-  private applyExtras(result: FitResult): { schedule: number[] | null; windows: { from: number; to: number; label: string }[] } {
+   *  (same builder + fitted index offset the fit used), its window spans for
+   *  chart shading, the fitted mean curves for the live overlay, and the
+   *  REPRESENTATIVE trial seed — the fit's mean averages K trials at derived
+   *  seeds, so applying the base seed would hand the live sim a world the fit
+   *  never simulated (it can fizzle at patient zero). Replaying the trial
+   *  closest to the mean makes the live run track the fitted curve
+   *  bit-exactly on the CPU/WASM engines. */
+  private async applyExtras(result: FitResult): Promise<import('../types').FitApplyExtras> {
     const o = result.indexOffset ?? 0;
     const schedule = transmissionSchedule(this.interventions, result.days + 1, o) ?? null;
-    return { schedule, windows: schedule ? this.itvWindows(o) : [] };
+    let seed = result.config.seed;
+    try {
+      const r = await this.pool?.bestSeed(result.config, result.days, this.K, result.config.seed, schedule ?? undefined);
+      if (r?.bestSeed !== undefined) seed = r.bestSeed;
+    } catch { /* pool busy/cancelled — fall back to the base seed */ }
+    return {
+      schedule,
+      windows: schedule ? this.itvWindows(o) : [],
+      offset: o,
+      days: result.days,
+      seed,
+      overlay: result.simulated ?? null,
+    };
   }
 
   // ── Observed-data table ──
@@ -928,22 +951,11 @@ export class R0Modal {
 
   /** Active interventions' ramp windows (first → last intensity keyframe) in
    *  chart-day coordinates (data day + the given offset shift). */
+  // Interventions persist indefinitely: a span extends to the chart's right
+  // edge (Infinity, clamped when painting) unless the end state is keyframed
+  // down to zero effect (see interventionWindows in lib/fit).
   private itvWindows(offset: number): { from: number; to: number; label: string }[] {
-    return this.interventions
-      .filter((iv) => iv.enabled && (iv.keyframes?.length ?? 0) > 0)
-      .map((iv) => {
-        const ticks = iv.keyframes!.map((k) => k.tick);
-        // Interventions persist indefinitely: the span extends to the chart's
-        // right edge (Infinity, clamped when painting) unless the end state is
-        // keyframed down to zero effect — only then does the span really end.
-        const holds = effectiveReductionAt(iv, Number.MAX_SAFE_INTEGER) > 0;
-        return {
-          from: Math.min(...ticks) + offset,
-          to: holds ? Number.POSITIVE_INFINITY : Math.max(...ticks) + offset,
-          label: iv.label,
-        };
-      })
-      .filter((w) => Number.isFinite(w.from));
+    return interventionWindows(this.interventions, offset);
   }
 
   /** Interventions editor. Card layout: header (enable / name / taxonomy /
@@ -1850,8 +1862,11 @@ export class R0Modal {
           this.note('Loaded fit from history.');
         });
         row.querySelector<HTMLButtonElement>('[data-act="apply"]')!.addEventListener('click', () => {
-          this.events.onApply(e.result.config, this.applyExtras(e.result));
-          this.close();
+          void (async () => {
+            const extras = await this.applyExtras(e.result);
+            this.events.onApply(e.result.config, extras);
+            this.close();
+          })();
         });
         host.appendChild(row);
       });

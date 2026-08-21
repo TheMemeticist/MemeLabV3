@@ -143,6 +143,89 @@ export function runTrials(
   return { curves, rNaught };
 }
 
+/** Re-run the K trials behind a fitted mean curve (identical seeds and
+ *  seeding to `runTrials`) and pick the REPRESENTATIVE one: the trial whose
+ *  deaths + cumulative-infections curves sit closest (normalized L2) to the
+ *  K-mean. Returns its trial seed — applying `{...config, seed}` to the live
+ *  sim replays that exact trial bit-for-bit (CPU ≡ WASM), so the live run
+ *  tracks the fitted curve instead of being a fresh lottery draw that may
+ *  fizzle at patient zero.
+ *
+ *  Voronoi caveat: the live app derives its topology from config.seed, while
+ *  fit trials share one topology from the base seed — only trial 0
+ *  (trialSeed === baseSeed) reproduces the same world, so voronoi always
+ *  picks trial 0. */
+export function bestTrialSeed(
+  config: SimConfig,
+  days: number,
+  K: number,
+  seed: number,
+  schedule?: number[],
+): { seed: number; kIndex: number } {
+  if ((config.geometry ?? 'square') === 'voronoi' || K <= 1) return { seed: seed >>> 0, kIndex: 0 };
+  const len = days + 1;
+  const canReseed = config.reseedOnExtinction === true;
+  let rNaught: number | null = null;
+  const deaths: Float64Array[] = [];
+  const infs: Float64Array[] = [];
+
+  for (let k = 0; k < K; k++) {
+    const trialSeed = (seed ^ ((k * SEED_STRIDE) >>> 0)) >>> 0;
+    const engine: AnyEngine = engineFor(
+      { ...config, seed: trialSeed },
+      undefined,
+      k === 0 ? { txSchedule: schedule } : { rNaught, txSchedule: schedule },
+    );
+    if (k === 0) rNaught = engine.rNaught;
+    const death = new Float64Array(len);
+    const inf = new Float64Array(len);
+    const { state } = engine.buffers();
+    let cumInf = 0;
+    for (let i = 0; i < state.length; i++) {
+      const s = state[i];
+      if (s === CellState.Exposed || s === CellState.Infectious) cumInf++;
+    }
+    inf[0] = cumInf;
+    let cumDeath = 0;
+    for (let d = 1; d <= days; d++) {
+      const stats = engine.step();
+      cumInf += stats.newInfections;
+      cumDeath += stats.newDeaths;
+      inf[d] = cumInf;
+      death[d] = cumDeath;
+      if (!canReseed && stats.e + stats.i === 0) {
+        for (let f = d + 1; f <= days; f++) { inf[f] = cumInf; death[f] = cumDeath; }
+        break;
+      }
+    }
+    deaths.push(death);
+    infs.push(inf);
+  }
+
+  const meanD = new Float64Array(len);
+  const meanI = new Float64Array(len);
+  for (let k = 0; k < K; k++) {
+    for (let d = 0; d < len; d++) { meanD[d] += deaths[k][d]; meanI[d] += infs[k][d]; }
+  }
+  for (let d = 0; d < len; d++) { meanD[d] /= K; meanI[d] /= K; }
+  // Normalize each curve family by its mean's peak so deaths (small counts)
+  // and infections (large counts) weigh equally.
+  const dScale = 1 / Math.max(1, meanD[len - 1]);
+  const iScale = 1 / Math.max(1, meanI[len - 1]);
+  let bestK = 0;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (let k = 0; k < K; k++) {
+    let score = 0;
+    for (let d = 0; d < len; d++) {
+      const ed = (deaths[k][d] - meanD[d]) * dScale;
+      const ei = (infs[k][d] - meanI[d]) * iScale;
+      score += ed * ed + ei * ei;
+    }
+    if (score < bestScore) { bestScore = score; bestK = k; }
+  }
+  return { seed: (seed ^ ((bestK * SEED_STRIDE) >>> 0)) >>> 0, kIndex: bestK };
+}
+
 /** Run N stochastic trials of `config`, each starting from a DIFFERENT index
  *  case, and return the per-trial per-capita curves (for percentile/fan-chart
  *  aggregation) instead of the mean.

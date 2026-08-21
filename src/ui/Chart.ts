@@ -51,6 +51,9 @@ export class Chart {
   private resizeRaf = 0;
   private markers: InterventionEvent[] = [];
   private fitWindows: FitWindow[] = [];
+  // Fitted mean curves (per-capita) × grid cells — dashed reference lines the
+  // live run should track after "Apply to simulation".
+  private fitOverlay: { deaths: number[]; active: number[]; cumInf: number[] } | null = null;
   private markerTip: HTMLElement | null = null;
   private mouseHandler: ((ev: MouseEvent) => void) | null = null;
   private leaveHandler: (() => void) | null = null;
@@ -87,6 +90,21 @@ export class Chart {
    *  applied R(t) schedule is active. Same repaint contract as setMarkers. */
   setFitWindows(windows: FitWindow[]): void {
     this.fitWindows = windows;
+  }
+
+  /** Fitted mean curves for the applied-fit overlay: per-capita fractions ×
+   *  `cells` so they plot in the live chart's people units. Null clears. */
+  setFitOverlay(
+    curves: { cumulative_infections: number[]; cumulative_deaths: number[]; active_infections: number[] } | null,
+    cells = 1,
+  ): void {
+    this.fitOverlay = curves
+      ? {
+          deaths: curves.cumulative_deaths.map((v) => v * cells),
+          active: curves.active_infections.map((v) => v * cells),
+          cumInf: curves.cumulative_infections.map((v) => v * cells),
+        }
+      : null;
   }
 
   setView(view: ChartView): void {
@@ -337,6 +355,7 @@ export class Chart {
           draw: [
             (u) => this.paintFitWindows(u),
             (u) => { if (isReff) this.paintReffThreshold(u); },
+            (u) => { if (this.view === 'compartments') this.paintFitOverlay(u); },
             (u) => this.paintMarkers(u),
           ],
         },
@@ -472,6 +491,54 @@ export class Chart {
       ctx.setLineDash([]);
       ctx.fillStyle = 'rgba(245, 158, 11, 0.9)';
       ctx.fillText(w.label, x0 + 3 * dpr, top + h - 3 * dpr);
+    }
+    ctx.restore();
+  }
+
+  /** Dashed fitted-curve references: Dead in both modes; Infectious (active)
+   *  in Active mode, cumulative infections (ecum) in Total mode. The live
+   *  traces should ride these when the applied fit reproduces. */
+  private paintFitOverlay(u: uPlot): void {
+    const ov = this.fitOverlay;
+    if (!ov) return;
+    const ctx = u.ctx;
+    const dpr = window.devicePixelRatio || 1;
+    const lines: Array<{ ys: number[]; color: string }> = [
+      { ys: ov.deaths, color: cssVar('--chart-dead') },
+      this.mode === 'total'
+        ? { ys: ov.cumInf, color: rgbCss('--cell-e') }
+        : { ys: ov.active, color: rgbCss('--cell-i') },
+    ];
+    ctx.save();
+    ctx.setLineDash([6 * dpr, 5 * dpr]);
+    ctx.lineWidth = 1.4 * dpr;
+    ctx.globalAlpha = 0.65;
+    const left = u.bbox.left;
+    const right = left + u.bbox.width;
+    const top = u.bbox.top;
+    const bottom = top + u.bbox.height;
+    let labelAt: { x: number; y: number } | null = null;
+    for (const line of lines) {
+      ctx.strokeStyle = line.color;
+      ctx.beginPath();
+      let started = false;
+      for (let d = 0; d < line.ys.length; d++) {
+        const x = u.valToPos(d, 'x', true);
+        if (x < left || x > right) { if (started && x > right) break; continue; }
+        const y = Math.min(bottom, Math.max(top, u.valToPos(line.ys[d], 'y', true)));
+        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+        if (line === lines[0]) labelAt = { x, y };
+      }
+      ctx.stroke();
+    }
+    if (labelAt) {
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 0.9;
+      ctx.font = `600 ${9 * dpr}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.fillStyle = cssVar('--chart-dead');
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('fit', Math.min(labelAt.x + 4 * dpr, right - 14 * dpr), labelAt.y - 2 * dpr);
     }
     ctx.restore();
   }
