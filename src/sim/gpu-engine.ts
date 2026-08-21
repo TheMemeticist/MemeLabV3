@@ -22,18 +22,26 @@
 // runs the classic per-cell sweep semantics with its own RNG — its
 // trajectories are their own family, NOT bit-comparable with the TS/WASM
 // engines (which are bit-identical to each other). The census-conservation
-// invariant (ΣS..D = N) holds exactly. The compatibility gate routes voronoi,
-// mutation, and extinction-reseed configs back to the CPU backends.
+// invariant (ΣS..D = N) holds exactly. The compatibility gate routes mutation
+// and extinction-reseed configs back to the CPU backends.
+//
+// Voronoi (geometry 4) rides the same single tables buffer as the lattice
+// parity tables, reinterpreted as per-cell CSR: seg.x = base of the offsets
+// array (n+1 i32s), seg.y = base of the neighbor list (absolute cell
+// indices). The gather stays valid because voronoi adjacency — and its BFS
+// range expansions — is symmetric: "my neighbors" and "who can reach me" are
+// the same set.
 //
 // GpuEngine exposes the same read surface `sim.worker.ts` posts frames from
 // (tick / history / retiredCost / rNaught / buffers()), plus an async
 // `run(nTicks)` in place of the sync `step()`.
 
-import type { LongStats, RetiredCostTotals, SimConfig, SimStats } from '../types';
+import type { LongStats, RetiredCostTotals, SimConfig, SimStats, VoronoiTopology } from '../types';
 import { LongHistory } from './long-history';
 import { Rng } from './rng';
 import { seed } from './population';
-import { makeGeometry } from './neighbors';
+import { makeGeometry, VoronoiLattice } from './neighbors';
+import { buildVoronoi } from './voronoi';
 import { resolveDefenses } from './defense';
 import { estimateAnalyticR0 } from './engine';
 
@@ -43,11 +51,7 @@ const MAX_BATCH = 2048; // ticks per submit (uniform-ring + stats-window capacit
 const WG = 256;
 
 export function gpuCompatible(config: SimConfig): boolean {
-  return (
-    (config.geometry ?? 'square') !== 'voronoi' &&
-    config.mutate !== true &&
-    config.reseedOnExtinction !== true
-  );
+  return config.mutate !== true && config.reseedOnExtinction !== true;
 }
 
 export function gpuSupported(): boolean {
@@ -58,7 +62,7 @@ const SHADER = /* wgsl */ `
 struct Params {
   size: u32,
   n: u32,
-  geometry: u32,      // 0 square, 1 triangular, 2 hexagonal, 3 meanfield
+  geometry: u32,      // 0 square, 1 triangular, 2 hexagonal, 3 meanfield, 4 voronoi
   seed: u32,
   attack: f32,
   ifr: f32,
@@ -79,8 +83,10 @@ struct Params {
   prot_mask: vec4<f32>,
   src_mask: vec4<f32>,
   mort_mask: vec4<f32>,
-  // (base, len) pairs into the tables buffer, in i32 units:
-  // x=evenBase y=evenLen z=oddBase w=oddLen
+  // Lattices: (base, len) pairs into the tables buffer, in i32 units:
+  // x=evenBase y=evenLen z=oddBase w=oddLen.
+  // Voronoi (geometry 4): x=base of the CSR offsets array (n+1 i32s),
+  // y=base of the CSR neighbor list (absolute cell indices); z,w unused.
   tx_seg: vec4<u32>,
   ct_seg: vec4<u32>,
   b_seg: vec4<u32>,
@@ -190,6 +196,24 @@ fn tick_main(@builtin(global_invocation_id) gid: vec3<u32>) {
           p_inf = mob_keep * (1.0 - pow(1.0 - p, i_count * 2.0 / f32(P.n)));
         }
       }
+    } else if (P.geometry == 4u) {
+      // Voronoi gather over the per-cell CSR list (symmetric adjacency).
+      var miss = 1.0;
+      let seg = table_seg(0u, 0u);
+      let lo = u32(tables[seg.x + i]);
+      let hi = u32(tables[seg.x + i + 1u]);
+      for (var k = lo; k < hi; k = k + 1u) {
+        let j = u32(tables[seg.y + k]);
+        if (state_of(cellsIn[j]) == ST_I) {
+          let dj = defenses[j];
+          var src = P.src_mask[dj & 3u];
+          if (P.quarantine_on != 0u && q_active(quarIn[j], tick)) { src = src * P.q_src; }
+          src = src * P.trans_mul;
+          if (P.lockdown_on != 0u && (dj & COMPLIANT_BIT) != 0u) { src = src * (1.0 - P.mobility); }
+          miss = miss * (1.0 - P.attack * src * prot);
+        }
+      }
+      p_inf = 1.0 - miss;
     } else {
       var miss = 1.0;
       let seg = table_seg(0u, parity);
@@ -226,7 +250,17 @@ fn tick_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   } else {
     // Dead: birth roll scaled by the alive-neighbor fraction (flat mean-field).
     var p = P.birth;
-    if (P.geometry != 3u) {
+    if (P.geometry == 4u) {
+      // Voronoi: direct CSR neighbors; a zero-degree cell uses 0.5 (TS parity).
+      let seg = table_seg(2u, 0u);
+      let lo = u32(tables[seg.x + i]);
+      let hi = u32(tables[seg.x + i + 1u]);
+      var alive = 0u;
+      for (var k = lo; k < hi; k = k + 1u) {
+        if (state_of(cellsIn[u32(tables[seg.y + k])]) != ST_D) { alive = alive + 1u; }
+      }
+      p = P.birth * select(f32(alive) / f32(max(hi - lo, 1u)), 0.5, hi == lo);
+    } else if (P.geometry != 3u) {
       let seg = table_seg(2u, parity);
       let cnt = seg.y / 2u;
       var alive = 0u;
@@ -253,7 +287,14 @@ fn tick_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (exp > 0u && exp < tick) { exp = 0u; }
   if (P.quarantine_on != 0u && ns != ST_D) {
     var det = detected(i, tick);
-    if (!det && P.geometry != 3u) {
+    if (!det && P.geometry == 4u) {
+      let seg = table_seg(1u, 0u);
+      let lo = u32(tables[seg.x + i]);
+      let hi = u32(tables[seg.x + i + 1u]);
+      for (var k = lo; k < hi; k = k + 1u) {
+        if (detected(u32(tables[seg.y + k]), tick)) { det = true; break; }
+      }
+    } else if (!det && P.geometry != 3u) {
       let seg = table_seg(1u, parity);
       let cnt = seg.y / 2u;
       for (var k = 0u; k < cnt; k = k + 1u) {
@@ -292,6 +333,9 @@ interface GpuBuffers {
   quarA: GPUBuffer;
   quarB: GPUBuffer;
   stats: GPUBuffer;
+  // One census row (STATS_STRIDE u32s): WebGPU forbids same-buffer copies, so
+  // rolling the batch's final census into row 0 goes stats→carry→stats.
+  carry: GPUBuffer;
   tables: GPUBuffer;
   params: GPUBuffer;
   tickRing: GPUBuffer;
@@ -307,6 +351,10 @@ export class GpuEngine {
   private bgPong!: GPUBindGroup;
   private config!: SimConfig;
   private n = 0;
+  // Voronoi topology + lattice (BFS cache) — set in reset, reused by
+  // patchConfig table rebuilds (topology changes always full-rebuild).
+  private voronoiTopo: VoronoiTopology | null = null;
+  private vorLattice: VoronoiLattice | null = null;
   private lastState!: Uint8Array;
   private lastDefenses!: Uint8Array;
   private lastQuarantined!: Uint8Array;
@@ -330,7 +378,7 @@ export class GpuEngine {
 
   /** Async constructor — adapter/device acquisition and first upload. Throws
    *  when WebGPU is unavailable; the worker falls back to a CPU backend. */
-  static async create(config: SimConfig): Promise<GpuEngine> {
+  static async create(config: SimConfig, prebuiltTopo?: VoronoiTopology | null): Promise<GpuEngine> {
     if (!gpuSupported()) throw new Error('WebGPU not available');
     if (!gpuCompatible(config)) throw new Error('config outside gpu engine feature space');
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -346,7 +394,7 @@ export class GpuEngine {
     const e = new GpuEngine();
     e.device = device;
     e.buildPipeline();
-    e.reset(config);
+    e.reset(config, prebuiltTopo);
     return e;
   }
 
@@ -371,12 +419,22 @@ export class GpuEngine {
     });
   }
 
-  reset(config: SimConfig): void {
+  reset(config: SimConfig, prebuiltTopo?: VoronoiTopology | null): void {
     if (!gpuCompatible(config)) throw new Error('config outside gpu engine feature space');
     this.config = config;
     const device = this.device;
     const n = config.size * config.size;
     this.n = n;
+    if ((config.geometry ?? 'square') === 'voronoi') {
+      // Same derived-seed topology every backend builds; keep the lattice (and
+      // its BFS cache) when the topology object is unchanged.
+      const topo = prebuiltTopo ?? buildVoronoi(n, config.voronoiConfig, new Rng(config.seed ^ 0x564f524f), false);
+      if (topo !== this.voronoiTopo || this.vorLattice === null) this.vorLattice = new VoronoiLattice(topo);
+      this.voronoiTopo = topo;
+    } else {
+      this.voronoiTopo = null;
+      this.vorLattice = null;
+    }
     this.tick = 0;
     this.history.clear();
     this.retiredCost = emptyRetired();
@@ -443,6 +501,7 @@ export class GpuEngine {
       quarA: mk('quarA', n * 4, S, zero32),
       quarB: mk('quarB', n * 4, S, zero32),
       stats: mk('stats', (MAX_BATCH + 1) * STATS_STRIDE * 4, S),
+      carry: mk('carry', STATS_STRIDE * 4, GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST),
       tables: this.buildTables(config),
       params: mk('params', 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
       tickRing: mk('tickRing', MAX_BATCH * 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
@@ -455,7 +514,7 @@ export class GpuEngine {
     device.queue.writeBuffer(this.bufs.stats, 0, census0);
     this.pushParams(config);
     this.buildBindGroups();
-    this.rNaught = estimateAnalyticR0(config, makeGeometry(config.geometry), null);
+    this.rNaught = estimateAnalyticR0(config, this.vorLattice ?? makeGeometry(config.geometry), this.voronoiTopo);
   }
 
   private stagingSize(): number {
@@ -475,6 +534,7 @@ export class GpuEngine {
   private tableSegs!: Uint32Array; // [txEB, txEL, txOB, txOL, ctEB, ctEL, ctOB, ctOL, bEB, bEL, bOB, bOL]
   private buildTables(config: SimConfig): GPUBuffer {
     const geoType = config.geometry ?? 'square';
+    if (geoType === 'voronoi') return this.buildCsrTables(config);
     const geo = makeGeometry(geoType);
     const contactsRange = Math.max(1, config.quarantine.contactsRange | 0);
     const roles: number[] = [Math.max(1, Math.floor(config.strain.range)), contactsRange, 1];
@@ -506,6 +566,66 @@ export class GpuEngine {
     return buf;
   }
 
+  /** Voronoi: per-role [offsets(n+1), list] CSR chunks concatenated into the
+   *  same single tables buffer; tableSegs[role*4] = offsets base and
+   *  tableSegs[role*4+1] = list base (the shader's voronoi branches read seg.x
+   *  and seg.y with that meaning). The contacts CSR (role 1) can be
+   *  BFS-expensive at contactsRange > 1, so it is only materialized while
+   *  quarantine is enabled — the shader only reads it under the same flag, and
+   *  patchConfig rebuilds tables on every change. */
+  private buildCsrTables(config: SimConfig): GPUBuffer {
+    const lat = this.vorLattice!;
+    const n = this.n;
+    const contactsRange = Math.max(1, config.quarantine.contactsRange | 0);
+    const roles: Array<[number, boolean]> = [
+      [Math.max(1, Math.floor(config.strain.range)), true],
+      [contactsRange, config.quarantine.enabled === true],
+      [1, true],
+    ];
+    this.tableSegs = new Uint32Array(12);
+    const chunks: Int32Array[] = [];
+    let base = 0;
+    roles.forEach(([range, wanted], role) => {
+      const offsets = new Int32Array(n + 1);
+      const lists: Int32Array[] = [];
+      let total = 0;
+      if (wanted) {
+        for (let i = 0; i < n; i++) {
+          const nb = lat.getNeighborIndices!(i, range);
+          lists.push(nb);
+          offsets[i] = total;
+          total += nb.length;
+        }
+        offsets[n] = total;
+      }
+      const flatList = new Int32Array(Math.max(1, total));
+      let w = 0;
+      for (const nb of lists) {
+        flatList.set(nb, w);
+        w += nb.length;
+      }
+      this.tableSegs[role * 4] = base;
+      chunks.push(offsets);
+      base += offsets.length;
+      this.tableSegs[role * 4 + 1] = base;
+      chunks.push(flatList);
+      base += flatList.length;
+    });
+    const flat = new Int32Array(base);
+    let at = 0;
+    for (const c of chunks) {
+      flat.set(c, at);
+      at += c.length;
+    }
+    const buf = this.device.createBuffer({
+      label: 'tables',
+      size: flat.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(buf, 0, flat as Int32Array<ArrayBuffer>);
+    return buf;
+  }
+
   private pushParams(config: SimConfig): void {
     const D = resolveDefenses(config.defenses);
     const g = config.strain;
@@ -513,7 +633,7 @@ export class GpuEngine {
     const ldOn = ld.enabled === true;
     const q = config.quarantine;
     const qOn = q.enabled === true;
-    const geoCode = ({ square: 0, triangular: 1, hexagonal: 2, meanfield: 3 } as Record<string, number>)[
+    const geoCode = ({ square: 0, triangular: 1, hexagonal: 2, meanfield: 3, voronoi: 4 } as Record<string, number>)[
       config.geometry ?? 'square'
     ] ?? 0;
 
@@ -613,7 +733,7 @@ export class GpuEngine {
     this.bufs.tables = this.buildTables(newCfg);
     this.buildBindGroups();
     this.pushParams(newCfg);
-    this.rNaught = estimateAnalyticR0(newCfg, makeGeometry(newCfg.geometry), null);
+    this.rNaught = estimateAnalyticR0(newCfg, this.vorLattice ?? makeGeometry(newCfg.geometry), this.voronoiTopo);
   }
 
   private async readbackU32(src: GPUBuffer): Promise<Uint32Array<ArrayBuffer>> {
@@ -672,8 +792,12 @@ export class GpuEngine {
     enc.copyBufferToBuffer(outCells, 0, this.bufs.staging, statsBytes, this.n * 4);
     enc.copyBufferToBuffer(this.bufs.defenses, 0, this.bufs.staging, statsBytes + this.n * 4, this.n * 4);
     enc.copyBufferToBuffer(outQuar, 0, this.bufs.staging, statsBytes + this.n * 8, this.n * 4);
-    // Roll the batch's final census into row 0 for the next batch.
-    enc.copyBufferToBuffer(this.bufs.stats, n * STATS_STRIDE * 4, this.bufs.stats, 0, STATS_STRIDE * 4);
+    // Roll the batch's final census into row 0 for the next batch. A direct
+    // stats→stats copy is a WebGPU validation error (same src and dst buffer
+    // invalidates the WHOLE command buffer — every dispatch above dies
+    // silently), so bounce it through the one-row carry buffer.
+    enc.copyBufferToBuffer(this.bufs.stats, n * STATS_STRIDE * 4, this.bufs.carry, 0, STATS_STRIDE * 4);
+    enc.copyBufferToBuffer(this.bufs.carry, 0, this.bufs.stats, 0, STATS_STRIDE * 4);
     device.queue.submit([enc.finish()]);
 
     await this.bufs.staging.mapAsync(GPUMapMode.READ);

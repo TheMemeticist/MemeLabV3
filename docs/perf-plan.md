@@ -207,7 +207,15 @@ All three phases are now INTEGRATED in the app, not just spiked:
   shipping (compile + pipeline + 100-tick conservation run), which caught a
   portability bug the spike missed: baseline WebGPU allows only 8 storage
   bindings per stage, so per-cell words are packed (state+age,
-  defenses+compliance).
+  defenses+compliance). Voronoi runs on the GPU too: per-cell CSR neighbor
+  lists ride the same single tables buffer (seg.x = offsets base, seg.y =
+  list base), valid because voronoi adjacency and its BFS expansions are
+  symmetric — measured 320²: 14,937 t/s voronoi vs 17,544 square (~15%
+  divergence cost), conservation exact. Browser-side error capture during
+  that port caught a real production bug: the batch-end census roll used a
+  same-buffer copyBufferToBuffer (stats→stats), which Dawn rejects —
+  invalidating the whole command buffer and silently killing every dispatch
+  in Chrome. It now bounces through a one-row carry buffer.
 - **UI**: toolbar backend picker (⚙/⚡ button opens a menu — each backend row
   shows running / requested-but-fell-back / unavailable with the actionable
   reason, availability probed by the worker), localStorage preference,

@@ -150,7 +150,6 @@ function wasmBlockReason(_config: SimConfig): string {
 
 function gpuBlockReason(config: SimConfig): string {
   if (config.mutate === true) return wasmBlockReason(config);
-  if ((config.geometry ?? 'square') === 'voronoi') return 'Voronoi geometry runs on the CPU/WASM engines — switch to a lattice geometry to use GPU';
   return 'extinction reseed runs on the CPU engines — disable it to use GPU';
 }
 
@@ -250,7 +249,7 @@ function rebuild(config: SimConfig): void {
     }
     gpuChain = gpuChain
       .then(async () => {
-        const g = await GpuEngine.create(config);
+        const g = await GpuEngine.create(config, topo);
         // A newer rebuild may have raced us; only install if still current.
         if (currentConfig === config && requestedBackend === 'gpu') {
           gpu = g;
