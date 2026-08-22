@@ -1,3 +1,4 @@
+import { installFocusTrap } from './focus';
 // "What is this?" modal — explains the model, history, and backing research
 // without requiring a separate page or routing layer.
 
@@ -82,6 +83,7 @@ const CONTENT = `
 
 export class AboutModal {
   private el: HTMLDivElement | null = null;
+  private untrap: (() => void) | null = null;
 
   open(): void {
     if (this.el) return;
@@ -105,10 +107,16 @@ export class AboutModal {
       if (ev.target === overlay) close();
     });
     document.addEventListener('keydown', this.onKey);
+    this.untrap = installFocusTrap(
+      overlay.querySelector('.about-card') as HTMLElement,
+      overlay.querySelector('.about-close') as HTMLElement,
+    );
   }
 
   close(): void {
     if (!this.el) return;
+    this.untrap?.();
+    this.untrap = null;
     document.removeEventListener('keydown', this.onKey);
     const e = this.el;
     this.el = null;

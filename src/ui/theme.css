@@ -1,117 +1,148 @@
-/* MemeLab CDA v3 — Theme tokens
- * Two themes: petri (light, agar/bone) and lab (dark, oscilloscope).
- * State colors are constant across themes for chart/petri consistency,
- * but their CSS triplet form (`r g b`) lets the petri renderer parse them.
+/* MemeLab CDA v3 — "Plex Observatory" theme tokens
+ * Swiss/IBM scientific rationalism: light-first, carbon-dark second.
+ *
+ * TOKEN CONTRACT (read by TS at runtime — keep names and formats):
+ *   --cell-* and --petri-bg MUST stay space-separated `r g b` triplets
+ *   (Petri.ts parses them); --chart-dead, --grid-color, --accent, --border,
+ *   --bg-panel, --bg-elevated, --text-muted are read via getComputedStyle
+ *   by Chart.ts / R0Modal.ts.
+ *
+ * SEMANTIC COLOR SYSTEM (deliberately separated):
+ *   accent  #0f62fe / #78a9ff  — interactive UI only (buttons, focus, links)
+ *   danger  #da1e28 / #fa4d56  — destructive actions + cost escalation only
+ *   data categorical (colorblind-considered, never used for chrome):
+ *     susceptible gray · masked cyan · vaccinated purple · both teal ·
+ *     exposed gold · infectious deep orange · recovered slate · dead graphite
  */
 
 :root,
 :root[data-theme='petri'] {
-  /* Surface palette — warm "agar" lights */
-  --bg-base: #f6efe1;
-  --bg-elevated: #fffaf0;
-  --bg-panel: #fff8e6;
-  --bg-sunken: #f2e8d3;
-  --petri-bg: 246 239 225;
-  --petri-ring: rgba(85, 58, 21, 0.18);
-  --petri-ring-shadow: 0 0 0 1px rgba(85, 58, 21, 0.12) inset, 0 16px 40px -22px rgba(85, 58, 21, 0.45);
+  color-scheme: light;
+
+  /* Surfaces */
+  --bg-base: #f4f4f4;      /* page ground — IBM Gray 10 */
+  --bg-elevated: #ffffff;  /* modules, popovers */
+  --bg-panel: #ffffff;
+  --bg-sunken: #f4f4f4;    /* inputs, wells */
+  --bg: #f4f4f4;           /* legacy alias (chart modal backdrop mix) */
+  --petri-bg: 255 255 255;
+  --petri-ring: rgba(22, 22, 22, 0.12);
+  --petri-ring-shadow: 0 0 0 1px rgba(22, 22, 22, 0.08) inset;
 
   /* Text */
-  --text: #2a2317;
-  --text-muted: #6b5e44;
-  --text-subtle: #93876a;
+  --text: #161616;
+  --text-muted: #525252;   /* AA on white and on gray-10 */
+  --text-subtle: #6f6f6f;
 
-  /* Brand */
-  --accent: #c2410c;
-  --accent-2: #ea580c;
-  --accent-soft: rgba(194, 65, 12, 0.12);
-  --link: #b45309;
+  /* Interactive accent — IBM Blue 60 */
+  --accent: #0f62fe;
+  --accent-2: #0043ce;
+  --accent-soft: rgba(15, 98, 254, 0.08);
+  --link: #0f62fe;
 
-  /* Edges & shadows */
-  --border: rgba(60, 38, 8, 0.16);
-  --border-strong: rgba(60, 38, 8, 0.30);
-  --shadow-sm: 0 1px 2px rgba(60, 38, 8, 0.08), 0 2px 8px rgba(60, 38, 8, 0.06);
-  --shadow-md: 0 4px 16px rgba(60, 38, 8, 0.10), 0 12px 32px -16px rgba(60, 38, 8, 0.20);
+  /* Destructive / critical only */
+  --danger: #da1e28;
+  --danger-soft: rgba(218, 30, 40, 0.08);
 
-  /* Cell state colors (rgb triplets so Petri.ts can parse them) */
-  --cell-s: 122 173 35;          /* susceptible — agar green */
-  --cell-s-mask: 38 169 198;     /* susceptible + mask — cyan */
-  --cell-s-vax: 156 89 209;      /* susceptible + vaccine — violet */
-  --cell-s-both: 33 191 175;     /* susceptible + both — teal */
-  --cell-e: 230 167 23;          /* exposed — amber */
-  --cell-i: 218 60 50;           /* infectious — coral */
-  --cell-r: 70 110 145;          /* recovered — slate-blue */
-  --cell-d: 40 35 30;             /* dead — near-black slate */
-  --chart-dead: rgb(40, 35, 30);  /* dead series line — dark on light bg */
-  --cell-ring-mask: 38 169 198;
-  --cell-ring-vax: 156 89 209;
-  --cell-quarantine: 196 126 18;  /* quarantined — burnt amber tint */
-  --cost-warn: rgb(202, 110, 12);   /* cost meter — low burden (amber) */
-  --cost-danger: rgb(192, 28, 22);  /* cost meter — high burden (deep red) */
-  --grid-color: rgba(60, 38, 8, 0.10);
+  /* Edges & elevation (hairlines carry the design; shadows stay quiet) */
+  --border: #e0e0e0;
+  --border-strong: #c6c6c6;
+  --shadow-sm: 0 1px 2px rgba(22, 22, 22, 0.06);
+  --shadow-md: 0 2px 6px rgba(22, 22, 22, 0.10), 0 8px 24px rgba(22, 22, 22, 0.10);
 
-  /* Goodness-of-fit rating ramp (theme-independent). */
-  --gof-excellent: rgb(22, 163, 74);  /* green */
-  --gof-good: rgb(101, 163, 13);      /* lime */
-  --gof-fair: rgb(217, 160, 18);      /* amber */
-  --gof-poor: rgb(220, 60, 50);       /* red */
+  /* Data categorical — cell states (rgb triplets; Petri parses these) */
+  --cell-s: 141 141 141;          /* susceptible — neutral gray */
+  --cell-s-mask: 17 146 232;      /* + mask — cyan */
+  --cell-s-vax: 138 63 252;       /* + vaccine — purple */
+  --cell-s-both: 0 157 154;       /* + both — teal */
+  --cell-e: 202 154 0;            /* exposed — gold */
+  --cell-i: 235 98 0;             /* infectious — deep orange (NOT danger red) */
+  --cell-r: 69 113 158;           /* recovered — slate blue */
+  --cell-d: 57 57 57;             /* dead — graphite */
+  --chart-dead: rgb(57, 57, 57);
+  --cell-ring-mask: 17 146 232;
+  --cell-ring-vax: 138 63 252;
+  --cell-quarantine: 178 134 0;   /* quarantine tick — bronze */
+  --cost-warn: rgb(178, 134, 0);
+  --cost-danger: rgb(218, 30, 40);
+  --grid-color: rgba(22, 22, 22, 0.08);
 
-  /* Toolbar */
-  --tb-bg: #fffaf0;
-  --tb-btn: #fff8e6;
-  --tb-btn-hover: #f5e9c8;
+  /* Goodness-of-fit rating ramp */
+  --gof-excellent: rgb(25, 128, 56);
+  --gof-good: rgb(101, 163, 13);
+  --gof-fair: rgb(202, 154, 0);
+  --gof-poor: rgb(218, 30, 40);
+
+  /* Control strip */
+  --tb-bg: #ffffff;
+  --tb-btn: #ffffff;
+  --tb-btn-hover: #e8e8e8;
   --tb-btn-active: var(--accent-soft);
 
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 16px;
+  /* Geometry — near-square, Carbon-like */
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
   --radius-pill: 999px;
 
-  --font-sans: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-serif: 'IBM Plex Serif', Georgia, 'Times New Roman', serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 :root[data-theme='lab'] {
-  --bg-base: #0c1116;
-  --bg-elevated: #131a22;
-  --bg-panel: #161e27;
-  --bg-sunken: #0a0f14;
-  --petri-bg: 8 12 16;
-  --petri-ring: rgba(120, 200, 235, 0.22);
-  --petri-ring-shadow: 0 0 0 1px rgba(120, 200, 235, 0.18) inset, 0 0 60px -10px rgba(120, 200, 235, 0.18);
+  color-scheme: dark;
 
-  --text: #e8eef4;
-  --text-muted: #8aa0b3;
-  --text-subtle: #5a6f81;
+  --bg-base: #161616;      /* Carbon g100 */
+  --bg-elevated: #1f1f1f;
+  --bg-panel: #1f1f1f;
+  --bg-sunken: #2a2a2a;
+  --bg: #161616;
+  --petri-bg: 14 14 14;
+  --petri-ring: rgba(244, 244, 244, 0.14);
+  --petri-ring-shadow: 0 0 0 1px rgba(244, 244, 244, 0.08) inset;
 
-  --accent: #34d399;
-  --accent-2: #10b981;
-  --accent-soft: rgba(52, 211, 153, 0.16);
-  --link: #5eead4;
+  --text: #f4f4f4;
+  --text-muted: #c6c6c6;
+  --text-subtle: #8d8d8d;
 
-  --border: rgba(120, 200, 235, 0.14);
-  --border-strong: rgba(120, 200, 235, 0.28);
+  --accent: #78a9ff;       /* IBM Blue 40 — AA on carbon */
+  --accent-2: #a6c8ff;
+  --accent-soft: rgba(120, 169, 255, 0.14);
+  --link: #78a9ff;
+
+  --danger: #fa4d56;
+  --danger-soft: rgba(250, 77, 86, 0.14);
+
+  --border: #393939;
+  --border-strong: #525252;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5), 0 24px 60px -24px rgba(52, 211, 153, 0.18);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.45);
 
-  --cell-s: 144 218 88;          /* susceptible — phosphor green */
-  --cell-s-mask: 92 222 236;     /* susceptible + mask — bright cyan */
-  --cell-s-vax: 195 145 255;     /* susceptible + vaccine — bright violet */
-  --cell-s-both: 130 240 215;    /* susceptible + both — mint */
-  --cell-e: 255 191 71;          /* exposed — amber */
-  --cell-i: 255 92 92;            /* infectious — neon red */
-  --cell-r: 130 165 195;         /* recovered — slate-cyan */
-  --cell-d: 30 35 42;             /* dead — graphite */
-  --chart-dead: rgb(175, 180, 192); /* dead series line — light gray on dark bg */
-  --cell-ring-mask: 92 222 236;
-  --cell-ring-vax: 195 145 255;
-  --cell-quarantine: 240 165 45;  /* quarantined — bright amber tint */
-  --cost-warn: rgb(245, 165, 55);   /* cost meter — low burden (amber) */
-  --cost-danger: rgb(255, 80, 70);  /* cost meter — high burden (bright red) */
-  --grid-color: rgba(120, 200, 235, 0.10);
+  --cell-s: 168 168 168;
+  --cell-s-mask: 51 177 255;
+  --cell-s-vax: 190 149 255;
+  --cell-s-both: 61 219 217;
+  --cell-e: 241 194 27;
+  --cell-i: 255 131 43;
+  --cell-r: 130 165 195;
+  --cell-d: 82 82 82;
+  --chart-dead: rgb(198, 198, 198);
+  --cell-ring-mask: 51 177 255;
+  --cell-ring-vax: 190 149 255;
+  --cell-quarantine: 240 165 45;
+  --cost-warn: rgb(241, 194, 27);
+  --cost-danger: rgb(250, 77, 86);
+  --grid-color: rgba(244, 244, 244, 0.08);
 
-  --tb-bg: #131a22;
-  --tb-btn: #1a2330;
-  --tb-btn-hover: #233040;
+  --gof-excellent: rgb(66, 190, 101);
+  --gof-good: rgb(144, 200, 60);
+  --gof-fair: rgb(241, 194, 27);
+  --gof-poor: rgb(250, 77, 86);
+
+  --tb-bg: #1f1f1f;
+  --tb-btn: #1f1f1f;
+  --tb-btn-hover: #333333;
   --tb-btn-active: var(--accent-soft);
 }
 

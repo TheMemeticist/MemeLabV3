@@ -14,6 +14,7 @@ import 'uplot/dist/uPlot.min.css';
 import type { InterventionParamName, SimConfig } from '../types';
 import { FitPool } from '../lib/fit-pool';
 import { Slider } from './Slider';
+import { installFocusTrap } from './focus';
 import { read, remove, write } from '../lib/storage';
 import {
   CATEGORY_LABELS,
@@ -450,6 +451,7 @@ export class R0Modal {
   private livePop = 0;
   private pendingSnapshot: FitProgress | null = null;
   private rafId = 0;
+  private untrap: (() => void) | null = null;
 
   constructor(private events: R0ModalEvents) {}
 
@@ -493,6 +495,10 @@ export class R0Modal {
     this.renderParams();
     this.renderOutput();
     this.renderHistory();
+    this.untrap = installFocusTrap(
+      overlay.querySelector('.r0-card') as HTMLElement,
+      overlay.querySelector('.r0-close') as HTMLElement,
+    );
     if (saved) this.showRestoreBanner();
     if (!saved) void this.loadDemo();
   }
@@ -500,6 +506,8 @@ export class R0Modal {
   close(): void {
     if (!this.el) return;
     if (!this.skipPersist) this.persist();
+    this.untrap?.();
+    this.untrap = null;
     document.removeEventListener('keydown', this.onKey);
     this.signal.aborted = true;
     if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
@@ -2611,13 +2619,15 @@ function gofRating(r2: number): { label: string; cls: string } {
 
 // Static markup; dynamic regions are filled by render*() via [data-r0] hooks.
 const TEMPLATE = `
-  <div class="r0-banner" data-r0="banner" hidden></div>
   <header class="r0-head">
     <div class="r0-titles">
-      <h2 id="r0-title">R₀ Estimator</h2>
-      <p class="r0-tag">Fit an observed outbreak curve back to disease parameters.</p>
+      <h2 id="r0-title">Estimation workspace</h2>
+      <p class="r0-tag">Fit an observed outbreak curve back to disease parameters — R₀, with uncertainty.</p>
     </div>
   </header>
+  <div class="r0-cols">
+  <div class="r0-col r0-col-cfg">
+  <div class="r0-banner" data-r0="banner" hidden></div>
 
   <section class="r0-section">
     <h3>1 · Observed data</h3>
@@ -2748,6 +2758,8 @@ const TEMPLATE = `
       </label>
     </div>
     <div class="r0-ga" data-r0="ga-controls">
+      <details class="r0-details">
+      <summary>Advanced search settings (GA hyperparameters)</summary>
       <p class="r0-blurb">Evolves a population of disease genomes — selection, crossover, and Gaussian mutation — like the simulation's own strain mutation. Larger population / more generations search harder.</p>
       <div class="r0-ga-grid">
         <label class="r0-field r0-field-inline"><span>Population</span><input class="r0-in tiny" type="number" min="8" max="200" step="1" data-ga="population" /></label>
@@ -2757,6 +2769,7 @@ const TEMPLATE = `
         <label class="r0-field r0-field-inline"><span>Elitism</span><input class="r0-in tiny" type="number" min="0" max="20" step="1" data-ga="elitism" /></label>
         <label class="r0-field r0-field-inline"><span>Tournament</span><input class="r0-in tiny" type="number" min="2" max="10" step="1" data-ga="tournament" /></label>
       </div>
+      </details>
     </div>
     <div class="r0-actions">
       <button class="btn primary" type="button" data-r0="run">Run fit</button>
@@ -2766,9 +2779,11 @@ const TEMPLATE = `
     </div>
     <p class="r0-note" data-r0="note" role="status" aria-live="polite"></p>
   </section>
+  </div>
 
-  <section class="r0-section">
-    <h3>4 · Result</h3>
+  <div class="r0-col r0-col-out">
+  <section class="r0-section r0-section-result">
+    <h3>Result</h3>
     <div data-r0="output"></div>
     <div class="r0-actions">
       <button class="btn primary" type="button" data-r0="apply" disabled>Apply to simulation</button>
@@ -2778,4 +2793,6 @@ const TEMPLATE = `
       <div data-r0="history"></div>
     </details>
   </section>
+  </div>
+  </div>
 `;

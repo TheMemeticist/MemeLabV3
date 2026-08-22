@@ -42,19 +42,13 @@ export class ControlPanel {
   }
 
   buildLeft(host: HTMLElement): void {
+    // Interventions lead the column — they are the primary verbs of the sim;
+    // population/topology settings follow as the quieter world configuration.
     host.innerHTML = `
-      <section class="panel collapsible" aria-label="Population" data-collapsed="false">
-        <button type="button" class="panel-head" aria-expanded="true" data-toggle="population">
-          <h3>Population <span class="rate-badge" data-badge="popsize">—</span></h3>
-          <span class="panel-icon" aria-hidden="true">👥</span>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
-        </button>
-        <div class="panel-body" data-section="population"></div>
-      </section>
       <section class="panel collapsible" aria-label="Interventions" data-collapsed="false">
         <button type="button" class="panel-head" aria-expanded="true" data-toggle="interventions">
           <h3>Interventions</h3>
-          <span class="panel-icon" aria-hidden="true">🛡️</span>
+          <span class="panel-icon" aria-hidden="true">${ICON_SHIELD}</span>
           <span class="panel-chevron" aria-hidden="true">▾</span>
         </button>
         <div class="panel-body intervention-stack">
@@ -63,6 +57,14 @@ export class ControlPanel {
           ${this.interventionCardMarkup('lockdown', 'Lockdown', '🚧')}
           ${this.interventionCardMarkup('quarantine', 'Quarantine', '🚷')}
         </div>
+      </section>
+      <section class="panel collapsible" aria-label="Population" data-collapsed="false">
+        <button type="button" class="panel-head" aria-expanded="true" data-toggle="population">
+          <h3>Population <span class="rate-badge" data-badge="popsize">—</span></h3>
+          <span class="panel-icon" aria-hidden="true">${ICON_PEOPLE}</span>
+          <span class="panel-chevron" aria-hidden="true">▾</span>
+        </button>
+        <div class="panel-body" data-section="population"></div>
       </section>
     `;
     const popHost = host.querySelector('[data-section="population"]') as HTMLElement;
@@ -343,14 +345,18 @@ export class ControlPanel {
       <section class="panel collapsible" aria-label="Disease" data-collapsed="false">
         <button type="button" class="panel-head" aria-expanded="true" data-toggle="disease">
           <h3>Disease</h3>
-          <span class="panel-icon" aria-hidden="true">🦠</span>
+          <span class="panel-icon" aria-hidden="true">${ICON_VIRUS}</span>
           <span class="panel-chevron" aria-hidden="true">▾</span>
         </button>
         <div class="panel-body">
           <div class="preset-host"></div>
-          <button type="button" class="btn estimator-launch" data-act="estimator" data-tip="Fit an observed outbreak curve back to disease parameters — reports the implied R₀ and can apply the fitted disease here.">
-            <span class="btn-icon" aria-hidden="true">📉</span>R₀ Estimator
-          </button>
+          <div class="estimator-card">
+            <span class="est-kicker">Estimation</span>
+            <p class="est-blurb">Fit an observed outbreak curve back to disease parameters, with uncertainty — then apply the fitted world here.</p>
+            <button type="button" class="btn estimator-launch" data-act="estimator" data-tip="Open the estimation workspace: fit real outbreak data, read the implied R₀ with uncertainty bands, and apply the fitted disease to the live simulation.">
+              <span class="btn-icon" aria-hidden="true">${ICON_FIT}</span>Open estimation workspace
+            </button>
+          </div>
           <div class="strain-sliders" data-section="strain"></div>
         </div>
       </section>
@@ -444,8 +450,16 @@ export class ControlPanel {
         onChange: (v) => { this.cfg.strain.mutationRate = v / 100; this.dirty(); },
       }),
     };
+    // Primary genes in the open form; slower-moving expert genes fold away.
+    // Note: attackRate and range stay direct children of strainHost — the R₀
+    // slider is inserted before attackRate below, and geometry visibility
+    // toggles both regardless of parent.
+    const primaryKeys: (keyof typeof this.strainSliders)[] = ['attackRate', 'range', 'incubation', 'infectious', 'ifr'];
+    const advancedKeys: (keyof typeof this.strainSliders)[] = ['immunityDays', 'mutationRate'];
+    for (const k of primaryKeys) strainHost.appendChild(this.strainSliders[k].el);
+    const strainAdv = this.advancedGroup(strainHost);
+    for (const k of advancedKeys) strainAdv.appendChild(this.strainSliders[k].el);
     for (const k of Object.keys(this.strainSliders) as (keyof typeof this.strainSliders)[]) {
-      strainHost.appendChild(this.strainSliders[k].el);
       // Whenever any disease gene changes, re-check whether we've drifted from
       // the current preset and reflect that in the picker label.
       this.strainSliders[k].onValueChange(() => this.recheckCustom());
@@ -535,8 +549,21 @@ export class ControlPanel {
       hint: 'Reduces fatality if a wearer is infected.',
       onChange: (v) => { def().mortalityReduction = v / 100; this.dirty(); },
     });
-    [uptake, protection, sourceControl, mortalityReduction].forEach((s) => host.appendChild(s.el));
+    // Uptake is the headline dial; effectiveness parameters fold away.
+    host.appendChild(uptake.el);
+    const adv = this.advancedGroup(host);
+    [protection, sourceControl, mortalityReduction].forEach((s) => adv.appendChild(s.el));
     return { protection, sourceControl, mortalityReduction, uptake };
+  }
+
+  /** A collapsed "Advanced" disclosure appended to a panel body — the visual
+   *  weight split between primary and expert parameters. */
+  private advancedGroup(host: HTMLElement): HTMLElement {
+    const det = document.createElement('details');
+    det.className = 'adv-params';
+    det.innerHTML = `<summary>Advanced</summary><div class="adv-body"></div>`;
+    host.appendChild(det);
+    return det.querySelector('.adv-body') as HTMLElement;
   }
 
   private buildLockdownSliders(host: HTMLElement) {
@@ -559,7 +586,9 @@ export class ControlPanel {
       hint: 'Per-cell adherence. Non-compliant cells move and transmit normally.',
       onChange: (v) => { ld().compliance = v / 100; this.dirty(); },
     });
-    [mobility, transmission, compliance].forEach((s) => host.appendChild(s.el));
+    host.appendChild(transmission.el);
+    const adv = this.advancedGroup(host);
+    [mobility, compliance].forEach((s) => adv.appendChild(s.el));
     return { mobility, transmission, compliance };
   }
 
@@ -595,7 +624,9 @@ export class ControlPanel {
       hint: 'How long a quarantine persists from the tick of detection.',
       onChange: (v) => { q().duration = v | 0; this.dirty(); },
     });
-    [detection, range, protection, sourceControl, duration].forEach((s) => host.appendChild(s.el));
+    host.appendChild(detection.el);
+    const adv = this.advancedGroup(host);
+    [range, protection, sourceControl, duration].forEach((s) => adv.appendChild(s.el));
     return { detection, range, protection, sourceControl, duration };
   }
 
@@ -725,6 +756,14 @@ export class ControlPanel {
     return this.picker.getCustomName();
   }
 }
+
+// Chrome iconography — one geometric SVG language (16px, stroke currentColor)
+// instead of the split emoji/SVG set. The emoji stay where they belong: on the
+// petri specimen itself.
+const ICON_SHIELD = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.7l5.3 1.9v3.9c0 3.3-2.2 5.6-5.3 6.8-3.1-1.2-5.3-3.5-5.3-6.8V3.6z"/></svg>`;
+const ICON_PEOPLE = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.2" r="2.6"/><path d="M2.8 14c.7-2.9 2.7-4.4 5.2-4.4s4.5 1.5 5.2 4.4"/></svg>`;
+const ICON_VIRUS = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3.1"/><path d="M8 1.6v3.2M8 11.2v3.2M1.6 8h3.2M11.2 8h3.2M3.5 3.5l2.2 2.2M10.3 10.3l2.2 2.2M3.5 12.5l2.2-2.2M10.3 5.7l2.2-2.2"/></svg>`;
+const ICON_FIT = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 13.5V2M2 13.5h12M4 11l3-4 2.5 2L13.5 4"/></svg>`;
 
 function formatDays(v: number): string {
   // "lifelong" reserved for the very top of the slider — see IMMUNITY_MAX_DAYS.

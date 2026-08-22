@@ -2,6 +2,7 @@
 // in place and fires onChange so the cost tile, chart, and totals re-price the
 // entire run instantly (the cost layer is a pure function of recorded counts).
 
+import { installFocusTrap } from './focus';
 import type { CostConfig, CostLedger, CurrencySpec, PathogenCostProfile } from '../types';
 import {
   CURRENCIES,
@@ -105,6 +106,7 @@ const SECTIONS: Section[] = [
 
 export class CostModal {
   private el: HTMLDivElement | null = null;
+  private untrap: (() => void) | null = null;
   private cfg: CostConfig;
   private events: CostModalEvents;
   private lastLedger: CostLedger | null = null;
@@ -142,7 +144,7 @@ export class CostModal {
         <button class="about-close" type="button" aria-label="Close">×</button>
         <div class="about-body cost-body">
           <header class="cost-head">
-            <h2>💲 Cost model</h2>
+            <h2>Cost model</h2>
             <p class="about-tag">Economic burden of the outbreak. Edit any value — the whole run re-prices instantly.</p>
           </header>
           <div class="cost-summary" data-cost-summary></div>
@@ -166,12 +168,18 @@ export class CostModal {
       pressOnBackdrop = false;
     });
     document.addEventListener('keydown', this.onKey);
+    this.untrap = installFocusTrap(
+      overlay.querySelector('.about-card') as HTMLElement,
+      overlay.querySelector('.about-close') as HTMLElement,
+    );
 
     this.renderBody();
   }
 
   close(): void {
     if (!this.el) return;
+    this.untrap?.();
+    this.untrap = null;
     document.removeEventListener('keydown', this.onKey);
     const e = this.el;
     this.el = null;

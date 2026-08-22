@@ -245,23 +245,37 @@ export class Chart {
     if (window.matchMedia('(max-width: 1080px)').matches) {
       return window.matchMedia('(max-width: 700px)').matches ? 160 : 180;
     }
-    // Desktop overlay card: the card height is auto (it grows to fit the
-    // canvas + however many rows the legend wraps to), so a fixed canvas
-    // height is used rather than deriving from the container — deriving would
-    // be circular. The Expand button gives a larger view on demand.
-    return 188;
+    // Observe layout: the chart module owns a tall grid track, so fill it —
+    // host height is grid-determined (definite), not content-driven.
+    if (document.querySelector('.app-main.layout-observe')) {
+      const legend = this.host.querySelector<HTMLElement>('.u-legend');
+      const legendH = legend ? legend.offsetHeight + 12 : 48;
+      const avail = this.host.clientHeight - legendH - 10;
+      if (avail >= 180) return Math.min(760, avail);
+    }
+    // Configure layout: the module height is content-driven, so a fixed
+    // canvas height is used rather than deriving from the container —
+    // deriving would be circular. Expand gives a larger view on demand.
+    return 200;
   }
 
   update(long: LongStats): void {
     this.lastLong = long;
+    // Ready state: a single day-0 sample would plot as a meaningless flat
+    // line on a −1…1 axis. Until the run has recorded at least two days,
+    // show a designed ready card instead of an empty plot.
     const empty = this.view === 'costs'
-      ? !this.costData || this.costData.tick.length === 0
-      : long.tick.length === 0;
+      ? !this.costData || this.costData.tick.length <= 1
+      : long.tick.length <= 1;
     if (empty) {
       // Tear down any existing plot before wiping the DOM, otherwise the next
       // non-empty update would call setData() on a detached uPlot instance.
       this.destroyPlot();
-      this.host.innerHTML = '<div class="chart-empty">Waiting for first tick…</div>';
+      this.host.innerHTML = `
+        <div class="chart-empty">
+          <span class="chart-empty-kicker">No recording yet</span>
+          <span class="chart-empty-msg">Press <kbd>Space</kbd> to run the simulation — daily counts chart here from day 0.</span>
+        </div>`;
       return;
     }
 
@@ -337,7 +351,11 @@ export class Chart {
               if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) {
                 return isReff ? [0, 2] : [0, 1];
               }
-              if (dataMin === dataMax) return [dataMin - 1, dataMax + 1];
+              // Flat series: pad upward only for count data — a −1…N axis
+              // would imply negative people.
+              if (dataMin === dataMax) {
+                return isReff ? [dataMin - 1, dataMax + 1] : [Math.max(0, dataMin - 1), Math.max(1, dataMax * 1.5)];
+              }
               const pad = (dataMax - dataMin) * 0.08;
               const lo = Math.max(0, dataMin - pad);
               const hi = dataMax + pad;

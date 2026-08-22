@@ -45,6 +45,11 @@ export class BackendMenu {
     this.el = pop;
     this.render(null);
     this.position();
+    // Keyboard: focus lands on the requested backend's row; arrows cycle.
+    const initial =
+      pop.querySelector<HTMLButtonElement>(`.bp-row[data-backend="${this.opts.getState().requested}"]`) ??
+      pop.querySelector<HTMLButtonElement>('.bp-row');
+    initial?.focus();
 
     requestAnimationFrame(() => {
       document.addEventListener('pointerdown', this.onOutside, true);
@@ -80,6 +85,9 @@ export class BackendMenu {
 
   private render(probe: BackendProbeMessage | null): void {
     if (!this.el) return;
+    // innerHTML replacement drops focus — remember which row had it so the
+    // async probe re-render doesn't strand keyboard users.
+    const focused = (document.activeElement as HTMLElement | null)?.dataset?.['backend'] ?? null;
     const { requested, active, reason } = this.opts.getState();
     const avail: Record<EngineBackend, BackendAvailability | null> = {
       cpu: { ok: true },
@@ -126,6 +134,7 @@ export class BackendMenu {
         this.close();
       });
     });
+    if (focused) this.el.querySelector<HTMLButtonElement>(`.bp-row[data-backend="${focused}"]`)?.focus();
   }
 
   /** Left-align under the anchor, clamped inside the viewport. */
@@ -145,7 +154,27 @@ export class BackendMenu {
   };
 
   private onKey = (ev: KeyboardEvent) => {
-    if (ev.key === 'Escape') this.close();
+    if (ev.key === 'Escape') {
+      this.close();
+      (this.anchor as HTMLElement | null)?.focus?.();
+      return;
+    }
+    if (!this.el) return;
+    const rows = Array.from(this.el.querySelectorAll<HTMLButtonElement>('.bp-row'));
+    if (rows.length === 0) return;
+    const idx = rows.indexOf(document.activeElement as HTMLButtonElement);
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const dir = ev.key === 'ArrowDown' ? 1 : -1;
+      const next = idx < 0 ? (dir === 1 ? 0 : rows.length - 1) : (idx + dir + rows.length) % rows.length;
+      rows[next].focus();
+    } else if (ev.key === 'Home') {
+      ev.preventDefault();
+      rows[0].focus();
+    } else if (ev.key === 'End') {
+      ev.preventDefault();
+      rows[rows.length - 1].focus();
+    }
   };
 
   private onReflow = () => this.position();

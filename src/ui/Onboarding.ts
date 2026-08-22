@@ -32,13 +32,13 @@ export class Onboarding {
       <h2 id="onboard-title">Welcome to MemeLab — CDA v3</h2>
       <p class="onboard-tag">Simulate outbreaks. Evolve strains. Master defenses.</p>
       <ol class="onboard-steps">
-        <li><strong>Pick a disease</strong> — top-right panel. Click the disease name to browse presets.</li>
-        <li><strong>Tune defenses</strong> — left panel. Adjust mask + vaccine uptake and effectiveness.</li>
-        <li><strong>Press <kbd>Space</kbd></strong> to play, <kbd>→</kbd> to step a day, <kbd>R</kbd> to reset.</li>
-        <li><strong>Share</strong> — the Share button copies a deterministic URL (and a QR code) anyone can replay.</li>
+        <li><strong>Pick a disease</strong> — right panel. Click the disease name to browse presets.</li>
+        <li><strong>Switch on interventions</strong> — left panel. Masks, vaccines, lockdowns, quarantine.</li>
+        <li><strong>Press <kbd>Space</kbd></strong> to run, <kbd>→</kbd> to step a day, <kbd>R</kbd> to restart.</li>
+        <li><strong>Fit real data</strong> — the estimation workspace fits observed outbreaks back to parameters.</li>
       </ol>
       <div class="onboard-actions">
-        <button class="btn btn-primary" data-cta="hanta">Run a Bundibugyo Ebola outbreak →</button>
+        <button class="btn btn-primary" data-cta="hanta">Run the default outbreak →</button>
         <button class="btn" data-cta="dismiss">Explore on my own</button>
       </div>
       <p class="onboard-foot">Institute of Armchair Epidemiology · clean-room V3 rebuild</p>

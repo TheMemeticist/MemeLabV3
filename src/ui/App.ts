@@ -11,6 +11,7 @@ import { R0Modal } from './R0Modal';
 import { ShareMenu } from './ShareMenu';
 import { BackendMenu } from './BackendMenu';
 import { installTooltip } from './Tooltip';
+import { installFocusTrap } from './focus';
 import { read, write } from '../lib/storage';
 import { effectiveReduction, interventionWindows, migrateInterventionSpecs, syncSpecsWithToggle, transmissionSchedule } from '../lib/fit';
 import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
@@ -33,10 +34,14 @@ export class App {
   private speedIdx = 2;
   private playing = false;
   private theme: 'petri' | 'lab' = 'petri';
+  // Workspace arrangement: Configure = full 3-column grid; Observe = the
+  // parameter asides step aside and specimen + time series go large.
+  private layoutMode: 'configure' | 'observe' = read<'configure' | 'observe'>('layout', 'configure');
   private toolbarBtns: Record<string, HTMLButtonElement> = {};
-  private speedBtn!: HTMLButtonElement;
   private mutateBtn!: HTMLButtonElement;
   private engineBtn!: HTMLButtonElement;
+  private dishMeta: HTMLElement | null = null;
+  private chartModalUntrap: (() => void) | null = null;
   // Engine backend preference (runtime setting, NOT part of SimConfig or
   // permalinks — see EngineBackend in types.ts). Default wasm: bit-identical
   // to the TS engine, just faster; the worker falls back automatically.
@@ -108,6 +113,9 @@ export class App {
     let initialConfig = defaults.config;
     let initialPresetId = defaults.presetId;
     let initialCustomName: string | null = null;
+    // Default theme follows the OS unless the URL or a saved session says
+    // otherwise (both branches below may override).
+    if (window.matchMedia('(prefers-color-scheme: dark)').matches) this.theme = 'lab';
     if (fromUrl) {
       const applied = applyEncoded(fromUrl, defaults.config);
       initialConfig = applied.config;
@@ -274,50 +282,63 @@ export class App {
           <span class="brand-tagline">Simulate outbreaks. Evolve strains. Master defenses.</span>
         </div>
         <div class="topbar-actions">
-          <a class="btn ghost" href="https://github.com/TheMemeticist/MemeLabV3" target="_blank" rel="noopener noreferrer" aria-label="View source on GitHub">
-            <svg class="btn-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.418 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.009-.868-.013-1.703-2.782.604-3.369-1.342-3.369-1.342-.454-1.155-1.11-1.463-1.11-1.463-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.03-2.682-.103-.253-.447-1.27.097-2.646 0 0 .84-.269 2.75 1.025A9.563 9.563 0 0 1 12 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.376.202 2.394.1 2.646.64.698 1.026 1.591 1.026 2.682 0 3.841-2.337 4.687-4.565 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z"/></svg>
-            GitHub
-          </a>
           <button class="btn ghost" data-act="about" data-tip="What is this? Model overview, history, backing research.">
             <span class="btn-icon">?</span>What is this?
           </button>
           <button class="btn ghost" data-act="cost" data-tip="Edit the economic cost model — region, currency, severity, unit costs, hospital capacity.">
-            <span class="btn-icon">💲</span>Cost model
+            <span class="btn-icon"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 1.5v13M11 4H6.6a2 2 0 000 4h2.8a2 2 0 010 4H5"/></svg></span>Cost model
           </button>
+          <a class="btn ghost" href="https://github.com/TheMemeticist/MemeLabV3" target="_blank" rel="noopener noreferrer" aria-label="View source on GitHub">
+            <svg class="btn-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.418 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.009-.868-.013-1.703-2.782.604-3.369-1.342-3.369-1.342-.454-1.155-1.11-1.463-1.11-1.463-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.03-2.682-.103-.253-.447-1.27.097-2.646 0 0 .84-.269 2.75 1.025A9.563 9.563 0 0 1 12 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.376.202 2.394.1 2.646.64.698 1.026 1.591 1.026 2.682 0 3.841-2.337 4.687-4.565 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z"/></svg>
+            GitHub
+          </a>
+          <span class="topbar-divider" aria-hidden="true"></span>
           <button class="btn" data-act="share" data-tip="Share this run — copies the permalink and opens a QR code. The link encodes the full state so anyone can replay it exactly.">
-            <span class="btn-icon">🔗</span>Share
+            <span class="btn-icon"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M6.5 9.5l3-3M5 11l-1.2 1.2a2.4 2.4 0 01-3.4-3.4L3.6 5.6a2.4 2.4 0 013.4 0M11 5l1.2-1.2a2.4 2.4 0 013.4 3.4l-3.2 3.2a2.4 2.4 0 01-3.4 0" transform="scale(0.94) translate(0.5 0.5)"/></svg></span>Share
           </button>
           <button class="btn" data-act="export" data-tip="Download PNG snapshot, CSV stats, and JSON config.">
-            <span class="btn-icon">⤓</span>Export
-          </button>
-          <button class="btn ghost" data-act="reset-defaults" data-tip="Clear saved state and reload with factory defaults. Useful after updates.">
-            <span class="btn-icon">↺</span>Reset
+            <span class="btn-icon"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v8m0 0l-3-3m3 3l3-3M2.5 13.5h11"/></svg></span>Export
           </button>
           <button class="btn icon-only" data-act="theme" aria-label="Toggle theme" data-tip="Switch theme"></button>
+          <span class="topbar-divider" aria-hidden="true"></span>
+          <button class="btn danger-ghost" data-act="reset-defaults" data-tip="Erase all saved state (runs, fits, interventions, preferences) and reload with factory defaults. Asks once before erasing.">
+            Reset app…
+          </button>
         </div>
       </header>
 
       <div class="toolbar" role="toolbar" aria-label="Simulation controls">
-        <button class="tb-btn" data-act="play" aria-label="Play (Space)" title="Play / Pause (Space)">▶</button>
-        <button class="tb-btn" data-act="step" aria-label="Step one day (→)" title="Step (→)">▎▶</button>
-        <button class="tb-btn" data-act="reset" aria-label="Reset (R)" title="Reset (R)">↺</button>
+        <button class="tb-btn tb-play" data-act="play" aria-label="Play (Space)" title="Play / Pause (Space)"><span class="tb-ico">▶</span>Play</button>
+        <button class="tb-btn" data-act="step" aria-label="Step one day (→)" title="Step one day (→)"><span class="tb-ico">▎▶</span>Step</button>
+        <button class="tb-btn" data-act="reset" aria-label="Restart run (R)" title="Restart run (R)"><span class="tb-ico">↺</span>Restart</button>
         <span class="tb-divider"></span>
-        <button class="tb-btn" data-act="speed" aria-label="Cycle speed" title="Speed">1×</button>
-        <button class="tb-btn" data-act="mutate" aria-label="Toggle natural selection" title="Natural selection">🧬 off</button>
-        <button class="tb-btn" data-act="engine" aria-label="Cycle engine backend" data-tip="Engine backend: CPU (reference), WASM (identical results, faster), or GPU (WebGPU compute — its own random stream; huge grids). Switching resets the run.">⚙ WASM</button>
+        <div class="seg speed-seg" role="group" aria-label="Simulation speed">
+          <span class="seg-label">Speed</span>
+          ${SPEEDS.map((s, i) => `<button class="seg-btn" type="button" data-speed="${i}" aria-pressed="false">${s < 1 ? (s === 0.25 ? '¼' : '½') : s}×</button>`).join('')}
+        </div>
+        <button class="tb-btn tb-toggle" data-act="mutate" aria-pressed="false" data-tip="Natural selection: strains mutate as they replicate — attack rate, IFR, and the rest drift under selection pressure."><span class="tgl-dot" aria-hidden="true"></span>Natural selection</button>
+        <button class="tb-btn engine-chip" data-act="engine" aria-haspopup="menu" aria-label="Engine backend menu"><span class="chip-dot pending" data-enginedot aria-hidden="true"></span>Engine <b data-enginename>—</b><span class="chip-caret" aria-hidden="true">▾</span></button>
         <span class="tb-spacer"></span>
+        <div class="seg view-seg" role="group" aria-label="Workspace layout">
+          <button class="seg-btn" type="button" data-layout="configure" aria-pressed="true" title="Full workspace: parameters, specimen, and chart">Configure</button>
+          <button class="seg-btn" type="button" data-layout="observe" aria-pressed="false" title="Focus on the specimen and time series; parameters step aside">Observe</button>
+        </div>
         <span class="tb-meta" data-meta="rN">R<sub>0</sub> = —</span>
         <span class="tb-meta" data-meta="strains">Strains: 1</span>
       </div>
 
-      <main class="app-main">
-        <aside class="left-panel" aria-label="Population and defenses"></aside>
+      <main class="app-main layout-configure">
+        <aside class="left-panel" aria-label="Interventions and population"></aside>
         <section class="center-panel">
           <div class="ended-banner" data-section="ended-banner" hidden></div>
           <div class="stats-row" data-section="stats"></div>
-          <div class="petri-area" data-section="petri"></div>
+          <div class="module module-dish">
+            <div class="module-head"><span class="module-kicker">Specimen</span><span class="module-note" data-dishmeta></span></div>
+            <div class="petri-area" data-section="petri"></div>
+          </div>
           <div class="chart-wrap" data-section="chart-wrap">
             <div class="chart-tabs" role="tablist" aria-label="Chart view">
+              <span class="chart-kicker" aria-hidden="true">Time series</span>
               <button class="chart-tab" role="tab" data-view="compartments" aria-selected="true">Compartments</button>
               <button class="chart-tab" role="tab" data-view="reff" aria-selected="false">R<sub>eff</sub></button>
               <button class="chart-tab" role="tab" data-view="costs" aria-selected="false">Costs</button>
@@ -325,7 +346,7 @@ export class App {
                 <button class="chart-mode-btn active" data-mode="active" title="Currently in each state">Active</button>
                 <button class="chart-mode-btn" data-mode="total" title="Cumulative totals (e.g. total ever infected)">Total</button>
               </div>
-              <button class="chart-fit-chip" data-act="fit-chip" type="button" hidden data-tip="A fitted R(t) intervention schedule from the R₀ Estimator is modulating transmission in this run (shaded windows). Click ✕ to clear it and restart clean.">📈 fitted R(t) <span class="chip-x">✕</span></button>
+              <button class="chart-fit-chip" data-act="fit-chip" type="button" hidden data-tip="A fitted R(t) intervention schedule from the R₀ Estimator is modulating transmission in this run (shaded windows). Click ✕ to clear it and restart clean.">fitted R(t) <span class="chip-x">✕</span></button>
               <button class="chart-expand" data-act="expand-chart" type="button" title="Expand chart" aria-label="Expand chart" aria-pressed="false">⤢</button>
             </div>
             <div class="chart-area" data-section="chart"></div>
@@ -336,7 +357,7 @@ export class App {
 
       <footer class="footer">
         <span class="footer-left">Institute of Armchair Epidemiology · clean-room V3 rebuild</span>
-        <span class="footer-right">v3 · 10× faster · fully deterministic</span>
+        <span class="footer-right">v3 · fully deterministic</span>
       </footer>
 
       <div class="toast" role="status" aria-live="polite" hidden></div>
@@ -410,9 +431,22 @@ export class App {
       this.toolbarBtns[act] = b;
       b.addEventListener('click', () => this.toolbarAction(act));
     });
-    this.speedBtn = this.toolbarBtns['speed'];
     this.mutateBtn = this.toolbarBtns['mutate'];
     this.engineBtn = this.toolbarBtns['engine'];
+
+    // Speed — a segmented control: every rate is one click and the active
+    // rate is always readable (no blind cycling).
+    this.root.querySelectorAll<HTMLButtonElement>('.speed-seg .seg-btn').forEach((b) => {
+      b.addEventListener('click', () => this.setSpeed(Number(b.dataset['speed'])));
+    });
+
+    // Workspace layout toggle (Observe / Configure).
+    this.root.querySelectorAll<HTMLButtonElement>('.view-seg .seg-btn').forEach((b) => {
+      b.addEventListener('click', () => this.setLayoutMode(b.dataset['layout'] === 'observe' ? 'observe' : 'configure'));
+    });
+    this.applyLayoutMode();
+
+    this.dishMeta = this.root.querySelector('[data-dishmeta]');
     this.backendMenu = new BackendMenu(this.engineBtn, {
       getState: () => ({ requested: this.requestedBackend, active: this.activeBackend, reason: this.backendReason }),
       probe: () => this.probeBackends(),
@@ -455,8 +489,27 @@ export class App {
       getInterventions: () => this.interventions,
       onInterventionsChange: () => write('interventions', this.interventions),
     });
-    (this.root.querySelector('[data-act="reset-defaults"]') as HTMLButtonElement)
-      .addEventListener('click', () => { localStorage.clear(); location.reload(); });
+    // Reset app — destructive, so it arms on first click and only erases on a
+    // confirming second click (auto-disarms after a few seconds).
+    const resetBtn = this.root.querySelector('[data-act="reset-defaults"]') as HTMLButtonElement;
+    let resetArmed = false;
+    let resetTimer = 0;
+    resetBtn.addEventListener('click', () => {
+      if (!resetArmed) {
+        resetArmed = true;
+        resetBtn.classList.add('confirming');
+        resetBtn.textContent = 'Erase saved state?';
+        resetTimer = window.setTimeout(() => {
+          resetArmed = false;
+          resetBtn.classList.remove('confirming');
+          resetBtn.textContent = 'Reset app…';
+        }, 5000);
+        return;
+      }
+      clearTimeout(resetTimer);
+      localStorage.clear();
+      location.reload();
+    });
 
     this.refreshPlayLabel();
   }
@@ -508,6 +561,10 @@ export class App {
     const rNStr = msg.rNaught == null ? '—' : msg.rNaught.toFixed(1);
     this.metaSet('rN', `R₀ = ${rNStr}`);
     this.metaSet('strains', `Strains: ${msg.stats.strains}`);
+    if (this.dishMeta) {
+      const geo = this.controls.config().geometry ?? 'square';
+      this.dishMeta.textContent = `${msg.size}×${msg.size} · ${(msg.size * msg.size).toLocaleString()} cells · ${geo}`;
+    }
 
     this.checkEpidemicEnded(msg);
   }
@@ -692,10 +749,12 @@ export class App {
       wrap.classList.add('chart-wrap--expanded');
       this.chartEscHandler = (e: KeyboardEvent) => { if (e.key === 'Escape') this.setChartExpanded(false); };
       window.addEventListener('keydown', this.chartEscHandler);
-      close.focus();
+      this.chartModalUntrap = installFocusTrap(modal, close);
     } else {
       wrap.classList.remove('chart-wrap--expanded');
       (this.chartWrapHome ?? this.root.querySelector('.center-panel'))?.appendChild(wrap);
+      this.chartModalUntrap?.();
+      this.chartModalUntrap = null;
       this.chartModal?.remove();
       this.chartModal = null;
       if (this.chartEscHandler) window.removeEventListener('keydown', this.chartEscHandler);
@@ -922,7 +981,6 @@ export class App {
       case 'play': this.handlePlay(); break;
       case 'step': this.handleStep(); break;
       case 'reset': this.handleReset(); break;
-      case 'speed': this.cycleSpeed(); break;
       case 'mutate': this.toggleMutate(); break;
       case 'engine': this.backendMenu.toggle(); break;
     }
@@ -958,10 +1016,14 @@ export class App {
 
   private refreshEngineLabel(): void {
     const shown = this.activeBackend ?? this.requestedBackend;
-    const icon = shown === 'gpu' ? '⚡' : '⚙';
-    this.engineBtn.textContent = `${icon} ${shown.toUpperCase()}`;
-    this.engineBtn.classList.toggle('active', shown === 'gpu');
+    const name = this.engineBtn.querySelector<HTMLElement>('[data-enginename]');
+    if (name) name.textContent = shown.toUpperCase();
     const fellBack = this.activeBackend !== null && this.activeBackend !== this.requestedBackend;
+    const dot = this.engineBtn.querySelector<HTMLElement>('[data-enginedot]');
+    if (dot) {
+      dot.classList.toggle('pending', this.activeBackend === null);
+      dot.classList.toggle('fallback', fellBack);
+    }
     this.engineBtn.classList.toggle('fallback', fellBack);
     // Persistent explanation — a transient toast is easy to miss.
     let tip = 'Engine backend — CPU: reference engine · WASM: identical results, faster · GPU: WebGPU compute (own random stream, huge grids). Switching restarts the run.';
@@ -1012,11 +1074,31 @@ export class App {
     this.refreshPlayLabel();
   }
 
-  private cycleSpeed(): void {
-    this.speedIdx = (this.speedIdx + 1) % SPEEDS.length;
+  private setSpeed(idx: number): void {
+    this.speedIdx = clampInt(idx, 0, SPEEDS.length - 1);
     this.refreshSpeedLabel();
     if (this.playing) this.send({ cmd: 'play', tps: this.tps() });
     this.persist();
+  }
+
+  private setLayoutMode(mode: 'configure' | 'observe'): void {
+    if (mode === this.layoutMode) return;
+    this.layoutMode = mode;
+    write('layout', mode);
+    this.applyLayoutMode();
+    // The dish and chart get new boxes; nudge their resize observers now.
+    window.dispatchEvent(new Event('resize'));
+  }
+
+  private applyLayoutMode(): void {
+    const main = this.root.querySelector('.app-main');
+    if (main) {
+      main.classList.toggle('layout-observe', this.layoutMode === 'observe');
+      main.classList.toggle('layout-configure', this.layoutMode === 'configure');
+    }
+    this.root.querySelectorAll<HTMLButtonElement>('.view-seg .seg-btn').forEach((b) => {
+      b.setAttribute('aria-pressed', b.dataset['layout'] === this.layoutMode ? 'true' : 'false');
+    });
   }
 
   private toggleMutate(): void {
@@ -1042,24 +1124,28 @@ export class App {
   }
 
   private refreshThemeLabel(): void {
-    this.themeBtn.innerHTML = this.theme === 'petri' ? '🌙' : '☀️';
-    this.themeBtn.title = `Switch to ${this.theme === 'petri' ? 'Lab (dark)' : 'Petri (light)'} theme`;
+    const moon = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.5A6 6 0 016.5 2.5a6 6 0 107 7z"/></svg>';
+    const sun = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></svg>';
+    this.themeBtn.innerHTML = this.theme === 'petri' ? moon : sun;
+    this.themeBtn.title = `Switch to ${this.theme === 'petri' ? 'dark' : 'light'} theme`;
   }
 
   private refreshPlayLabel(): void {
     const b = this.toolbarBtns['play'];
-    b.textContent = this.playing ? '⏸' : '▶';
+    b.innerHTML = this.playing
+      ? '<span class="tb-ico">⏸</span>Pause'
+      : '<span class="tb-ico">▶</span>Play';
     b.setAttribute('aria-pressed', this.playing ? 'true' : 'false');
   }
 
   private refreshSpeedLabel(): void {
-    this.speedBtn.textContent = `${SPEEDS[this.speedIdx]}×`;
+    this.root.querySelectorAll<HTMLButtonElement>('.speed-seg .seg-btn').forEach((b) => {
+      b.setAttribute('aria-pressed', Number(b.dataset['speed']) === this.speedIdx ? 'true' : 'false');
+    });
   }
 
   private refreshMutateLabel(): void {
     const on = this.controls.config().mutate;
-    this.mutateBtn.innerHTML = `🧬 ${on ? 'on' : 'off'}`;
-    this.mutateBtn.classList.toggle('active', on);
     this.mutateBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
   }
 
