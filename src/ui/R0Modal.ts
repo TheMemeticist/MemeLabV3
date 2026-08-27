@@ -16,6 +16,7 @@ import { FitPool } from '../lib/fit-pool';
 import { Slider } from './Slider';
 import { installFocusTrap } from './focus';
 import { read, remove, write } from '../lib/storage';
+import { icon } from './icons';
 import {
   CATEGORY_LABELS,
   FIT_CATEGORIES,
@@ -464,7 +465,7 @@ export class R0Modal {
     overlay.setAttribute('aria-label', 'R₀ Estimator');
     overlay.innerHTML = `
       <div class="r0-card">
-        <button class="r0-close" type="button" aria-label="Close">×</button>
+        <button class="r0-close" type="button" aria-label="Close">${icon('close')}</button>
         <div class="r0-body">${TEMPLATE}</div>
       </div>
     `;
@@ -590,7 +591,7 @@ export class R0Modal {
     host.innerHTML = `
       <span>Restored your previous session — population, dataset, bounds and offsets persist between visits and quietly shape new fits.</span>
       <button class="btn ghost" type="button" data-r0="reset">Reset to defaults</button>
-      <button class="r0-banner-x" type="button" aria-label="Dismiss">×</button>
+      <button class="r0-banner-x" type="button" aria-label="Dismiss">${icon('close')}</button>
     `;
     host.querySelector<HTMLButtonElement>('[data-r0="reset"]')!.addEventListener('click', () => this.resetToDefaults());
     host.querySelector<HTMLButtonElement>('.r0-banner-x')!.addEventListener('click', () => { host.hidden = true; });
@@ -932,7 +933,7 @@ export class R0Modal {
         <select class="r0-in" data-col="category" aria-label="Category">
           ${FIT_CATEGORIES.map((c) => `<option value="${c}"${c === pt.category ? ' selected' : ''}>${CATEGORY_LABELS[c]}</option>`).join('')}
         </select>
-        <button class="r0-del" type="button" aria-label="Delete row" title="Delete">×</button>
+        <button class="r0-del" type="button" aria-label="Delete row" title="Delete">${icon('delete')}</button>
       `;
       row.querySelector<HTMLInputElement>('[data-col="day"]')!.addEventListener('change', (e) => {
         pt.day = Number((e.target as HTMLInputElement).value);
@@ -1053,7 +1054,7 @@ export class R0Modal {
             ${['custom', 'mask', 'vaccine', 'lockdown', 'quarantine']
               .map((k) => `<option value="${k}"${iv.intervention === k ? ' selected' : ''}>${k}</option>`).join('')}
           </select>
-          <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">×</button>
+          <button class="r0-del" type="button" aria-label="Remove intervention" title="Remove">${icon('delete')}</button>
         </div>
         <div class="r0-itv-kf" data-iv="kf">
           <div class="r0-itv-kf-head">
@@ -1109,9 +1110,9 @@ export class R0Modal {
         row.className = 'r0-kf-row';
         row.innerHTML = `
           <div class="r0-kf-row-head" role="button" tabindex="0" aria-label="Toggle keyframe ${ki + 1} sliders">
-            <button class="r0-kf-caret" type="button" aria-label="Expand or collapse this keyframe">▸</button>
+            <button class="r0-kf-caret" type="button" aria-label="Expand or collapse this keyframe">${icon('caretRight')}</button>
             <label>day <input class="r0-in tiny" type="number" step="1" value="${kf.tick}" data-kf="day" aria-label="Keyframe day" /></label>
-            <button class="r0-del" type="button" aria-label="Delete keyframe" ${kfs.length <= 1 ? 'disabled' : ''}>×</button>
+            <button class="r0-del" type="button" aria-label="Delete keyframe" ${kfs.length <= 1 ? 'disabled' : ''}>${icon('delete')}</button>
           </div>
           <div class="r0-kf-body" hidden></div>
         `;
@@ -1120,7 +1121,7 @@ export class R0Modal {
         const caret = row.querySelector<HTMLElement>('.r0-kf-caret')!;
         const toggle = (): void => {
           body.hidden = !body.hidden;
-          caret.textContent = body.hidden ? '▸' : '▾';
+          caret.innerHTML = body.hidden ? icon('caretRight') : icon('caretDown');
           if (!body.hidden && body.childElementCount === 0) {
             // This keyframe's OWN sliders — same set as the top of the card.
             this.renderParamSliders(body, iv, {
@@ -1294,7 +1295,7 @@ export class R0Modal {
         row.innerHTML = `
           <label>day <input class="r0-in tiny" type="number" step="1" value="${f.day}" data-kf="day" aria-label="${label} keyframe day" /></label>
           <label>× <input class="r0-in tiny" type="number" step="0.1" min="1" value="${f.m}" data-kf="m" aria-label="${label} keyframe multiplier" /></label>
-          <button class="r0-del" type="button" aria-label="Delete keyframe" ${frames.length <= 1 ? 'disabled' : ''}>×</button>
+          <button class="r0-del" type="button" aria-label="Delete keyframe" ${frames.length <= 1 ? 'disabled' : ''}>${icon('delete')}</button>
         `;
         row.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
           f.day = Math.round(Number((e.target as HTMLInputElement).value)) || 0;
@@ -2605,7 +2606,7 @@ function holdoutLine(r: FitResult): string {
   // Poisson NLL can be negative; compare on the difference scaled by |fit|.
   const worse = Number.isFinite(h) && Number.isFinite(f) && (h - f) > 0.5 * Math.max(1, Math.abs(f));
   const tip = 'The best-fit disease re-simulated at K trials on a DIFFERENT seed set (fresh RNG draws; a fresh topology on Voronoi). Candidates are compared on shared seeds (common random numbers) for fair, deterministic ranking — this checks the winner generalizes beyond those specific draws. A much worse holdout loss means the fit was riding its seed set: raise K (trials).';
-  return `<span class="r0-metric-sub ${worse ? 'r0-holdout-warn' : ''}" data-tip="${tip}">held-out seeds: loss ${fmtLoss(h)} (fit ${fmtLoss(f)})${worse ? ' ⚠ raise K' : ' ✓'}</span>`;
+  return `<span class="r0-metric-sub ${worse ? 'r0-holdout-warn' : ''}" data-tip="${tip}">held-out seeds: loss ${fmtLoss(h)} (fit ${fmtLoss(f)})${worse ? ` ${icon('warning','r0-inline-ico')} raise K` : ` ${icon('check','r0-inline-ico')}`}</span>`;
 }
 
 // Turns the R² goodness-of-fit number into a plain-language, color-coded rating

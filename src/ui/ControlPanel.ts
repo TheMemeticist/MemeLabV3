@@ -1,4 +1,5 @@
 import type { GeometryType, InterventionKey, SimConfig, StrainGenes } from '../types';
+import { ICONS, icon } from './icons';
 import { Slider } from './Slider';
 import { PresetPicker } from './PresetPicker';
 import { findPreset, type DiseasePreset } from '../sim/presets';
@@ -49,20 +50,20 @@ export class ControlPanel {
         <button type="button" class="panel-head" aria-expanded="true" data-toggle="interventions">
           <h3>Interventions</h3>
           <span class="panel-icon" aria-hidden="true">${ICON_SHIELD}</span>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
+          <span class="panel-chevron" aria-hidden="true">${icon('caretDown')}</span>
         </button>
         <div class="panel-body intervention-stack">
-          ${this.interventionCardMarkup('mask', 'Mask', '😷')}
-          ${this.interventionCardMarkup('vaccine', 'Vaccine', '💉')}
-          ${this.interventionCardMarkup('lockdown', 'Lockdown', '🚧')}
-          ${this.interventionCardMarkup('quarantine', 'Quarantine', '🚷')}
+          ${this.interventionCardMarkup('mask', 'Mask', icon('mask'))}
+          ${this.interventionCardMarkup('vaccine', 'Vaccine', icon('vaccine'))}
+          ${this.interventionCardMarkup('lockdown', 'Lockdown', icon('lockdown'))}
+          ${this.interventionCardMarkup('quarantine', 'Quarantine', icon('quarantine'))}
         </div>
       </section>
       <section class="panel collapsible" aria-label="Population" data-collapsed="false">
         <button type="button" class="panel-head" aria-expanded="true" data-toggle="population">
           <h3>Population <span class="rate-badge" data-badge="popsize">—</span></h3>
           <span class="panel-icon" aria-hidden="true">${ICON_PEOPLE}</span>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
+          <span class="panel-chevron" aria-hidden="true">${icon('caretDown')}</span>
         </button>
         <div class="panel-body" data-section="population"></div>
       </section>
@@ -269,18 +270,18 @@ export class ControlPanel {
     }
   }
 
-  private interventionCardMarkup(key: InterventionKey, label: string, icon: string): string {
+  private interventionCardMarkup(key: InterventionKey, label: string, iconHtml: string): string {
     return `
       <section class="panel collapsible intervention-item" aria-label="${label}" data-collapsed="true" data-intervention="${key}">
         <button type="button" class="panel-head" aria-expanded="false" data-toggle="${key}">
           <h3>${label} <span class="rate-badge" data-badge="${key}">—</span></h3>
           <span class="panel-summary" data-summary="${key}"></span>
-          <span class="panel-icon" aria-hidden="true">${icon}</span>
+          <span class="panel-icon" aria-hidden="true">${iconHtml}</span>
           <label class="panel-switch" data-stop title="Enable / disable ${label}">
             <input type="checkbox" data-switch="${key}" aria-label="${label} enabled" />
             <span class="panel-switch-track" aria-hidden="true"></span>
           </label>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
+          <span class="panel-chevron" aria-hidden="true">${icon('caretDown')}</span>
         </button>
         <div class="panel-body" data-section="${key}"></div>
       </section>
@@ -346,7 +347,7 @@ export class ControlPanel {
         <button type="button" class="panel-head" aria-expanded="true" data-toggle="disease">
           <h3>Disease</h3>
           <span class="panel-icon" aria-hidden="true">${ICON_VIRUS}</span>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
+          <span class="panel-chevron" aria-hidden="true">${icon('caretDown')}</span>
         </button>
         <div class="panel-body">
           <div class="preset-host"></div>
@@ -760,10 +761,10 @@ export class ControlPanel {
 // Chrome iconography — one geometric SVG language (16px, stroke currentColor)
 // instead of the split emoji/SVG set. The emoji stay where they belong: on the
 // petri specimen itself.
-const ICON_SHIELD = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.7l5.3 1.9v3.9c0 3.3-2.2 5.6-5.3 6.8-3.1-1.2-5.3-3.5-5.3-6.8V3.6z"/></svg>`;
-const ICON_PEOPLE = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.2" r="2.6"/><path d="M2.8 14c.7-2.9 2.7-4.4 5.2-4.4s4.5 1.5 5.2 4.4"/></svg>`;
-const ICON_VIRUS = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3.1"/><path d="M8 1.6v3.2M8 11.2v3.2M1.6 8h3.2M11.2 8h3.2M3.5 3.5l2.2 2.2M10.3 10.3l2.2 2.2M3.5 12.5l2.2-2.2M10.3 5.7l2.2-2.2"/></svg>`;
-const ICON_FIT = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 13.5V2M2 13.5h12M4 11l3-4 2.5 2L13.5 4"/></svg>`;
+const ICON_SHIELD = ICONS['shield'];
+const ICON_PEOPLE = ICONS['people'];
+const ICON_VIRUS = ICONS['virus'];
+const ICON_FIT = ICONS['fit'];
 
 function formatDays(v: number): string {
   // "lifelong" reserved for the very top of the slider — see IMMUNITY_MAX_DAYS.

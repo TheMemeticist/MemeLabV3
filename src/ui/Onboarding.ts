@@ -1,3 +1,5 @@
+import { ICONS, icon } from './icons';
+
 export class Onboarding {
   private el: HTMLElement;
   private onAccept: () => void;
@@ -9,26 +11,8 @@ export class Onboarding {
     card.setAttribute('role', 'dialog');
     card.setAttribute('aria-labelledby', 'onboard-title');
     card.innerHTML = `
-      <button class="onboard-close" type="button" aria-label="Close">×</button>
-      <div class="onboard-icon" aria-hidden="true">
-        <svg viewBox="0 0 80 80" width="64" height="64">
-          <circle cx="40" cy="40" r="34" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.55"/>
-          <circle cx="40" cy="40" r="22" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.35"/>
-          <g transform="translate(40 40)">
-            <circle r="6" fill="currentColor"/>
-            <g stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none">
-              <line x1="0" y1="-6" x2="0" y2="-14"/>
-              <line x1="0" y1="6" x2="0" y2="14"/>
-              <line x1="-6" y1="0" x2="-14" y2="0"/>
-              <line x1="6" y1="0" x2="14" y2="0"/>
-              <line x1="-4.2" y1="-4.2" x2="-10" y2="-10"/>
-              <line x1="4.2" y1="4.2" x2="10" y2="10"/>
-              <line x1="-4.2" y1="4.2" x2="-10" y2="10"/>
-              <line x1="4.2" y1="-4.2" x2="10" y2="-10"/>
-            </g>
-          </g>
-        </svg>
-      </div>
+      <button class="onboard-close" type="button" aria-label="Close">${icon('close')}</button>
+      <div class="onboard-icon" aria-hidden="true">${ICONS['igduo']}</div>
       <h2 id="onboard-title">Welcome to MemeLab — CDA v3</h2>
       <p class="onboard-tag">Simulate outbreaks. Evolve strains. Master defenses.</p>
       <ol class="onboard-steps">

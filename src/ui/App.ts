@@ -1,6 +1,8 @@
 import type { BackendMessage, BackendProbeMessage, CostConfig, EngineBackend, FitApplyExtras, FitWindow, FrameMessage, InterventionEvent, InterventionKey, InterventionSpec, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { findPreset, baseSimConfig, DEFAULT_PRESET_ID, type DiseasePreset } from '../sim/presets';
 import { Petri } from './Petri';
+import { ICONS, icon } from './icons';
+import { maskTierFor } from './SpriteAtlas';
 import { Chart, type ChartView, type CostChartData } from './Chart';
 import { Stats } from './Stats';
 import { ControlPanel } from './ControlPanel';
@@ -200,6 +202,10 @@ export class App {
     this.refreshFitChip();
     this.renderFitPanel();
     this.send({ cmd: 'init', config: initialConfig });
+    this.petri.setMotionEnabled(read<boolean>('motion', true));
+    this.petri.setMotionSeed(initialConfig.seed);
+    this.initMotionToggle();
+    this.syncMaskTier(initialConfig);
     if ((initialConfig.geometry ?? 'square') !== 'voronoi') {
       this.petri.setVoronoiTopology(null);
     }
@@ -252,28 +258,7 @@ export class App {
       <header class="topbar">
         <div class="brand">
           <a class="brand-link" href="./" aria-label="MemeLab home">
-            <svg class="brand-mark" viewBox="0 0 64 64" width="40" height="40" aria-hidden="true">
-              <defs>
-                <linearGradient id="bg-gloss" x1="0" y1="0" x2="1" y2="1">
-                  <stop offset="0" stop-color="currentColor" stop-opacity="0.25"/>
-                  <stop offset="1" stop-color="currentColor" stop-opacity="0.05"/>
-                </linearGradient>
-              </defs>
-              <circle cx="32" cy="32" r="28" fill="url(#bg-gloss)" stroke="currentColor" stroke-width="2"/>
-              <circle cx="32" cy="32" r="20" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.45"/>
-              <path d="M32 14 C 28 18, 28 22, 32 26 C 36 30, 36 34, 32 38 C 28 42, 28 46, 32 50"
-                    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              <path d="M28 17 L36 17 M28 23 L36 23 M28 35 L36 35 M28 41 L36 41 M28 47 L36 47"
-                    stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-              <circle cx="46" cy="22" r="4.5" fill="currentColor"/>
-              <circle cx="46" cy="22" r="2" fill="var(--bg-elevated, #fff)"/>
-              <g stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
-                <line x1="46" y1="14.5" x2="46" y2="11"/>
-                <line x1="46" y1="29.5" x2="46" y2="33"/>
-                <line x1="40" y1="22" x2="36.5" y2="22"/>
-                <line x1="55.5" y1="22" x2="52" y2="22"/>
-              </g>
-            </svg>
+            <span class="brand-mark" aria-hidden="true">${ICONS['igduo40']}</span>
             <span class="brand-text">
               <span class="brand-name">MemeLab</span>
               <span class="brand-sub">CDA <span class="brand-version">v3</span></span>
@@ -286,7 +271,7 @@ export class App {
             <span class="btn-icon">?</span>What is this?
           </button>
           <button class="btn ghost" data-act="cost" data-tip="Edit the economic cost model — region, currency, severity, unit costs, hospital capacity.">
-            <span class="btn-icon"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 1.5v13M11 4H6.6a2 2 0 000 4h2.8a2 2 0 010 4H5"/></svg></span>Cost model
+            <span class="btn-icon">${icon('cost')}</span>Cost model
           </button>
           <a class="btn ghost" href="https://github.com/TheMemeticist/MemeLabV3" target="_blank" rel="noopener noreferrer" aria-label="View source on GitHub">
             <svg class="btn-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.418 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.009-.868-.013-1.703-2.782.604-3.369-1.342-3.369-1.342-.454-1.155-1.11-1.463-1.11-1.463-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.03-2.682-.103-.253-.447-1.27.097-2.646 0 0 .84-.269 2.75 1.025A9.563 9.563 0 0 1 12 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.376.202 2.394.1 2.646.64.698 1.026 1.591 1.026 2.682 0 3.841-2.337 4.687-4.565 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z"/></svg>
@@ -294,30 +279,30 @@ export class App {
           </a>
           <span class="topbar-divider" aria-hidden="true"></span>
           <button class="btn" data-act="share" data-tip="Share this run — copies the permalink and opens a QR code. The link encodes the full state so anyone can replay it exactly.">
-            <span class="btn-icon"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M6.5 9.5l3-3M5 11l-1.2 1.2a2.4 2.4 0 01-3.4-3.4L3.6 5.6a2.4 2.4 0 013.4 0M11 5l1.2-1.2a2.4 2.4 0 013.4 3.4l-3.2 3.2a2.4 2.4 0 01-3.4 0" transform="scale(0.94) translate(0.5 0.5)"/></svg></span>Share
+            <span class="btn-icon">${icon('share')}</span>Share
           </button>
           <button class="btn" data-act="export" data-tip="Download PNG snapshot, CSV stats, and JSON config.">
-            <span class="btn-icon"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v8m0 0l-3-3m3 3l3-3M2.5 13.5h11"/></svg></span>Export
+            <span class="btn-icon">${icon('export')}</span>Export
           </button>
           <button class="btn icon-only" data-act="theme" aria-label="Toggle theme" data-tip="Switch theme"></button>
           <span class="topbar-divider" aria-hidden="true"></span>
           <button class="btn danger-ghost" data-act="reset-defaults" data-tip="Erase all saved state (runs, fits, interventions, preferences) and reload with factory defaults. Asks once before erasing.">
-            Reset app…
+            <span class="btn-icon">${icon('resetDanger')}</span>Reset app…
           </button>
         </div>
       </header>
 
       <div class="toolbar" role="toolbar" aria-label="Simulation controls">
-        <button class="tb-btn tb-play" data-act="play" aria-label="Play (Space)" title="Play / Pause (Space)"><span class="tb-ico">▶</span>Play</button>
-        <button class="tb-btn" data-act="step" aria-label="Step one day (→)" title="Step one day (→)"><span class="tb-ico">▎▶</span>Step</button>
-        <button class="tb-btn" data-act="reset" aria-label="Restart run (R)" title="Restart run (R)"><span class="tb-ico">↺</span>Restart</button>
+        <button class="tb-btn tb-play" data-act="play" aria-label="Play (Space)" title="Play / Pause (Space)"><span class="tb-ico">${icon('play')}</span>Play</button>
+        <button class="tb-btn" data-act="step" aria-label="Step one day (→)" title="Step one day (→)"><span class="tb-ico">${icon('step')}</span>Step</button>
+        <button class="tb-btn" data-act="reset" aria-label="Restart run (R)" title="Restart run (R)"><span class="tb-ico">${icon('restart')}</span>Restart</button>
         <span class="tb-divider"></span>
         <div class="seg speed-seg" role="group" aria-label="Simulation speed">
           <span class="seg-label">Speed</span>
           ${SPEEDS.map((s, i) => `<button class="seg-btn" type="button" data-speed="${i}" aria-pressed="false">${s < 1 ? (s === 0.25 ? '¼' : '½') : s}×</button>`).join('')}
         </div>
         <button class="tb-btn tb-toggle" data-act="mutate" aria-pressed="false" data-tip="Natural selection: strains mutate as they replicate — attack rate, IFR, and the rest drift under selection pressure."><span class="tgl-dot" aria-hidden="true"></span>Natural selection</button>
-        <button class="tb-btn engine-chip" data-act="engine" aria-haspopup="menu" aria-label="Engine backend menu"><span class="chip-dot pending" data-enginedot aria-hidden="true"></span>Engine <b data-enginename>—</b><span class="chip-caret" aria-hidden="true">▾</span></button>
+        <button class="tb-btn engine-chip" data-act="engine" aria-haspopup="menu" aria-label="Engine backend menu"><span class="chip-dot pending" data-enginedot aria-hidden="true"></span>Engine <b data-enginename>—</b><span class="chip-caret" aria-hidden="true">${icon('caretDown')}</span></button>
         <span class="tb-spacer"></span>
         <div class="seg view-seg" role="group" aria-label="Workspace layout">
           <button class="seg-btn" type="button" data-layout="configure" aria-pressed="true" title="Full workspace: parameters, specimen, and chart">Configure</button>
@@ -333,7 +318,7 @@ export class App {
           <div class="ended-banner" data-section="ended-banner" hidden></div>
           <div class="stats-row" data-section="stats"></div>
           <div class="module module-dish">
-            <div class="module-head"><span class="module-kicker">Specimen</span><span class="module-note" data-dishmeta></span></div>
+            <div class="module-head"><span class="module-kicker">Specimen</span><button class="motion-toggle" type="button" data-motion aria-pressed="true" title="Live motion — germs breathe, morph between states, and jiggle under the cursor (small boards)">Motion</button><span class="module-note" data-dishmeta></span></div>
             <div class="petri-area" data-section="petri"></div>
           </div>
           <div class="chart-wrap" data-section="chart-wrap">
@@ -346,8 +331,8 @@ export class App {
                 <button class="chart-mode-btn active" data-mode="active" title="Currently in each state">Active</button>
                 <button class="chart-mode-btn" data-mode="total" title="Cumulative totals (e.g. total ever infected)">Total</button>
               </div>
-              <button class="chart-fit-chip" data-act="fit-chip" type="button" hidden data-tip="A fitted R(t) intervention schedule from the R₀ Estimator is modulating transmission in this run (shaded windows). Click ✕ to clear it and restart clean.">fitted R(t) <span class="chip-x">✕</span></button>
-              <button class="chart-expand" data-act="expand-chart" type="button" title="Expand chart" aria-label="Expand chart" aria-pressed="false">⤢</button>
+              <button class="chart-fit-chip" data-act="fit-chip" type="button" hidden data-tip="A fitted R(t) intervention schedule from the R₀ Estimator is modulating transmission in this run (shaded windows). Click ✕ to clear it and restart clean.">fitted R(t) <span class="chip-x">${icon('close')}</span></button>
+              <button class="chart-expand" data-act="expand-chart" type="button" title="Expand chart" aria-label="Expand chart" aria-pressed="false">${icon('expand')}</button>
             </div>
             <div class="chart-area" data-section="chart"></div>
           </div>
@@ -651,7 +636,7 @@ export class App {
         ? 'All cases were fatal.'
         : `${pct(r)} recovered, ${pct(d)} dead.`;
     this.endedBanner.innerHTML = `
-      <div class="ended-icon" aria-hidden="true">✓</div>
+      <div class="ended-icon" aria-hidden="true">${icon('check')}</div>
       <div class="ended-text">
         <div class="ended-title">Epidemic ended · Day ${msg.tick}</div>
         <div class="ended-sub">${verdict} ${s} susceptible remain.</div>
@@ -739,7 +724,7 @@ export class App {
       close.type = 'button';
       close.className = 'chart-modal-close';
       close.setAttribute('aria-label', 'Close expanded chart');
-      close.textContent = '✕';
+      close.innerHTML = icon('close');
       close.addEventListener('click', () => this.setChartExpanded(false));
       bar.append(title, close);
       card.append(bar, wrap); // move the live chart-wrap into the modal (uPlot intact)
@@ -769,8 +754,45 @@ export class App {
 
   // ---- handlers ----
 
+  /** Keep the petri's mask-overlay tier in step with the mask intervention's
+   *  protection level (cloth → surgical → N95 → hazmat). Rendering only. */
+  private syncMaskTier(cfg: SimConfig): void {
+    this.petri.setMaskTier(maskTierFor(cfg.defenses[0]?.protection ?? 0.5));
+    if (this.lastFrame && !this.playing) {
+      this.petri.paint(this.lastFrame.state, this.lastFrame.defenses, this.lastFrame.quarantined, this.lastFrame.size, cfg.geometry ?? 'square');
+    }
+  }
+
+  /** Specimen-header "Motion" toggle for the live-motion tier. Hidden when the
+   *  OS asks for reduced motion (the tier is force-disabled there anyway). */
+  private initMotionToggle(): void {
+    const btn = this.root.querySelector<HTMLButtonElement>('[data-motion]');
+    if (!btn) return;
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      btn.style.display = 'none';
+      return;
+    }
+    let on = read<boolean>('motion', true);
+    const sync = (): void => {
+      btn.setAttribute('aria-pressed', String(on));
+      btn.classList.toggle('is-on', on);
+    };
+    sync();
+    btn.addEventListener('click', () => {
+      on = !on;
+      write('motion', on);
+      this.petri.setMotionEnabled(on);
+      sync();
+      if (this.lastFrame) {
+        this.petri.paint(this.lastFrame.state, this.lastFrame.defenses, this.lastFrame.quarantined, this.lastFrame.size, this.controls.config().geometry ?? 'square');
+      }
+    });
+  }
+
   private onConfigChange(): void {
     const cfg = this.controls.config();
+    this.petri.setMotionSeed(cfg.seed);
+    this.syncMaskTier(cfg);
     const rebuild = this.needsRebuild(this.prevConfig, cfg);
     const cmd: 'updateConfig' | 'patchConfig' = rebuild ? 'updateConfig' : 'patchConfig';
     this.send({ cmd, config: cfg });
@@ -877,7 +899,9 @@ export class App {
       return;
     }
     this.fitPanel.hidden = false;
-    const ICONS: Record<string, string> = { mask: '😷', vaccine: '💉', lockdown: '🚧', quarantine: '🚷' };
+    const CARD_ICONS: Record<string, string> = {
+      mask: icon('mask'), vaccine: icon('vaccine'), lockdown: icon('lockdown'), quarantine: icon('quarantine'),
+    };
     const cards = specs.map((iv, idx) => {
       const red = Math.round(effectiveReduction(iv) * 100);
       const ticks = (iv.keyframes ?? []).map((k) => k.tick);
@@ -889,12 +913,12 @@ export class App {
         <button type="button" class="panel-head" aria-expanded="false" data-fit-head="${idx}">
           <h3>${label} <span class="rate-badge">${red}%</span></h3>
           <span class="panel-summary">fitted R(t) · ${span}</span>
-          <span class="panel-icon" aria-hidden="true">${ICONS[iv.intervention] ?? '📈'}</span>
+          <span class="panel-icon" aria-hidden="true">${CARD_ICONS[iv.intervention] ?? icon('fitted')}</span>
           <label class="panel-switch" data-stop title="Enable / disable ${label}">
             <input type="checkbox" data-fit-itv="${idx}" aria-label="${label} enabled" ${iv.enabled ? 'checked' : ''} />
             <span class="panel-switch-track" aria-hidden="true"></span>
           </label>
-          <span class="panel-chevron" aria-hidden="true">▾</span>
+          <span class="panel-chevron" aria-hidden="true">${icon('caretDown')}</span>
         </button>
         <div class="panel-body">
           <p class="fit-card-note">From the R₀ Estimator — replayed as the fitted time-varying transmission schedule: −${red}% transmission over ${span}. Toggling restarts the run so the schedule applies from day 0.</p>
@@ -1124,17 +1148,15 @@ export class App {
   }
 
   private refreshThemeLabel(): void {
-    const moon = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.5A6 6 0 016.5 2.5a6 6 0 107 7z"/></svg>';
-    const sun = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></svg>';
-    this.themeBtn.innerHTML = this.theme === 'petri' ? moon : sun;
+    this.themeBtn.innerHTML = this.theme === 'petri' ? icon('moon', 'theme-ico') : icon('sun', 'theme-ico');
     this.themeBtn.title = `Switch to ${this.theme === 'petri' ? 'dark' : 'light'} theme`;
   }
 
   private refreshPlayLabel(): void {
     const b = this.toolbarBtns['play'];
     b.innerHTML = this.playing
-      ? '<span class="tb-ico">⏸</span>Pause'
-      : '<span class="tb-ico">▶</span>Play';
+      ? `<span class="tb-ico">${icon('pause')}</span>Pause`
+      : `<span class="tb-ico">${icon('play')}</span>Play`;
     b.setAttribute('aria-pressed', this.playing ? 'true' : 'false');
   }
 

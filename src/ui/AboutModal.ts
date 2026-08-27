@@ -1,17 +1,11 @@
 import { installFocusTrap } from './focus';
+import { ICONS, icon } from './icons';
 // "What is this?" modal — explains the model, history, and backing research
 // without requiring a separate page or routing layer.
 
 const CONTENT = `
   <header class="about-head">
-    <div class="about-mark" aria-hidden="true">
-      <svg viewBox="0 0 64 64" width="56" height="56">
-        <circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="2.4" opacity="0.55"/>
-        <circle cx="32" cy="32" r="20" fill="none" stroke="currentColor" stroke-width="1" opacity="0.4"/>
-        <path d="M32 12 C 27.5 17, 27.5 22, 32 27 C 36.5 32, 36.5 37, 32 42 C 27.5 47, 27.5 52, 32 52" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
-        <circle cx="46" cy="22" r="4.6" fill="currentColor"/>
-      </svg>
-    </div>
+    <div class="about-mark" aria-hidden="true">${ICONS['igduo']}</div>
     <div class="about-titles">
       <h2>What is MemeLab?</h2>
       <p class="about-tag">Simulate outbreaks. Evolve strains. Master defenses.</p>
@@ -94,7 +88,7 @@ export class AboutModal {
     overlay.setAttribute('aria-labelledby', 'about-title');
     overlay.innerHTML = `
       <div class="about-card">
-        <button class="about-close" type="button" aria-label="Close">×</button>
+        <button class="about-close" type="button" aria-label="Close">${icon('close')}</button>
         <div class="about-body">${CONTENT}</div>
       </div>
     `;

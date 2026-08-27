@@ -4,6 +4,7 @@
 
 import { installFocusTrap } from './focus';
 import type { CostConfig, CostLedger, CurrencySpec, PathogenCostProfile } from '../types';
+import { icon } from './icons';
 import {
   CURRENCIES,
   REGION_PRESETS,
@@ -141,7 +142,7 @@ export class CostModal {
     overlay.setAttribute('aria-label', 'Cost model');
     overlay.innerHTML = `
       <div class="about-card cost-card">
-        <button class="about-close" type="button" aria-label="Close">×</button>
+        <button class="about-close" type="button" aria-label="Close">${icon('close')}</button>
         <div class="about-body cost-body">
           <header class="cost-head">
             <h2>Cost model</h2>

@@ -7,6 +7,7 @@
 // the contrast, and a dark-mode QR on a dark card would not read reliably.
 
 import { qrcodegen } from '../lib/qrcodegen';
+import { icon } from './icons';
 
 export interface ShareMenuOptions {
   /** Resolve the current permalink URL at open time (state may have changed). */
@@ -44,7 +45,7 @@ export class ShareMenu {
     pop.setAttribute('aria-modal', 'false');
     pop.setAttribute('aria-label', 'Share this run');
     pop.innerHTML = `
-      <button class="share-close" type="button" aria-label="Close">×</button>
+      <button class="share-close" type="button" aria-label="Close">${icon('close')}</button>
       <div class="share-head">
         <h3>Spread your meme model</h3>
         <p class="share-tag">This link is your model, ready to share. Whoever opens it sees the exact same run.</p>

@@ -1,0 +1,8 @@
+<svg id="emoji" viewBox="0 0 72 72" xmlns="http://www.w3.org/2000/svg">
+<path fill="#e3e8cf" stroke="#24272d" stroke-width="2.4" fill-rule="evenodd" d="M11,66 C11,46 13.5,31 20.5,20.5 C25.5,13 31,8.5 36,8.5 C41,8.5 46.5,13 51.5,20.5 C58.5,31 61,46 61,66 L11,66 Z M36,25.6 C41.5,25.6 46.5,27.2 48.4,29.6 C50.2,31.9 50.2,34.3 48.4,36.4 C46.5,38.6 41.5,40.0 36,40.0 C30.5,40.0 25.5,38.6 23.6,36.4 C21.8,34.3 21.8,31.9 23.6,29.6 C25.5,27.2 30.5,25.6 36,25.6 Z"/>
+<rect x="29" y="46" width="14" height="9" rx="3" fill="#24272d"/>
+<rect x="31.5" y="48.4" width="9" height="2" rx="1" fill="#e3e8cf"/>
+<rect x="31.5" y="51.6" width="9" height="2" rx="1" fill="#e3e8cf"/>
+<path fill="none" stroke="#b9c19c" stroke-width="2" d="M16,63 C16,50 18,38 22.5,28.5"/>
+<path fill="none" stroke="#b9c19c" stroke-width="2" d="M56,63 C56,50 54,38 49.5,28.5"/>
+</svg>

@@ -5,6 +5,7 @@
 // worker is the single authority on what can actually run).
 
 import type { BackendAvailability, BackendProbeMessage, EngineBackend } from '../types';
+import { ICONS } from './icons';
 
 export interface BackendMenuOptions {
   /** Current requested/active/reason state, read at render time. */
@@ -15,9 +16,9 @@ export interface BackendMenuOptions {
 }
 
 const ROWS: Array<{ id: EngineBackend; icon: string; name: string; desc: string }> = [
-  { id: 'cpu', icon: '⚙', name: 'CPU', desc: 'reference engine — always available' },
-  { id: 'wasm', icon: '⚙', name: 'WASM', desc: 'identical results, faster (default)' },
-  { id: 'gpu', icon: '⚡', name: 'GPU', desc: 'WebGPU compute — own random stream, huge grids' },
+  { id: 'cpu', icon: ICONS['chip'], name: 'CPU', desc: 'reference engine — always available' },
+  { id: 'wasm', icon: ICONS['cube'], name: 'WASM', desc: 'identical results, faster (default)' },
+  { id: 'gpu', icon: ICONS['bolt'], name: 'GPU', desc: 'WebGPU compute — own random stream, huge grids' },
 ];
 
 export class BackendMenu {

@@ -23,8 +23,22 @@ const SPRITE_BY_STATE: Record<number, string> = {
   [CellState.Recovered]: `${SPRITE_BASE}/zombie.svg`,
   [CellState.Dead]: `${SPRITE_BASE}/headstone.svg`,
 };
-const MASK_OVERLAY = `${SPRITE_BASE}/defenses/maskSurgical.svg`;
+// Mask overlays escalate with the mask intervention's protection parameter
+// (tier chosen by the caller via setMaskTier): cloth < surgical < N95 < hazmat.
+const MASK_OVERLAYS = [
+  `${SPRITE_BASE}/defenses/mask_cloth.svg`,
+  `${SPRITE_BASE}/defenses/maskSurgical.svg`,
+  `${SPRITE_BASE}/defenses/mask_n95.svg`,
+  `${SPRITE_BASE}/defenses/mask_hazmat.svg`,
+] as const;
 const VAX_OVERLAY = `${SPRITE_BASE}/defenses/syringe.svg`;
+
+export type MaskTier = 0 | 1 | 2 | 3;
+
+/** Map DefenseSpec.protection (0..1) to a visual mask tier. */
+export function maskTierFor(protection: number): MaskTier {
+  return protection < 0.35 ? 0 : protection < 0.65 ? 1 : protection < 0.85 ? 2 : 3;
+}
 
 const ROWS = 5;
 const COLS = 4;
@@ -33,8 +47,9 @@ export class SpriteAtlas {
   private canvas: OffscreenCanvas | HTMLCanvasElement;
   private ctx: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D;
   private tile = 0;
+  private maskTier: MaskTier = 1;
   private ready: Promise<void>;
-  private images: { state: HTMLImageElement[]; mask: HTMLImageElement; vax: HTMLImageElement } | null = null;
+  private images: { state: HTMLImageElement[]; masks: HTMLImageElement[]; vax: HTMLImageElement } | null = null;
 
   constructor() {
     this.canvas = supportsOffscreen()
@@ -54,6 +69,14 @@ export class SpriteAtlas {
     this.tile = size;
     this.canvas.width = size * COLS;
     this.canvas.height = size * ROWS;
+    this.rasterize();
+  }
+
+  /** Swap the mask overlay tier (cloth/surgical/N95/hazmat) and re-rasterize.
+   *  Same pattern as setTile; rendering only — the defense bitmask is untouched. */
+  setMaskTier(tier: MaskTier): void {
+    if (tier === this.maskTier) return;
+    this.maskTier = tier;
     this.rasterize();
   }
 
@@ -100,9 +123,9 @@ export class SpriteAtlas {
         (s) => loadImage(SPRITE_BY_STATE[s]),
       ),
     );
-    const mask = await loadImage(MASK_OVERLAY);
+    const masks = await Promise.all(MASK_OVERLAYS.map((m) => loadImage(m)));
     const vax = await loadImage(VAX_OVERLAY);
-    this.images = { state: stateImgs, mask, vax };
+    this.images = { state: stateImgs, masks, vax };
     if (this.tile > 0) this.rasterize();
   }
 
@@ -122,7 +145,7 @@ export class SpriteAtlas {
         // Defense overlays — only meaningful for Susceptible, Exposed, Infectious.
         // Recovered (zombie) and Dead (headstone) skip overlays for clarity.
         if (row <= 2) {
-          if (col & 1) ctx.drawImage(this.images.mask, x, y, t, t);
+          if (col & 1) ctx.drawImage(this.images.masks[this.maskTier], x, y, t, t);
           if (col & 2) ctx.drawImage(this.images.vax, x + t * 0.55, y + t * 0.5, t * 0.45, t * 0.45);
         }
       }

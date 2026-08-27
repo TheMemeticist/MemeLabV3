@@ -1,4 +1,5 @@
 import { PRESETS, type DiseasePreset } from '../sim/presets';
+import { icon } from './icons';
 
 export class PresetPicker {
   el: HTMLElement;
@@ -20,9 +21,9 @@ export class PresetPicker {
         <button type="button" class="preset-button" aria-haspopup="listbox" aria-expanded="false">
           <span class="preset-label" data-preset-label></span>
           <span class="preset-blurb"></span>
-          <span class="preset-chevron" aria-hidden="true">▾</span>
+          <span class="preset-chevron" aria-hidden="true">${icon('caretDown')}</span>
         </button>
-        <button type="button" class="preset-rename" aria-label="Rename pathogen" data-tip="Give this strain a custom name">✎</button>
+        <button type="button" class="preset-rename" aria-label="Rename pathogen" data-tip="Give this strain a custom name">${icon('rename')}</button>
       </div>
       <div class="preset-menu" role="listbox" hidden>
         <input type="search" class="preset-search" placeholder="Search diseases…" aria-label="Search diseases" />

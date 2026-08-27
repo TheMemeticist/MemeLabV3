@@ -1,6 +1,7 @@
 import { CellState } from '../types';
 import type { GeometryType, VoronoiTopology } from '../types';
-import { SpriteAtlas } from './SpriteAtlas';
+import { SpriteAtlas, type MaskTier } from './SpriteAtlas';
+import { PetriMotion } from './PetriMotion';
 
 interface ColorTriplet { r: number; g: number; b: number }
 interface ColorPalette {
@@ -22,6 +23,15 @@ const SPRITE_THRESHOLD = 60;
 // Voronoi sprites sit at irregular centroids and read well only on small grids,
 // so they use a tighter threshold; above it Voronoi renders as solid polygons.
 const VORONOI_SPRITE_THRESHOLD = 24;
+// Live-motion tier (V3+ morph/jelly renderer) ceiling, in cells. Measured on
+// the reference box: 32² (1024 blobs + springs + particles) holds 60fps with
+// headroom; 40² (1600) dips below 50 during outbreak bursts, so the ceiling
+// sits at 32². Voronoi runs it too (≤ VORONOI_SPRITE_THRESHOLD²): blobs sit at
+// the centroids and are scaled per cell by nearest-neighbour pitch so tight
+// clusters shrink instead of piling up.
+const MOTION_CELLS = 1024;
+const REDUCED_MOTION =
+  typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 export class Petri {
   private canvas: HTMLCanvasElement;
@@ -30,7 +40,7 @@ export class Petri {
   private legend: HTMLElement;
   private size = 0;
   private geometry: GeometryType = 'square';
-  private mode: 'pixel' | 'sprite' = 'pixel';
+  private mode: 'pixel' | 'sprite' | 'motion' = 'pixel';
   private imageData: ImageData | null = null;
   // Pixel→cell lookup for hex/tri pixel mode: geoLut[pixelIndex] = cell index.
   // Built once per size/geometry change so per-frame paint is a flat putImageData
@@ -41,8 +51,18 @@ export class Petri {
   private cellB: Uint8Array | null = null;
   private palette: ColorPalette = makeDefaultPalette();
   private atlas: SpriteAtlas | null = null;
+  private maskTier: MaskTier = 1;
   private spriteReady = false;
   private voronoiTopo: VoronoiTopology | null = null;
+  // ── live-motion tier ──
+  private motion: PetriMotion | null = null;
+  private motionEnabled = true;
+  private motionSeed = 1;
+  private motionLoopOn = false;
+  private motionLastTs = 0;
+  private lastState: Uint8Array | null = null;
+  private lastDefenses: Uint8Array | null = null;
+  private lastQuarantined: Uint8Array | null = null;
 
   constructor(host: HTMLElement) {
     host.classList.add('petri-host');
@@ -62,6 +82,46 @@ export class Petri {
     this.ctx = ctx;
     this.refreshPalette();
     this.renderLegend();
+  }
+
+  /** Visual mask tier for the sprite atlas (cloth/surgical/N95/hazmat),
+   *  derived from the mask intervention's protection level. Repaints on the
+   *  next frame; if the atlas exists it re-rasterizes immediately. */
+  setMaskTier(tier: MaskTier): void {
+    if (tier === this.maskTier) return;
+    this.maskTier = tier;
+    this.atlas?.setMaskTier(tier);
+    this.motion?.setMaskTier(tier);
+  }
+
+  /** User toggle for the live-motion tier (persisted by App). Forces a
+   *  re-derive of the render mode on the next paint. */
+  setMotionEnabled(on: boolean): void {
+    if (on === this.motionEnabled) return;
+    this.motionEnabled = on;
+    this.size = 0; // invalidate so the next paint() re-runs resize()
+  }
+
+  /** Board seed drives per-cell anatomy (individuality stable across a run). */
+  setMotionSeed(seed: number): void {
+    const s = seed >>> 0;
+    if (s === this.motionSeed) return;
+    this.motionSeed = s;
+    if (this.mode === 'motion') this.size = 0; // rebuild tables on next paint
+  }
+
+  /** True when the current board renders on the live-motion tier. */
+  motionActive(): boolean {
+    return this.mode === 'motion';
+  }
+
+  private motionEligible(size: number, geometry: GeometryType): boolean {
+    return (
+      this.motionEnabled &&
+      !REDUCED_MOTION &&
+      size * size <= MOTION_CELLS &&
+      geometry !== 'meanfield'
+    );
   }
 
   refreshPalette(): void {
@@ -112,17 +172,40 @@ export class Petri {
     // threshold. Voronoi uses a tighter sprite threshold (its sprites sit at
     // irregular centroids). Mean-field has no per-cell sprites.
     const spriteThreshold = geometry === 'voronoi' ? VORONOI_SPRITE_THRESHOLD : SPRITE_THRESHOLD;
-    const wantMode: 'pixel' | 'sprite' =
-      (geometry !== 'meanfield' && size <= spriteThreshold) ? 'sprite' : 'pixel';
+    const smallGrid = geometry !== 'meanfield' && size <= spriteThreshold;
+    const wantMode: 'pixel' | 'sprite' | 'motion' =
+      smallGrid ? (this.motionEligible(size, geometry) ? 'motion' : 'sprite') : 'pixel';
 
-    if (wantMode === 'sprite') {
+    if (wantMode === 'motion') {
+      const tile = clampInt(Math.round(900 / size), 24, 80);
+      this.canvas.width = size * tile;
+      this.canvas.height = size * tile;
+      this.imageData = null;
+      this.geoLut = null;
+      this.motion ??= new PetriMotion();
+      this.motion.setMaskTier(this.maskTier);
+      this.motion.configure(
+        size * size,
+        this.motionSeed,
+        this.motionTile(size, geometry, tile),
+        this.motionCenters(size, geometry, tile),
+        geometry === 'voronoi' ? this.voronoiScale(size) : null,
+      );
+      this.attachMotionPointer();
+    } else if (wantMode === 'sprite') {
       const tile = clampInt(Math.round(900 / size), 24, 80);
       this.atlas ??= new SpriteAtlas();
+      this.atlas.setMaskTier(this.maskTier);
       this.atlas.setTile(tile);
       this.spriteReady = false;
       this.atlas.whenReady().then(() => {
         this.spriteReady = true;
         this.atlas?.setTile(tile);
+        // Repaint the stored frame: while paused no new frame will arrive to
+        // replace the pre-ready palette-rect fallback.
+        if (this.lastState && this.lastDefenses && this.size === size && this.geometry === geometry) {
+          this.paint(this.lastState, this.lastDefenses, this.lastQuarantined, size, geometry);
+        }
       });
       this.canvas.width = size * tile;
       this.canvas.height = size * tile;
@@ -171,10 +254,21 @@ export class Petri {
     // bounds (undefined → 0,0,0 = black board). Skip the frame — a
     // consistent one follows within a tick.
     if (geometry === 'voronoi' && (this.voronoiTopo === null || this.voronoiTopo.n !== size * size)) return;
+    this.lastState = state;
+    this.lastDefenses = defenses;
+    this.lastQuarantined = quarantined;
     if (size !== this.size || geometry !== this.geometry) this.resize(size, geometry);
 
     if (geometry === 'meanfield') {
       this.paintMeanField(state, size);
+      return;
+    }
+
+    if (this.mode === 'motion') {
+      // The motion loop repaints continuously (idle life must not wait for
+      // the next worker frame); paint() already stored the frame arrays.
+      this.motion?.update(state, defenses);
+      this.startMotionLoop();
       return;
     }
 
@@ -512,6 +606,168 @@ export class Petri {
     ctx.restore();
   }
 
+  // ── Live-motion tier (V3+ morph/jelly renderer) ───────────────────────────
+
+  /** Blob pitch for the motion renderer, per geometry (px). */
+  private motionTile(size: number, geometry: GeometryType, tile: number): number {
+    const W = size * tile;
+    if (geometry === 'hexagonal') {
+      const sxr = W / (SQRT3 * (size + 0.5));
+      const syr = (2 * W) / (3 * size + 1);
+      return Math.min(SQRT3 * sxr, 2 * syr);
+    }
+    if (geometry === 'triangular') {
+      const tileW = W / size;
+      return (tileW * SQRT3) / 2 / 1.3; // triangle centroids sit closer — shrink blobs
+    }
+    return tile;
+  }
+
+  /** Cell center positions (px), mirroring paintSprites' layout math. */
+  private motionCenters(size: number, geometry: GeometryType, tile: number): Float32Array {
+    const W = size * tile;
+    const H = W;
+    const out = new Float32Array(size * size * 2);
+    if (geometry === 'hexagonal') {
+      const sxr = W / (SQRT3 * (size + 0.5));
+      const syr = (2 * H) / (3 * size + 1);
+      const colSpacing = SQRT3 * sxr;
+      const rowSpacing = 1.5 * syr;
+      const offX = colSpacing / 2;
+      const offY = syr;
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = y * size + x;
+          out[i * 2] = offX + x * colSpacing + (y & 1) * (colSpacing * 0.5);
+          out[i * 2 + 1] = offY + y * rowSpacing;
+        }
+      }
+    } else if (geometry === 'triangular') {
+      const tileW = W / size;
+      const tileH = (tileW * SQRT3) / 2;
+      const offY = (H - size * tileH) / 2;
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = y * size + x;
+          const isUp = (x + y) % 2 === 0;
+          out[i * 2] = (x + 0.5) * tileW;
+          out[i * 2 + 1] = offY + y * tileH + (isUp ? (tileH * 2) / 3 : tileH / 3);
+        }
+      }
+    } else if (geometry === 'voronoi' && this.voronoiTopo && this.voronoiTopo.n === size * size) {
+      const topo = this.voronoiTopo;
+      for (let i = 0; i < topo.n; i++) {
+        out[i * 2] = topo.cx[i] * W;
+        out[i * 2 + 1] = topo.cy[i] * H;
+      }
+    } else {
+      // square — and voronoi before its topology has arrived (setVoronoiTopology
+      // re-runs resize, which re-configures with the real centroids).
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const i = y * size + x;
+          out[i * 2] = (x + 0.5) * tile;
+          out[i * 2 + 1] = (y + 0.5) * tile;
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Per-cell blob scale for voronoi: nearest adjacent centroid distance over
+   *  the mean pitch (toroidal), clamped so no blob vanishes or balloons. */
+  private voronoiScale(size: number): Float32Array | null {
+    const topo = this.voronoiTopo;
+    if (!topo || topo.n !== size * size) return null;
+    const n = topo.n;
+    const out = new Float32Array(n).fill(1);
+    const pitch = 1 / size; // mean centroid spacing, normalized
+    for (let i = 0; i < n; i++) {
+      let best = Infinity;
+      for (let a = topo.adjOffsets[i]; a < topo.adjOffsets[i + 1]; a++) {
+        const j = topo.adjList[a];
+        let dx = Math.abs(topo.cx[j] - topo.cx[i]);
+        let dy = Math.abs(topo.cy[j] - topo.cy[i]);
+        if (dx > 0.5) dx = 1 - dx;
+        if (dy > 0.5) dy = 1 - dy;
+        const d = dx * dx + dy * dy;
+        if (d < best) best = d;
+      }
+      if (best < Infinity) out[i] = Math.min(1.1, Math.max(0.5, Math.sqrt(best) / pitch));
+    }
+    return out;
+  }
+
+  private motionPointerAttached = false;
+
+  private attachMotionPointer(): void {
+    if (this.motionPointerAttached) return;
+    this.motionPointerAttached = true;
+    let last: { x: number; y: number; t: number } | null = null;
+    const toCanvas = (ev: PointerEvent): { x: number; y: number } | null => {
+      const r = this.canvas.getBoundingClientRect();
+      if (!r.width || !r.height) return null;
+      return {
+        x: ((ev.clientX - r.left) * this.canvas.width) / r.width,
+        y: ((ev.clientY - r.top) * this.canvas.height) / r.height,
+      };
+    };
+    this.canvas.addEventListener('pointermove', (ev) => {
+      if (this.mode !== 'motion' || !this.motion) return;
+      const p = toCanvas(ev);
+      if (!p) return;
+      let speed = 0;
+      if (last) {
+        const dt = Math.max(1, ev.timeStamp - last.t);
+        speed = Math.hypot(p.x - last.x, p.y - last.y) / dt;
+      }
+      last = { x: p.x, y: p.y, t: ev.timeStamp };
+      this.motion.setCursor(p.x, p.y, speed);
+    });
+    this.canvas.addEventListener('pointerleave', () => {
+      last = null;
+      this.motion?.clearCursor();
+    });
+    this.canvas.addEventListener('pointerdown', (ev) => {
+      if (this.mode !== 'motion' || !this.motion) return;
+      const p = toCanvas(ev);
+      if (p) this.motion.pokeAt(p.x, p.y);
+    });
+  }
+
+  private startMotionLoop(): void {
+    if (this.motionLoopOn) return;
+    this.motionLoopOn = true;
+    this.motionLastTs = 0;
+    const step = (ts: number): void => {
+      if (this.mode !== 'motion' || !this.motion || !this.lastState) {
+        this.motionLoopOn = false;
+        return;
+      }
+      const dt = this.motionLastTs ? ts - this.motionLastTs : 16;
+      this.motionLastTs = ts;
+      try {
+        this.motionFrame(dt);
+      } catch (err) {
+        // Never let one bad frame silently kill the paint pipeline.
+        console.error('motion frame failed (frame skipped):', err);
+      }
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  private motionFrame(dt: number): void {
+    const ctx = this.ctx;
+    const p = this.palette;
+    ctx.fillStyle = `rgb(${p.bg.r},${p.bg.g},${p.bg.b})`;
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.motion!.frame(ctx, dt);
+    if (this.lastQuarantined) {
+      this.drawQuarantineBorders(this.lastQuarantined, this.size, this.geometry);
+    }
+  }
+
   // ── Shared helpers ────────────────────────────────────────────────────────
 
   private cellColor(cellState: number, flags: number, p: ColorPalette): ColorTriplet {
@@ -539,7 +795,7 @@ export class Petri {
 
   private renderLegend(): void {
     if (!this.legend) return;
-    if (this.mode === 'sprite') {
+    if (this.mode === 'sprite' || this.mode === 'motion') {
       this.renderSpriteLegend();
     } else {
       this.renderColorLegend();
