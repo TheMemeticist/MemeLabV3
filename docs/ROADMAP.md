@@ -1,6 +1,8 @@
 # MemeLabV3 — Delivery Roadmap (B175)
 
-Derived from `MemeLabV3_Proposal.md` (May 2026) and reconciled against what is actually in `src/` as of 2026-08-13.
+Derived from the B175 proposal (May 2026). Capability status reconciled against
+the implementation on **2026-09-16**. The phase estimates below are the original
+planning envelope, not a record of funding, hours spent, or current deadlines.
 
 Funding envelope: **240 hrs / 6 weeks (low band)** to **640 hrs / 16 weeks (high band)** at $90/hr CAD, plus AI compute. This roadmap is written to the high band at ~40 hrs/week, with an explicit low-band cut line so the project has a defensible shippable state either way.
 
@@ -8,37 +10,76 @@ Funding envelope: **240 hrs / 6 weeks (low band)** to **640 hrs / 16 weeks (high
 
 ## 1. Where the code actually stands
 
-The proposal describes four phases. Two of them are partly built already, and one proposal claim (WebGPU + Rust/WASM) has no code behind it at all. Being honest about this up front is what makes the schedule realistic.
+The simulator, accelerated backends, estimator, and revised interface are
+implemented. The ABCD genome model remains the main unfinished dependency.
+"Implemented" describes the source; the release checkpoint below records what
+has been verified for publication.
 
 | Proposal capability | State in `src/` | Evidence |
 |---|---|---|
 | SEIRS-D engine, deterministic, worker-threaded | **Done** | `src/sim/engine.ts`, `src/worker/sim.worker.ts` |
 | Permalink reproducibility | **Done** | `src/lib/url-state.ts`, `src/ui/ShareMenu.ts` (+ QR) |
-| Multi-topology lattices (grid, triangular, Voronoi, mean-field) | **Done** | `src/types.ts` geometry union, `src/sim/voronoi.ts`, `src/sim/delaunay.ts` |
+| Five geometries (square, triangular, hexagonal, Voronoi, mean-field) | **Done** | `src/types.ts` geometry union, `src/sim/neighbors.ts`, `src/sim/voronoi.ts` |
 | Interventions + live patching | **Done** | `src/sim/defense.ts`, `Engine.patchConfig()` |
 | Inverse fitting / R₀ estimator with GA optimizer | **Done** | `src/lib/ga.ts`, `src/lib/fit*.ts`, `src/ui/R0Modal.ts` |
 | Economic cost model | **Done** | `src/lib/cost.ts`, `src/ui/CostModal.ts` |
-| R_eff = 1 reference line on chart | **Partial** | `Chart.ts:358 paintReffThreshold()` — the line exists, the *interpretation* (phase badge, HIT gap) does not |
-| Phase badge, HIT stat, HIT line on chart | **Not built** | no herd-immunity computation anywhere outside comments |
+| R_eff = 1 reference line on chart | **Done** | `src/ui/Chart.ts`, `paintReffThreshold()` |
+| Observed outbreak phase and peak annotation | **Implemented and verified, September 16** | `src/lib/outbreak.ts`, `Stats.ts`, `Chart.ts`; E+I trend, infectious peak so far, reset/history edge cases |
+| HIT stat and HIT line | **Deferred pending model review** | A universal recovered-fraction threshold is not justified across every geometry, intervention, waning, and mutation configuration |
+| Progressive disclosure, onboarding, mobile/accessibility | **Partly implemented** | Configure/Observe layouts, collapsible intervention cards, estimation workspace, focus traps, responsive styles; remaining UX findings need explicit acceptance checks |
+| Strain diversity sparkline | **Not built** | Current toolbar reports strain count; no diversity timeline |
 | ABCD codon genome, degeneracy table, landscape seed | **Not built** | `strain.ts` mutates a float phenotype vector by Gaussian drift; there is no genotype |
 | Synthesize Memenome (phenotype → genome back-solve) | **Not built** | — |
-| Genome panel, phylodynamic timeline, Newick export | **Not built** | no phylogeny data structure exists |
-| Network topologies (Erdős–Rényi, Barabási–Albert, GraphML) | **Not built** | geometry is lattice-only; no adjacency-list path in `neighbors.ts` |
+| Genome panel, phylodynamic timeline, Newick export | **Not built** | Strains retain `parentId` and `birthTick`; no genome panel or tree export |
+| Network topologies (Erdős–Rényi, Barabási–Albert, GraphML) | **Not built** | Voronoi already uses per-cell neighbor lists; general graph generators/import are absent |
 | AI agent: paper → permalink | **Not built** | — |
-| WebGPU + Rust/WASM | **Not built** | pure TS in a Web Worker |
+| WebGPU + Rust/WASM | **Done** | `src/sim/gpu-engine.ts`, `src/sim/wasm-engine.ts`, `rust/engine-core`; all five geometries, backend picker/fallback, fitted transmission schedules |
+| Input hardening and production-bundle benchmarks | **Implemented and verified, September 16** | Direct saved-state validation preserves precision; URL/schedule bounds, estimator escaping, `tests/bench/` |
 | Validation against historical outbreaks | **Informal** | Ebola permalink in the proposal; no reproducible validation set |
 
 **The single biggest scope risk is the ABCD engine.** Everything downstream in the proposal — genome panel, phylodynamic timeline, Newick export, Synthesize Memenome, the agent layer's "synthesizes memenome" step — depends on replacing the current float-vector strain model with a real genotype→phenotype map. It is the critical path and it must start early, not in the back half.
 
-**The second-biggest risk is Rust/WASM + WebGPU.** At 640 hours total, a Rust port of the engine plus a WebGPU render path could plausibly eat 150–200 hours by itself and would fork the determinism invariant across two implementations. Recommendation below: treat it as a benchmark-gated spike, not a committed deliverable.
+**Backend maintenance is now an ongoing constraint.** CPU and WASM must remain
+bit-identical. GPU is deterministic within its own trajectory family and is
+not bit-comparable with CPU/WASM. Mutation runs on CPU; GPU also excludes
+anti-extinction reseeding. Backend choice is a runtime preference, not encoded
+in permalinks. Rebuild the embedded binary after Rust changes: normal JS builds
+and tests do not compile Rust. See `perf-plan.md` and `../tests/README.md` for
+the implemented backends and production-bundle benchmark protocol.
+
+### September 16 release checkpoint
+
+- Release verification: **183 tests across 11 files**, app and overlay
+  typechecks, production build, and the project-page-base build passing.
+- Embedded WASM rebuilt with the Rust schedule cap; new tests verify the
+  compiled binary and an oversized schedule's capped replay. CPU/WASM
+  benchmark parity passes across all five geometries for 501 ticks.
+- Phase/peak browser checks cover all five geometries, sprite/pixel rendering,
+  reset, Active/Total views, keyboard expansion/closure with focus restoration,
+  and no horizontal overflow at 320/390/1440px. This is not a complete
+  accessibility audit or a fresh GPU benchmark.
+- Existing limitations to track: stored fit metadata needs comprehensive
+  shape validation; chart canvas colors can remain stale on a paused theme
+  switch. Exact arbitrary-run replay needs more than the share-link codec.
+- Next feature dependency: deterministic ABCD representation and codon mapping,
+  followed by mutation and synthesis. Begin one sourced historical validation
+  fixture alongside this work.
 
 ---
 
 ## 2. Phase plan
 
+This section preserves the proposal sequence and effort estimates. Status
+notes take precedence over the original task wording; completed performance
+work is not a future spike, and the HIT display requires a revised design.
+
 Each phase ends on a **demoable permalink** and a build-in-public post, which is what the proposal promises as the development process.
 
 ### Phase 0 — Foundations (Week 1, ~30 hrs)
+
+**Status:** foundation code and invariant suites implemented. Use the bundled
+benchmark runners in `tests/README.md` for comparable numbers; legacy
+`npm run bench` runs through vite-node and is not a publication baseline.
 
 Not in the proposal, but the repo needs it before anything else lands cleanly.
 
@@ -51,6 +92,11 @@ Not in the proposal, but the repo needs it before anything else lands cleanly.
 
 ### Phase 1 — EID foundations (Weeks 1–2, ~60 hrs)
 
+**Status:** R_eff reference and contextual tooltips exist; observed phase
+interpretation is the current release slice. HIT work below is deferred for
+model review. The revised immediate exit is that a user can identify the
+observed direction of the outbreak without interpreting a raw R_eff value.
+
 Proposal Phase 1. No engine changes; this is pure interpretation of numbers the engine already produces.
 
 - **Phase badge** — classify the run (`Growing / Peaking / Declining / Contained / Extinct`) from R_eff and its trend, rendered in `Stats.ts` with the sentence form from the proposal ("Still growing — R_eff 2.3").
@@ -62,6 +108,11 @@ Proposal Phase 1. No engine changes; this is pure interpretation of numbers the 
 
 ### Phase 2 — Domain-constraint rendering (Weeks 3–5, ~110 hrs)
 
+**Status:** substantial layout/onboarding work landed in August. The current
+slice adds an explicitly observed peak annotation and checks its mobile and
+keyboard behavior. This does not close the full accessibility audit or the
+strain sparkline work below.
+
 Proposal Phase 2, informed by `ux-analysis.md`.
 
 - Peak annotation and epidemic-landmark rendering on the chart (peak day, peak height, cumulative deaths at peak).
@@ -72,6 +123,10 @@ Proposal Phase 2, informed by `ux-analysis.md`.
 **Exit:** first-run experience is usable on a phone with no instructions; UX-analysis findings closed or explicitly deferred with reasons.
 
 ### Phase 3 — ABCD memetic engine + agent (Weeks 5–11, ~230 hrs)
+
+**Status:** planned. Existing Gaussian phenotype mutation is not the ABCD
+genotype model. Specify achievable synthesis tolerances before committing to
+the original exact-match and sub-50-ms goals.
 
 Proposal Phase 3, and the heart of the grant. Starts overlapping Phase 2 deliberately.
 
@@ -87,6 +142,10 @@ Proposal Phase 3, and the heart of the grant. Starts overlapping Phase 2 deliber
 **Exit:** an outbreak run where a variant sweep is visible in the timeline, explainable from the genome panel, and reproducible from a permalink; Newick export opens in a standard tree viewer.
 
 ### Phase 4 — Networks, validation, frontier (Weeks 11–15, ~150 hrs)
+
+**Status:** general networks and reproducible historical validation remain
+planned. The performance item below is superseded: the gated CPU, WASM, and
+GPU work has been implemented. Further optimization needs new measurements.
 
 Proposal Phase 4, plus the validation the proposal commits to but does not schedule.
 
@@ -114,11 +173,11 @@ Run this on **every** change before it is considered done. It exists because thi
 ### Before writing code
 - [ ] Which layer does this touch — `sim/` (pure), `worker/`, `ui/`, `lib/`? Keep `sim/` DOM-free.
 - [ ] Does it add a `SimConfig` field? If yes, plan for all four call sites: `types.ts`, `needsRebuild()` in `App.ts`, `encode()` and `applyEncoded()` in `url-state.ts`.
-- [ ] Does it change the RNG call sequence? If yes, it is a **rebuild** change, never a `patchConfig` change.
+- [ ] Does it alter RNG consumption? Preserve deterministic ordering. Existing live patches can consume draws; reproducibility requires the same edit schedule. Grid/seed/topology changes require a rebuild.
 
 ### While building
 - [ ] New config field added to `types.ts` `SimConfig`.
-- [ ] Routing decided in `App.ts` `needsRebuild()` — structural (size, seed, genes, geometry, genome) → `updateConfig`; soft (uptakes, toggles, multipliers) → `patchConfig`.
+- [ ] Routing decided in `App.ts` `needsRebuild()` — structural (size, seed, geometry/topology) → `updateConfig`; current strain genes, uptakes, toggles, multipliers → `patchConfig`. Decide future genome routing explicitly and check backend compatibility/fallback.
 - [ ] Permalink codec updated in **both** `encode()` and `applyEncoded()`.
 - [ ] No second RNG source introduced; all randomness goes through `this.rng`.
 - [ ] No writes into `pop.state` during a tick — only `pop.next`.
@@ -128,14 +187,14 @@ Run this on **every** change before it is considered done. It exists because thi
 - [ ] **Determinism**: two `Engine` instances, same `SimConfig`, identical `SimStats` at tick 1, 50, and 500.
 - [ ] **Conservation**: `S + E + I + R + D === N` on every tick of a 200-tick run.
 - [ ] **Permalink round-trip**: `decode(encode(config))` deep-equals the config, including the new field.
-- [ ] **Patch safety** (if `patchConfig` path was touched): patching mid-run leaves tick counter and RNG trajectory unchanged.
+- [ ] **Patch safety** (if `patchConfig` path was touched): tick is preserved; identical ordered patches at identical ticks reproduce, conservation holds, and backend parity remains valid for supported configurations. A changed intervention need not reproduce the unmodified trajectory.
 - [ ] `npm run typecheck` clean.
 - [ ] `npm run test` green.
 
 ### Manual verification
 - [ ] Both render paths exercised: sprite mode (grid ≤ 60) and pixel mode (grid > 60).
-- [ ] Every geometry still renders and steps: grid, triangular, Voronoi, mean-field.
-- [ ] `npm run bench` within 10% of the committed baseline, or the regression is explained in the commit message.
+- [ ] Every geometry still renders and steps: square, triangular, hexagonal, Voronoi, mean-field.
+- [ ] For performance-sensitive changes, use the matching production-bundle runner in `tests/README.md`; compare identical workload/census and runtime. Explain regressions over 10%. Do not compare legacy vite-node numbers with production-bundle numbers.
 - [ ] Mobile viewport: no horizontal scroll, controls reachable one-handed.
 - [ ] Fresh-tab permalink test: copy the link the feature produces, open in a new tab, confirm the run reproduces.
 

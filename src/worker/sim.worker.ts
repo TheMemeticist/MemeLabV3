@@ -2,6 +2,7 @@
 import type { EngineBackend, FrameMessage, SimConfig, TopologyMessage, WorkerCommand } from '../types';
 import { buildVoronoi } from '../sim/voronoi';
 import { Rng } from '../sim/rng';
+import { clampSchedule } from '../sim/config';
 import { WasmEngine, createEngine, wasmAvailable, wasmCompatible, type AnyEngine } from '../sim/wasm-engine';
 import { GpuEngine, gpuCompatible, gpuSupported } from '../sim/gpu-engine';
 
@@ -443,7 +444,7 @@ self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
     case 'setSchedule': {
       // Stored only — the sender always follows with a reset/init, which is
       // where the engine actually picks it up (schedules start at day 0).
-      txSchedule = m.schedule && m.schedule.length > 0 ? m.schedule : null;
+      txSchedule = clampSchedule(m.schedule);
       break;
     }
     case 'probeBackends': {

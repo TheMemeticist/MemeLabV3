@@ -149,7 +149,7 @@ integrated GPU before full integration.**
 **Gate PASSED on discrete GPU (integrated-GPU validation still open).** The
 full SEIR-D tick as a WGSL compute kernel (gather transmission, pcg4d
 counter-based RNG, recomputed-detection contact tracing, expiry-semantics
-quarantine, on-GPU census), run headlessly on an RTX 4060 Ti via wgpu/Vulkan —
+quarantine, on-GPU census), run headlessly on a consumer GPU via wgpu/Vulkan —
 the same WGSL a browser executes:
 
 - **320²: 18,086 t/s** (0.055 ms/tick) — 11.7× over the Phase-1 TS engine,
@@ -182,7 +182,7 @@ plain workers today, no shared memory needed.
 | baseline | — | 302.9 t/s | 1× |
 | P1 event-driven (landed in `engine.ts`) | 1,000–1,500 | **1,540** | **5.1×** |
 | P2 WASM (spike, scalar — SIMD still untapped) | 3,000–6,000 | **5,140** | **17×** |
-| P3 WebGPU (spike, RTX 4060 Ti) | 10,000+ | **18,086** | **59.7×** |
+| P3 WebGPU (spike, consumer GPU) | 10,000+ | **18,086** | **59.7×** |
 
 P3 also delivered the grid-tier target: 2048² (4.19M cells) at 476 t/s.
 Every phase met or beat its bull target; every gate passed.

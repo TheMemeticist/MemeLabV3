@@ -1,6 +1,7 @@
 import type { GeometryType, InterventionKey, SimConfig, StrainGenes } from '../types';
 import { ICONS, icon } from './icons';
 import { Slider } from './Slider';
+import { MIN_GRID_SIZE, MAX_GRID_SIZE } from '../sim/config';
 import { PresetPicker } from './PresetPicker';
 import { findPreset, type DiseasePreset } from '../sim/presets';
 import { makeGeometry } from '../sim/neighbors';
@@ -173,7 +174,7 @@ export class ControlPanel {
 
     // Population
     this.popSlider = new Slider({
-      id: 'pop-size', label: 'Grid size', min: 8, max: 320, step: 8,
+      id: 'pop-size', label: 'Grid size', min: MIN_GRID_SIZE, max: MAX_GRID_SIZE, step: 8,
       value: this.cfg.size,
       format: (v) => `${v}×${v}`,
       onChange: (v) => {

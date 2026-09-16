@@ -928,10 +928,10 @@ export class R0Modal {
       const row = document.createElement('div');
       row.className = 'r0-row';
       row.innerHTML = `
-        <input class="r0-in" type="number" step="any" value="${pt.day}" data-col="day" aria-label="Day" />
-        <input class="r0-in" type="number" step="any" value="${pt.value}" data-col="value" aria-label="Value" />
+        <input class="r0-in" type="number" step="any" value="${escapeAttr(String(pt.day))}" data-col="day" aria-label="Day" />
+        <input class="r0-in" type="number" step="any" value="${escapeAttr(String(pt.value))}" data-col="value" aria-label="Value" />
         <select class="r0-in" data-col="category" aria-label="Category">
-          ${FIT_CATEGORIES.map((c) => `<option value="${c}"${c === pt.category ? ' selected' : ''}>${CATEGORY_LABELS[c]}</option>`).join('')}
+          ${FIT_CATEGORIES.map((c) => `<option value="${escapeAttr(c)}"${c === pt.category ? ' selected' : ''}>${CATEGORY_LABELS[c]}</option>`).join('')}
         </select>
         <button class="r0-del" type="button" aria-label="Delete row" title="Delete">${icon('delete')}</button>
       `;
@@ -1952,7 +1952,7 @@ export class R0Modal {
           <span>R₀ ${e.result.r0 == null ? '—' : e.result.r0.toFixed(2)}</span>
           <span>R² ${e.result.gof.r2.toFixed(3)}</span>
           <span class="r0-muted">loss ${fmtLoss(e.result.loss)}</span>
-          <span class="r0-history-params r0-muted" title="${params}">${params}</span>
+          <span class="r0-history-params r0-muted" title="${escapeAttr(params)}">${escapeHtml(params)}</span>
           <button class="btn ghost" type="button" data-act="load">Load</button>
           <button class="btn ghost" type="button" data-act="apply">Apply</button>
         `;
@@ -2797,3 +2797,11 @@ const TEMPLATE = `
   </div>
   </div>
 `;
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function escapeAttr(s: string): string {
+  return escapeHtml(s).replace(/"/g, '&quot;');
+}

@@ -1,6 +1,38 @@
 // Headless tick-rate benchmark — the Phase 0 perf harness required by
 // docs/wasm-plan.md §2. Run with `npm run bench` (vite-node; no browser).
 //
+// ⚠️  DO NOT QUOTE THIS SCRIPT'S TICK RATES AS APP-LEVEL NUMBERS. ⚠️
+//
+// `npm run bench` executes this file through VITE-NODE, which is not a neutral
+// measuring instrument. Vite-node's SSR transform rewrites cross-module imports
+// into accesses on a synthetic namespace object whose members are ACCESSOR
+// properties (`Object.defineProperty(exports, 'CellState', { get() {...} })`),
+// so a `const enum` read such as `CellState.Infectious` becomes a GETTER CALL
+// plus a property load — per read, per cell, per tick. Nothing the app ships
+// does that: `vite build` emits a plain data-property load, which V8 serves
+// almost for free.
+//
+// Engines that read those enums inside the hot loop are penalised hard (~3.3×
+// on the pre-optimization engine); engines that hoist them into locals barely
+// notice. The penalty is therefore NOT constant across engine versions, which
+// means ratios taken between vite-node runs of two different engine versions
+// are inflated by an unknown amount — and the inflation looks exactly like a
+// real optimization.
+//
+// This file is kept because it is the original Phase 0 instrument, its per-pass
+// split is still useful for A/B work on the hot loops WITHIN one engine
+// version, and its history-maintenance micro-bench has no other home. For
+// anything that will be published or compared across versions, use the
+// runtime-honest harness:
+//
+//   npm run bench:node       TS engine, plain node, esbuild bundle
+//   npm run bench:backends   TS vs WASM + tick-by-tick parity, plain node
+//   npm run bench:frame      frame-post cost, plain node, production bundle
+//   npm run bench:browser    TS / WASM / shipped WebGPU engine, real Chrome
+//   npm run bench:ladder     the historical ladder, one harness, plain node
+//
+// See tests/README.md.
+//
 // Reports, per geometry at 320×320:
 //   - ticks/sec and ms/tick over a fixed measured window
 //   - coarse per-pass split: transmission / quarantine / life-cycle / stats
@@ -12,7 +44,9 @@
 //
 // Two micro-benches follow the main table:
 //   - frame-post cost: what sim.worker's postFrame pays per posted frame for
-//     the long-history payload
+//     the long-history payload. SUPERSEDED — quote `npm run bench:frame`
+//     (tests/bench/node-frame.ts), which measures the same two payloads on the
+//     production bundle, warmed, best-of-N.
 //   - history maintenance at the LONG_CAP window: per-tick cost of the sliding
 //     long-stats window once it is full (4096 ticks)
 
@@ -93,6 +127,9 @@ function runGeometry(geometry: GeometryType): void {
 // ── Frame-post micro-bench ───────────────────────────────────────────────────
 // sim.worker's postFrame serializes the long-history payload per posted frame
 // (up to 60/s). Measure what one post pays for that payload.
+//
+// Cold and single-batch by construction, and under vite-node. Kept for A/B
+// work in place; the quotable version is `npm run bench:frame`.
 function benchFramePost(): void {
   const cfg = benchConfig('square');
   cfg.size = 128; // history cost depends on tick count, not grid size

@@ -1,5 +1,10 @@
 # MemeLabV3 — Geometry-Extended Engine Architecture
 
+> Historical design diagrams. Several schemas and execution paths below
+> predate the event-driven core and accelerated backends. For current delivery
+> status see [ROADMAP.md](ROADMAP.md); protocol definitions in `src/types.ts`
+> and implementations in `src/sim/` and `src/worker/` are authoritative.
+
 ## System Overview
 
 ```mermaid

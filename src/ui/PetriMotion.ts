@@ -1,5 +1,5 @@
 // Live-motion petri renderer — a canvas port of the V3+ "True morph" engine
-// (docs/brand/animation/engine.js) for small boards. Render layer only: the
+// for small boards. Render layer only: the
 // worker's state arrays are the single source of truth; this module just
 // animates the presentation of state CHANGES (morph transitions), adds idle
 // life, particles, and cursor jelly springs on top.

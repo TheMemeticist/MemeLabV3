@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 
+const MAX_SCHEDULE_LEN: u32 = 10_000;
 const ST_S: u8 = 0;
 const ST_E: u8 = 1;
 const ST_I: u8 = 2;
@@ -954,6 +955,8 @@ pub extern "C" fn csr_list_alloc(role: u32, len: u32) -> *mut i32 {
 
 #[no_mangle]
 pub extern "C" fn sched_alloc(len: u32) -> *mut f64 {
+    // Mirror of MAX_SCHEDULE_LEN in src/sim/config.ts.
+    let len = len.min(MAX_SCHEDULE_LEN);
     let s = &mut sim().sched;
     s.clear();
     s.resize(len as usize, 1.0);

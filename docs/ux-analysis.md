@@ -1,5 +1,10 @@
 # MemeLab CDA v3 — UX Analysis & Improvement Proposals
 
+> Historical design analysis, not a completion tracker. Later work changed
+> the interface and implemented some proposals. See [ROADMAP.md](ROADMAP.md)
+> for current status and remaining validation; model claims below are design
+> rationale, not evidence of historical-outbreak validation.
+
 *Authored from the dual vantage of simulation science and cognitive interface theory.*
 *Every finding is traceable to source files cited inline.*
 

@@ -27,6 +27,7 @@
 import type { CostConfig, GeometryType, VoronoiMode, SimConfig } from '../types';
 import { findCurrency, costConfigFromProfile } from './cost';
 import { baseSimConfig, findPreset } from '../sim/presets';
+import { MIN_GRID_SIZE, MAX_GRID_SIZE, MIN_STAGE_DAYS, MAX_STAGE_DAYS } from '../sim/config';
 
 const VALID_GEOMETRIES = new Set<string>(['square', 'triangular', 'hexagonal', 'meanfield', 'voronoi']);
 const VALID_VORONOI_MODES = new Set<string>(['uniform', 'jittered', 'relaxed', 'settlements']);
@@ -238,7 +239,7 @@ export function applyEncoded(p: URLSearchParams, baseArg: SimConfig): {
 
   const config: SimConfig = {
     seed: int(p, 's', base.seed) >>> 0,
-    size: clampInt(int(p, 'z', base.size), 8, 1024),
+    size: clampInt(int(p, 'z', base.size), MIN_GRID_SIZE, MAX_GRID_SIZE),
     geometry,
     voronoiConfig: {
       mode: voronoiMode,
@@ -250,8 +251,8 @@ export function applyEncoded(p: URLSearchParams, baseArg: SimConfig): {
     reseedOnExtinction: base.reseedOnExtinction,
     strain: {
       attackRate: clamp01(num(p, 'at', base.strain.attackRate)),
-      incubation: Math.max(1, int(p, 'ic', base.strain.incubation)),
-      infectious: Math.max(1, int(p, 'if', base.strain.infectious)),
+      incubation: clampInt(int(p, 'ic', base.strain.incubation), MIN_STAGE_DAYS, MAX_STAGE_DAYS),
+      infectious: clampInt(int(p, 'if', base.strain.infectious), MIN_STAGE_DAYS, MAX_STAGE_DAYS),
       ifr: clamp01(num(p, 'fr', base.strain.ifr)),
       range: clampInt(int(p, 'rg', base.strain.range), 1, 8),
       immunityDays: clampInt(int(p, 'im', base.strain.immunityDays), 1, 36500),

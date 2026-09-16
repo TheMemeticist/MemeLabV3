@@ -1,6 +1,7 @@
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { FitWindow, InterventionEvent, LongStats } from '../types';
+import { OutbreakPeak } from '../lib/outbreak';
 
 const MARKER_COLORS: Record<string, string> = {
   mask: 'rgb(38, 169, 198)',
@@ -67,6 +68,8 @@ export class Chart {
   private costData: CostChartData | null = null;
   private costSymbol = '$';
   private expanded = false;
+  private peak = new OutbreakPeak();
+  private peakSummary: HTMLElement | null = null;
 
   constructor(host: HTMLElement) {
     this.host = host;
@@ -88,6 +91,10 @@ export class Chart {
     // Don't call plot.redraw() — uPlot 1.x's redraw() can clear cached series
     // paths in a way that wipes the visible traces. The next setData() (which
     // arrives at every sim tick) re-fires hooks.draw and paints markers fresh.
+  }
+
+  recordHistory(history: LongStats, reset = false): void {
+    this.peak.record(history, reset);
   }
 
   /** Fitted-intervention windows (sim days) shaded behind the series while an
@@ -142,6 +149,7 @@ export class Chart {
     // Only the Infectious series is renamed between modes; update it in place
     // (uPlot doesn't re-render legend labels on setData).
     this.setSeriesLabel(3, this.infectiousLabel());
+    this.updatePeakSummary();
   }
 
   // "Infectious" (current count) vs "Infections" (cumulative, Total mode).
@@ -192,6 +200,8 @@ export class Chart {
     this.leaveHandler = null;
     this.markerTip?.remove();
     this.markerTip = null;
+    this.peakSummary?.remove();
+    this.peakSummary = null;
   }
 
   // App computes the (currency-converted) cumulative cost series and hands it in.
@@ -237,7 +247,7 @@ export class Chart {
     if (this.expanded) {
       const legend = this.host.querySelector<HTMLElement>('.u-legend');
       const legendH = legend ? legend.offsetHeight + 12 : 48;
-      const avail = Math.round(window.innerHeight * 0.84) - 64 - legendH;
+      const avail = Math.round(window.innerHeight * 0.84) - 64 - legendH - (this.peakSummary?.offsetHeight ?? 0);
       return Math.max(240, Math.min(920, avail));
     }
     // Mobile / single-column layout: host has no row constraint, so use a
@@ -250,7 +260,7 @@ export class Chart {
     if (document.querySelector('.app-main.layout-observe')) {
       const legend = this.host.querySelector<HTMLElement>('.u-legend');
       const legendH = legend ? legend.offsetHeight + 12 : 48;
-      const avail = this.host.clientHeight - legendH - 10;
+      const avail = this.host.clientHeight - legendH - 10 - (this.peakSummary?.offsetHeight ?? 0);
       if (avail >= 180) return Math.min(760, avail);
     }
     // Configure layout: the module height is content-driven, so a fixed
@@ -386,15 +396,56 @@ export class Chart {
             (u) => { if (isReff) this.paintReffThreshold(u); },
             (u) => { if (this.view === 'compartments') this.paintFitOverlay(u); },
             (u) => this.paintMarkers(u),
+            (u) => this.paintPeak(u),
           ],
         },
       };
       this.plot = new uPlot(opts, data, this.host);
       this.installMarkerTooltip();
       this.annotateLegend();
+      this.peakSummary = document.createElement('p');
+      this.peakSummary.className = 'chart-peak-summary';
+      this.host.append(this.peakSummary);
     } else {
       this.plot.setData(data);
     }
+    this.updatePeakSummary();
+  }
+
+  private updatePeakSummary(): void {
+    if (!this.peakSummary) return;
+    const peak = this.peak.value;
+    this.peakSummary.hidden = this.view !== 'compartments' || this.mode !== 'active';
+    this.peakSummary.textContent = peak
+      ? `Infectious peak so far: ${peak.infectious.toLocaleString()} on day ${peak.tick} · ${peak.deaths.toLocaleString()} cumulative deaths then. Later waves may be higher.`
+      : 'No infectious cases recorded yet. Exposed cells may still become infectious.';
+  }
+
+  private paintPeak(u: uPlot): void {
+    const peak = this.peak.value;
+    if (!peak || this.view !== 'compartments' || this.mode !== 'active' || !u.series[3]?.show) return;
+    const x = u.valToPos(peak.tick, 'x', true);
+    const y = u.valToPos(peak.infectious, 'y', true);
+    const { left, top, width, height } = u.bbox;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < left || x > left + width || y < top || y > top + height) return;
+    const ctx = u.ctx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    ctx.strokeStyle = cssVar('--text');
+    ctx.fillStyle = cssVar('--bg-panel');
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.beginPath();
+    ctx.arc(x, y, 4 * dpr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = cssVar('--text');
+    ctx.font = `600 ${10 * dpr}px ui-sans-serif, system-ui, sans-serif`;
+    const label = 'peak so far';
+    const textWidth = ctx.measureText(label).width;
+    const textX = Math.max(left + 2 * dpr, Math.min(x + 7 * dpr, left + width - textWidth - 2 * dpr));
+    ctx.textBaseline = 'top';
+    ctx.fillText(label, textX, Math.min(y + 7 * dpr, top + height - 12 * dpr));
+    ctx.restore();
   }
 
   private buildData(long: LongStats): uPlot.AlignedData {
@@ -434,7 +485,7 @@ export class Chart {
   }
 
   private paintReffThreshold(u: uPlot): void {
-    // Draw a dashed horizontal at R=1 — the herd-immunity threshold.
+    // Reference R=1; this is not a universal immunity threshold.
     const y = u.valToPos(1, 'y', true);
     if (!Number.isFinite(y)) return;
     const ctx = u.ctx;
@@ -817,4 +868,3 @@ function cssVar(varName: string): string {
   const css = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
   return css || '#888';
 }
-

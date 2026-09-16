@@ -1,4 +1,5 @@
-import type { SimStats } from '../types';
+import type { LongStats, SimStats } from '../types';
+import { outbreakPhase } from '../lib/outbreak';
 
 export class Stats {
   private el: HTMLElement;
@@ -9,6 +10,8 @@ export class Stats {
   private costCalmTimer = 0;
   private lastReff: number | null = null;
   private lastTick = 0;
+  private phaseTile: HTMLElement;
+  private phaseDetail: HTMLElement;
 
   constructor(host: HTMLElement) {
     host.classList.add('stats-host');
@@ -20,6 +23,7 @@ export class Stats {
       <div class="stat" data-key="reff"><span class="stat-label">R<sub>eff</sub></span><span class="stat-value">—</span></div>
       <div class="stat" data-key="r0"><span class="stat-label">R<sub>0</sub></span><span class="stat-value">—</span></div>
       <div class="stat" data-key="cost"><span class="stat-label">Cost</span><span class="stat-value">—</span></div>
+      <div class="stat stat-phase" data-key="phase"><span class="stat-label">Outbreak trend</span><span class="stat-value">Watching trend</span><span class="stat-detail"></span></div>
     `;
     this.el = host;
     host.querySelectorAll<HTMLElement>('.stat').forEach((s) => {
@@ -28,6 +32,8 @@ export class Stats {
     });
     this.rNaughtVal = this.items['r0'];
     this.costTile = this.items['cost'].closest('.stat');
+    this.phaseTile = this.items['phase'].closest('.stat')!;
+    this.phaseDetail = this.phaseTile.querySelector('.stat-detail')!;
   }
 
   setRNaught(value: number | null): void {
@@ -59,7 +65,12 @@ export class Stats {
     }
   }
 
-  update(stats: SimStats, n: number): void {
+  reset(): void {
+    this.lastReff = null;
+    this.lastTick = 0;
+  }
+
+  update(stats: SimStats, n: number, history: LongStats): void {
     // Detect a reset / new run: tick rewound to 0 (or below previous).
     if (stats.tick < this.lastTick) this.lastReff = null;
     this.lastTick = stats.tick;
@@ -70,6 +81,10 @@ export class Stats {
     this.items['i'].textContent = pct(stats.e + stats.i, n);
     this.items['r'].textContent = pct(stats.r, n);
     this.items['d'].textContent = pct(stats.d, n);
+    const phase = outbreakPhase(stats, history);
+    this.items['phase'].textContent = phase.label;
+    this.phaseTile.dataset.phase = phase.kind;
+    this.phaseDetail.textContent = phase.detail;
     // R_eff is window-based (rolling new-infections / new-infectious). With
     // long-incubation pathogens, the denominator is often zero for stretches
     // even though the epidemic is clearly active. Treat zero as "no new data"

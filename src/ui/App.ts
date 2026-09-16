@@ -17,7 +17,8 @@ import { installFocusTrap } from './focus';
 import { read, write } from '../lib/storage';
 import { effectiveReduction, interventionWindows, migrateInterventionSpecs, syncSpecsWithToggle, transmissionSchedule } from '../lib/fit';
 import { encode as encodeUrl, decode as decodeUrl, applyEncoded, decodeCostConfig } from '../lib/url-state';
-import { computeLedger, costConfigFromProfile, findCurrency, formatMoney } from '../lib/cost';
+import { clampSchedule, restoreSimConfig } from '../sim/config';
+import { computeLedger, costConfigFromProfile, findCurrency, formatMoney, restoreCostConfig } from '../lib/cost';
 import { appendLongDelta, emptyLongStats } from '../sim/long-history';
 import type { LongStats } from '../types';
 import { downloadText, downloadDataUrl, timestamp } from '../lib/export';
@@ -109,7 +110,12 @@ export class App {
 
     // Hydrate config: URL > localStorage > default
     const defaults = this.defaultConfig();
-    const fromUrl = location.hash ? decodeUrl(location.hash) : null;
+    let fromUrl: URLSearchParams | null = null;
+    try {
+      fromUrl = location.hash ? decodeUrl(location.hash) : null;
+    } catch (err) {
+      console.warn('Ignoring malformed permalink', err);
+    }
     const fromLs = read<{ config: SimConfig; presetId: string; speed: number; theme: 'petri' | 'lab'; customName?: string | null; costConfig?: CostConfig } | null>('lastConfig', null);
 
     let initialConfig = defaults.config;
@@ -118,20 +124,30 @@ export class App {
     // Default theme follows the OS unless the URL or a saved session says
     // otherwise (both branches below may override).
     if (window.matchMedia('(prefers-color-scheme: dark)').matches) this.theme = 'lab';
+    let urlApplied: ReturnType<typeof applyEncoded> | null = null;
     if (fromUrl) {
-      const applied = applyEncoded(fromUrl, defaults.config);
-      initialConfig = applied.config;
-      if (applied.presetId) initialPresetId = applied.presetId;
-      if (applied.speed != null) this.speedIdx = clampInt(applied.speed, 0, SPEEDS.length - 1);
-      if (applied.theme === 'lab' || applied.theme === 'petri') this.theme = applied.theme;
-      const nameRaw = fromUrl.get('n');
-      if (nameRaw) initialCustomName = decodeURIComponent(nameRaw);
-    } else if (fromLs) {
-      initialConfig = fromLs.config;
-      initialPresetId = fromLs.presetId;
+      try {
+        urlApplied = applyEncoded(fromUrl, defaults.config);
+      } catch (err) {
+        console.warn('Ignoring malformed permalink', err);
+        fromUrl = null;
+      }
+    }
+    if (fromUrl && urlApplied) {
+      initialConfig = urlApplied.config;
+      if (urlApplied.presetId) initialPresetId = urlApplied.presetId;
+      if (urlApplied.speed != null) this.speedIdx = clampInt(urlApplied.speed, 0, SPEEDS.length - 1);
+      if (urlApplied.theme === 'lab' || urlApplied.theme === 'petri') this.theme = urlApplied.theme;
+      // URLSearchParams already percent-decodes; no second decode.
+      initialCustomName = fromUrl.get('n') || null;
+    } else if (fromLs && fromLs.config && typeof fromLs.config === 'object') {
+      // Validate stored values directly: permalink encoding rounds fitted
+      // parameters and omits disabled controls, which would alter a saved run.
+      initialPresetId = findPreset(typeof fromLs.presetId === 'string' ? fromLs.presetId : defaults.presetId).id;
+      initialConfig = restoreSimConfig(fromLs.config, baseSimConfig(initialPresetId));
       this.speedIdx = clampInt(fromLs.speed ?? 2, 0, SPEEDS.length - 1);
       if (fromLs.theme === 'lab' || fromLs.theme === 'petri') this.theme = fromLs.theme;
-      initialCustomName = fromLs.customName ?? null;
+      initialCustomName = typeof fromLs.customName === 'string' ? fromLs.customName : null;
     }
 
     // Cost config: URL > localStorage > the active preset's bundled profile.
@@ -139,7 +155,7 @@ export class App {
     if (fromUrl) {
       this.costConfig = decodeCostConfig(fromUrl, presetCost);
     } else if (fromLs?.costConfig) {
-      this.costConfig = fromLs.costConfig;
+      this.costConfig = restoreCostConfig(fromLs.costConfig, presetCost);
     } else {
       this.costConfig = presetCost;
     }
@@ -191,7 +207,7 @@ export class App {
       meta?: { offset: number; days: number; cells: number; overlay: FitApplyExtras['overlay'] } | null;
     } | null>('fitRt', null);
     if (fitRt && (fitRt.schedule?.length || fitRt.meta)) {
-      this.fitSchedule = fitRt.schedule?.length ? fitRt.schedule : null;
+      this.fitSchedule = clampSchedule(fitRt.schedule);
       this.fitWindows = (fitRt.windows ?? []).map((w) => ({ ...w, to: w.to === null ? Number.POSITIVE_INFINITY : w.to }));
       this.fitMeta = fitRt.meta ?? null;
       if (this.fitSchedule) this.send({ cmd: 'setSchedule', schedule: this.fitSchedule });
@@ -513,6 +529,9 @@ export class App {
   }
 
   private onFrame(msg: FrameMessage): void {
+    const newRun = !!msg.longFull && msg.tick === 0;
+    if (newRun) this.stats.reset();
+    if (msg.longFull || msg.longDelta) this.chart.recordHistory((msg.longFull ?? msg.longDelta)!, newRun);
     if (msg.longFull) this.longMirror = msg.longFull;
     else if (msg.longDelta) appendLongDelta(this.longMirror, msg.longDelta);
     // Keep only the most recent frame and render it on the next animation
@@ -541,7 +560,7 @@ export class App {
     this.petri.paint(msg.state, msg.defenses, msg.quarantined, msg.size, this.controls.config().geometry ?? 'square');
     this.updateCost(msg);
     this.chart.update(this.longMirror);
-    this.stats.update(msg.stats, msg.size * msg.size);
+    this.stats.update(msg.stats, msg.size * msg.size, this.longMirror);
     this.stats.setRNaught(msg.rNaught);
     const rNStr = msg.rNaught == null ? '—' : msg.rNaught.toFixed(1);
     this.metaSet('rN', `R₀ = ${rNStr}`);
@@ -749,6 +768,9 @@ export class App {
     const btn = wrap.querySelector<HTMLButtonElement>('[data-act="expand-chart"]');
     btn?.setAttribute('aria-pressed', on ? 'true' : 'false');
     btn?.setAttribute('title', on ? 'Collapse chart' : 'Expand chart');
+    // Moving the wrap into the modal drops the focused trigger before the
+    // focus trap can capture it. Restore the now-mounted trigger explicitly.
+    if (!on) btn?.focus();
     this.chart.setExpanded(on);
   }
 
@@ -1200,15 +1222,22 @@ export class App {
 
   private onHashChange(): void {
     if (!location.hash) return;
-    const decoded = decodeUrl(location.hash);
-    if (!decoded) return;
-    const applied = applyEncoded(decoded, this.controls.config());
+    let decoded: URLSearchParams | null = null;
+    let applied: ReturnType<typeof applyEncoded>;
+    try {
+      decoded = decodeUrl(location.hash);
+      if (!decoded) return;
+      applied = applyEncoded(decoded, this.controls.config());
+    } catch (err) {
+      console.warn('Ignoring malformed permalink', err);
+      return;
+    }
     this.controls.hydrate(applied.config, applied.presetId ?? this.controls.currentPresetId());
     const presetCost = costConfigFromProfile(findPreset(applied.presetId ?? this.controls.currentPresetId()).cost);
     this.costConfig = decodeCostConfig(decoded, presetCost);
     this.costModal.setConfig(this.costConfig);
     const nameParam = decoded.get('n');
-    this.controls.setCustomName(nameParam ? decodeURIComponent(nameParam) : null);
+    this.controls.setCustomName(nameParam || null);
     if (applied.theme === 'lab' || applied.theme === 'petri') {
       this.theme = applied.theme;
       this.applyTheme();

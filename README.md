@@ -74,7 +74,28 @@ Adjusting any slider while the sim is running uses a live-patch path: per-cell f
 
 ## Determinism
 
-Every run is reproducible. Click **Permalink** in the topbar to copy a URL that encodes seed + grid size + disease genes + defenses + theme + speed. Anyone who opens that URL replays the same simulation byte-for-byte.
+Runs are deterministic given the same configuration, seed, backend family,
+and ordered edits. CPU and WASM reproduce each other bit-for-bit; GPU has its
+own deterministic trajectory. The Share menu encodes simulation parameters,
+seed, theme, and speed in a human-readable link. Links round numeric values
+and omit backend preference, applied-fit schedules, and edit history; they
+are not exact checkpoints of an arbitrary running session.
+
+### Engines and development status
+
+The stats panel describes the recent observed E+I trend, including incubation
+and the initial ready state. The active chart marks the largest infectious
+count recorded so far, with its day and cumulative deaths at that time. These
+describe observations; a later wave may exceed the recorded peak.
+
+CPU is the reference implementation and supports mutation. WASM accelerates
+supported non-mutating configurations with parity tests. WebGPU supports all
+five geometries but excludes mutation and anti-extinction reseeding; the
+backend menu reports availability and fallback reasons.
+
+See [the current roadmap](docs/ROADMAP.md) for implemented and planned work,
+[the changelog](CHANGELOG.md) for releases, and
+[the benchmark protocol](tests/README.md) for reproducible measurements.
 
 ## What's in here
 

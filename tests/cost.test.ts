@@ -7,8 +7,45 @@ import {
   dailyCost,
   formatMoney,
   findCurrency,
+  defaultCostConfig,
+  restoreCostConfig,
 } from '../src/lib/cost';
 import type { LongStats, PathogenCostProfile, RetiredCostTotals, SimConfig } from '../src/types';
+
+describe('saved cost configuration', () => {
+  it('preserves fractional prices, small rates and custom regions exactly', () => {
+    const base = defaultCostConfig();
+    const saved = {
+      ...base, regionId: 'custom', currencyCode: 'EUR', currencyRate: 0.923456789,
+      profile: {
+        ...base.profile, medCostMild: 180.73, vaccineDosePrice: 23.45,
+        maskCostPerDayPerPerson: 0.0004, hospitalBedsPerCapita: 0.0001234567,
+        hospitalizationRate: 0.123456789, quarantineIsHospital: true,
+      },
+    };
+    const restored = restoreCostConfig(JSON.parse(JSON.stringify(saved)), base);
+    expect(restored).toEqual(saved);
+    expect(restored.profile).not.toBe(saved.profile);
+    restored.profile.medCostMild = 0;
+    expect(base.profile.medCostMild).toBe(180);
+  });
+
+  it('rejects malformed data and bounds typed numeric fields without coercing strings', () => {
+    const base = defaultCostConfig();
+    expect(restoreCostConfig({ profile: [] }, base)).toEqual(base);
+    const restored = restoreCostConfig({
+      regionId: '<bad>', currencyCode: '???', currencyRate: -1,
+      profile: { hospitalizationRate: 5, medCostMild: '123', medCostICU: Infinity,
+        vaccineDosePrice: -20, vaccineDosesRequired: 2.9, immunityDays: 0,
+        surgeCostMultiplier: 0, quarantineIsHospital: 'false' },
+    }, base);
+    expect(restored).toMatchObject({ regionId: base.regionId, currencyCode: base.currencyCode, currencyRate: 0 });
+    expect(restored.profile).toMatchObject({ hospitalizationRate: 1, medCostMild: base.profile.medCostMild,
+      medCostICU: base.profile.medCostICU, vaccineDosePrice: 0, vaccineDosesRequired: 2,
+      immunityDays: 1, surgeCostMultiplier: 1, quarantineIsHospital: base.profile.quarantineIsHospital });
+    expect(restoreCostConfig({ currencyCode: 'JPY', profile: {} }, base).currencyRate).toBe(findCurrency('JPY').rateVsUsd);
+  });
+});
 
 // Build a LongStats with only the fields the cost layer reads populated.
 function longFrom(parts: Partial<Record<keyof LongStats, number[]>>): LongStats {

@@ -22,6 +22,7 @@
 import { CellState } from '../types';
 import type { LongStats, RetiredCostTotals, SimConfig, SimStats, VoronoiTopology } from '../types';
 import { LongHistory } from './long-history';
+import { MAX_SCHEDULE_LEN } from './config';
 import { Rng } from './rng';
 import { seed } from './population';
 import { makeGeometry, VoronoiLattice, type LatticeGeometry } from './neighbors';
@@ -330,6 +331,9 @@ export class WasmEngine {
 
   private pushSchedule(sched: number[] | null): void {
     const ex = this.exports;
+    // Cap on the TS side too so a corrupt schedule can never request an
+    // unbounded wasm-side allocation.
+    if (sched && sched.length > MAX_SCHEDULE_LEN) sched = sched.slice(0, MAX_SCHEDULE_LEN);
     const len = sched ? sched.length : 0;
     const ptr = ex.sched_alloc(len);
     if (sched && len > 0) {

@@ -561,6 +561,12 @@ input[type='range']::-moz-range-thumb {
 .stat[data-key='d'] .stat-value { color: rgb(var(--cell-d)); }
 :root[data-theme='lab'] .stat[data-key='d'] .stat-value { color: var(--text-muted); }
 .stat .stat-value.stale { opacity: 0.6; font-style: italic; }
+.stat-phase { flex: 2 1 0; }
+.stat-phase .stat-value { font-size: 13px; white-space: normal; overflow: visible; }
+.stat-detail { font-size: 10px; line-height: 1.35; color: var(--text-muted); }
+.stat-phase[data-phase='growing'] { background: color-mix(in srgb, rgb(var(--cell-i)) 9%, transparent); }
+.stat-phase[data-phase='declining'],
+.stat-phase[data-phase='inactive'] { background: var(--accent-soft); }
 
 /* Observe layout: monitors become a 2×4 tile grid beside the dish. */
 .app-main.layout-observe .stats-row {
@@ -570,7 +576,7 @@ input[type='range']::-moz-range-thumb {
 .app-main.layout-observe .stat { border-left: 0; border-top: 1px solid var(--border); }
 .app-main.layout-observe .stat:nth-child(-n + 2) { border-top: 0; }
 .app-main.layout-observe .stat:nth-child(2n) { border-left: 1px solid var(--border); }
-.app-main.layout-observe .stat[data-key='cost'] { grid-column: 1 / -1; border-left: 0; }
+.app-main.layout-observe .stat[data-key='cost'] { border-left: 0; }
 
 /* Cost meter — escalates by color only; no motion (Swiss restraint). */
 .stat[data-key='cost'] {
@@ -876,6 +882,8 @@ input[type='range']::-moz-range-thumb {
   flex-direction: column;
 }
 .chart-host .uplot { flex: 0 0 auto; position: relative; width: 100%; }
+.chart-peak-summary { margin: 6px 0 0; font-size: 11px; line-height: 1.4; color: var(--text-muted); }
+.chart-peak-summary[hidden] { display: none; }
 .chart-host .uplot .u-legend {
   position: static !important;
   top: auto !important;
@@ -2709,7 +2717,6 @@ select.r0-in { width: auto; font-family: var(--font-sans); }
   .stats-row .stat { border-left: 1px solid var(--border); border-top: 1px solid var(--border); }
   .stats-row .stat:nth-child(-n + 4) { border-top: 0; }
   .stats-row .stat:nth-child(4n + 1) { border-left: 0; }
-  .stat[data-key='cost'] { grid-column: span 2; }
   /* Dish: square sized off the viewport */
   .petri-host {
     container-type: normal;

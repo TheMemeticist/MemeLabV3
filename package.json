@@ -10,6 +10,12 @@
     "preview": "vite preview",
     "test": "vitest run",
     "bench": "vite-node tests/bench.ts",
+    "bench:node": "node tests/bench/run-node.mjs ts",
+    "bench:backends": "node tests/bench/run-node.mjs backends",
+    "bench:fit": "node tests/bench/run-node.mjs fit",
+    "bench:frame": "node tests/bench/run-node.mjs frame",
+    "bench:browser": "node tests/bench/run-browser.mjs",
+    "bench:ladder": "node tests/bench/ladder.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc -b --noEmit"
   },

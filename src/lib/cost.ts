@@ -111,6 +111,41 @@ export function defaultCostConfig(): CostConfig {
   };
 }
 
+/** Validate saved cost inputs directly: sharing URLs intentionally compress
+ * numbers, while a reload must keep the user's exact prices and rates. */
+export function restoreCostConfig(value: unknown, fallback: CostConfig): CostConfig {
+  const result = structuredClone(fallback);
+  const object = (v: unknown): v is Record<string, unknown> =>
+    typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (!object(value) || !object(value.profile)) return result;
+  if (value.regionId === 'custom' || REGION_PRESETS.some((region) => region.id === value.regionId)) {
+    result.regionId = value.regionId as string;
+  }
+  if (CURRENCIES.some((currency) => currency.code === value.currencyCode)) {
+    result.currencyCode = value.currencyCode as string;
+  }
+  if (typeof value.currencyRate === 'number' && Number.isFinite(value.currencyRate)) {
+    result.currencyRate = Math.max(0, value.currencyRate);
+  } else if (result.currencyCode !== fallback.currencyCode) {
+    result.currencyRate = findCurrency(result.currencyCode).rateVsUsd;
+  }
+  const fractions = new Set<keyof PathogenCostProfile>([
+    'hospitalizationRate', 'icuRate', 'symptomaticFraction', 'workCapacityLoss', 'laborParticipationRate',
+  ]);
+  for (const key of Object.keys(fallback.profile) as Array<keyof PathogenCostProfile>) {
+    const candidate = value.profile[key];
+    if (key === 'quarantineIsHospital') {
+      if (typeof candidate === 'boolean') result.profile[key] = candidate;
+      continue;
+    }
+    if (typeof candidate !== 'number' || !Number.isFinite(candidate)) continue;
+    const minimum = key === 'immunityDays' || key === 'surgeCostMultiplier' ? 1 : 0;
+    const bounded = Math.max(minimum, Math.min(fractions.has(key) ? 1 : Infinity, candidate));
+    result.profile[key] = key === 'immunityDays' || key === 'vaccineDosesRequired' ? Math.trunc(bounded) : bounded;
+  }
+  return result;
+}
+
 // ─── Per-day cost for a single tick ───────────────────────────────────────────
 
 export interface DailyCost {

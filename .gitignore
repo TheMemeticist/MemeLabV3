@@ -8,3 +8,4 @@ dist/
 coverage/
 tsconfig.tsbuildinfo
 rust/engine-core/target/
+bench-out/

@@ -1,5 +1,10 @@
 # WebAssembly plan
 
+> Historical gate analysis, superseded by the implemented backends in
+> [perf-plan.md](perf-plan.md#7-integration-status--2026-08-20-same-day).
+> CPU/WASM parity and the GPU backend are now maintained production code;
+> see [ROADMAP.md](ROADMAP.md) for current status.
+
 Scope note: this covers the Rust/WASM half of the proposal's "WebGPU + Rust/WASM" claim. WebGPU is a rendering concern and is planned separately — the two are independent and should not be bundled into one decision.
 
 ## 1. Position

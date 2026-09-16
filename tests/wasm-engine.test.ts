@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { Engine } from '../src/sim';
 import { WasmEngine, wasmAvailable, wasmCompatible, createEngine } from '../src/sim/wasm-engine';
+import { MAX_SCHEDULE_LEN } from '../src/sim/config';
+import { ENGINE_CORE_WASM_B64 } from '../src/sim/wasm/engine-core-b64';
 import type { GeometryType, SimConfig, SimStats } from '../src/types';
 
 // The WASM engine's determinism contract is BIT-EQUALITY with the TS reference
@@ -40,6 +42,35 @@ const WASM_GEOMETRIES: GeometryType[] = ['square', 'triangular', 'hexagonal', 'm
 describe('WasmEngine ↔ Engine bit-parity', () => {
   it('wasm is available in this runtime', () => {
     expect(wasmAvailable()).toBe(true);
+  });
+
+  it('the embedded Rust binary bounds schedule allocation independently of the wrapper', () => {
+    const bytes = Uint8Array.from(atob(ENGINE_CORE_WASM_B64), (char) => char.charCodeAt(0));
+    const core = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports as unknown as {
+      init(size: number): void;
+      sched_alloc(length: number): number;
+      memory: WebAssembly.Memory;
+    };
+    core.init(8);
+    const ptr = core.sched_alloc(MAX_SCHEDULE_LEN);
+    const byteLength = core.memory.buffer.byteLength;
+    // An oversized request must reuse the capped allocation. Testing the
+    // shipped module catches a Rust change whose base64 artifact was not rebuilt.
+    expect(core.sched_alloc(MAX_SCHEDULE_LEN * 100)).toBe(ptr);
+    expect(core.memory.buffer.byteLength).toBe(byteLength);
+    expect(core.sched_alloc(0)).toBe(0);
+  });
+
+  it('an oversized schedule replays the capped TS schedule through its final entry', () => {
+    const cfg = goldenConfig('square');
+    cfg.size = 8;
+    cfg.reseedOnExtinction = true;
+    const schedule = Array<number>(MAX_SCHEDULE_LEN + 20).fill(1);
+    schedule[MAX_SCHEDULE_LEN - 1] = 0;
+    const ts = new Engine(cfg, null, { txSchedule: schedule.slice(0, MAX_SCHEDULE_LEN) });
+    const wa = new WasmEngine(cfg, null, { txSchedule: schedule });
+    for (let t = 0; t < schedule.length; t++) expectSameStats(ts.step(), wa.step());
+    expect(wa.buffers().state).toEqual(ts.buffers().state);
   });
 
   for (const geometry of WASM_GEOMETRIES) {

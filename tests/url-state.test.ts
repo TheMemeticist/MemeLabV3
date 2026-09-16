@@ -3,6 +3,7 @@ import { encode, decode, applyEncoded, decodeCostConfig } from '../src/lib/url-s
 import { PRESETS, baseSimConfig, findPreset } from '../src/sim/presets';
 import { costConfigFromProfile } from '../src/lib/cost';
 import type { SimConfig } from '../src/types';
+import { MIN_GRID_SIZE, MAX_GRID_SIZE, MAX_STAGE_DAYS } from '../src/sim/config';
 
 function roundTrip(config: SimConfig, presetId: string, opts?: { theme?: string; speed?: number }) {
   const url = encode({
@@ -96,5 +97,34 @@ describe('url-state codec', () => {
     const decoded = decodeCostConfig(decode(url)!, costConfigFromProfile(findPreset(presetId).cost));
     expect(decoded.profile.vsl).toBe(9_000_000);
     expect(decoded.profile.hospitalBedsPerCapita).toBe(0.0008);
+  });
+});
+
+describe('url-state hard limits', () => {
+  it('clamps grid size to the shared MIN/MAX_GRID_SIZE', () => {
+    const base = baseSimConfig('bdbv');
+    expect(applyEncoded(new URLSearchParams('z=1024&g=voronoi'), base).config.size).toBe(MAX_GRID_SIZE);
+    expect(applyEncoded(new URLSearchParams('z=999999'), base).config.size).toBe(MAX_GRID_SIZE);
+    expect(applyEncoded(new URLSearchParams('z=1'), base).config.size).toBe(MIN_GRID_SIZE);
+    expect(applyEncoded(new URLSearchParams(`z=${MAX_GRID_SIZE}`), base).config.size).toBe(MAX_GRID_SIZE);
+  });
+
+  it('clamps incubation and infectious days to 1..MAX_STAGE_DAYS', () => {
+    const base = baseSimConfig('bdbv');
+    const hi = applyEncoded(new URLSearchParams('ic=100000&if=100000'), base).config.strain;
+    expect(hi.incubation).toBe(MAX_STAGE_DAYS);
+    expect(hi.infectious).toBe(MAX_STAGE_DAYS);
+    const lo = applyEncoded(new URLSearchParams('ic=0&if=-5'), base).config.strain;
+    expect(lo.incubation).toBe(1);
+    expect(lo.infectious).toBe(1);
+  });
+
+  it('decodes a percent-encoded custom name once without throwing', () => {
+    const params = decode('#/sim?p=bdbv&n=100%25%20sure')!;
+    expect(params.get('n')).toBe('100% sure');
+    // A lone %25 must not need (or survive) a second decode.
+    expect(() => applyEncoded(params, baseSimConfig('bdbv'))).not.toThrow();
+    const bad = decode('#/sim?n=%25');
+    expect(bad?.get('n')).toBe('%');
   });
 });
