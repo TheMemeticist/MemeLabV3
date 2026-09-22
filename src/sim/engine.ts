@@ -759,6 +759,7 @@ export class Engine {
     // Hoisted per-step transmission multiplier (interventions R(t) schedule);
     // 1 when unscheduled, so the multiply below is bit-identical (x·1 === x).
     const txMul = this.txMulNow();
+    const n = pop.n;
 
     for (let c = 0; c < iCount; c++) {
       const i = iList[c];
@@ -852,6 +853,36 @@ export class Engine {
             this.census[ST_E]++;
             newInfections++;
           }
+        }
+      }
+
+      // Long-range mixing: one extra contact with a uniformly random cell,
+      // redrawn every tick (a dynamic small-world shortcut). Draws happen ONLY
+      // when the gene is nonzero, so mixing-free configs keep their exact RNG
+      // stream. The R(t) schedule scales the contact frequency as well as the
+      // per-contact attack (distancing cuts travel and contact intensity), and
+      // a compliant cell under lockdown skips the trip like a neighbour visit.
+      const mix = attackerStrain.mixing ?? 0;
+      if (mix > 0) {
+        const pJump = mix * txMul;
+        if (srcUnderLockdown && lockdownSkipP > 0 && rng.bernoulli(lockdownSkipP)) continue;
+        if (!rng.bernoulli(pJump)) continue;
+        const j = rng.intRange(n);
+        if (j === i || state[j] !== ST_S) continue;
+        let protMul = protByMask[defenses[j] & MASK_ALL];
+        if (quarantineOn && quarantined[j]) protMul *= qProtMul;
+        const p = atkSrc * protMul;
+        if (p <= 0) continue;
+        if (rng.bernoulli(p) && next[j] === ST_S) {
+          next[j] = ST_E;
+          exposedAt[j] = tickNow;
+          const sid = mutate ? strains.spawnChild(strainId[i], tickNow, rng) : strainId[i];
+          strainId[j] = sid;
+          const g = solo !== null && sid === 0 ? solo : strains.get(sid);
+          this.scheduleLife(j, tickNow + Math.max(1, g.incubation));
+          this.census[ST_S]--;
+          this.census[ST_E]++;
+          newInfections++;
         }
       }
     }
@@ -1003,6 +1034,11 @@ export class Engine {
     return estimateAnalyticR0(config, this.geometry, this.voronoiTopo);
   }
 
+  /** Detached strain genealogy for inspectors and data exports. */
+  snapshotStrains(): import('../types').Strain[] {
+    return this.strains.snapshot();
+  }
+
   buffers(): { state: Uint8Array; defenses: Uint8Array; quarantined: Uint8Array; size: number } {
     return {
       state: this.pop.state,
@@ -1031,6 +1067,9 @@ export function estimateAnalyticR0(
   if (config.geometry === 'meanfield') {
     return 2 * pInfected; // k=2 matches transmitMeanField
   }
+  // Long-range mixing adds fresh random contacts every infectious day, each
+  // infected with probability p while the population is mostly susceptible.
+  const mixing = Math.max(0, Math.min(1, strain.mixing ?? 0)) * days * p;
 
   if (config.geometry === 'voronoi' && voronoiTopo) {
     // Average reachable-neighbour count, not a single cell's degree: Voronoi
@@ -1051,7 +1090,7 @@ export function estimateAnalyticR0(
       }
       avgDegree = samples > 0 ? total / samples : 6;
     }
-    return avgDegree * pInfected;
+    return avgDegree * pInfected + mixing;
   }
 
   const size = Math.min(config.size, 80);
@@ -1066,7 +1105,7 @@ export function estimateAnalyticR0(
     const j = ny * size + nx;
     if (j !== cy * size + cx) reachable.add(j);
   }
-  return reachable.size * pInfected;
+  return reachable.size * pInfected + mixing;
 }
 
 function neighborAliveFraction(state: Uint8Array, i: number, size: number, geo: LatticeGeometry): number {

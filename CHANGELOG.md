@@ -2,8 +2,19 @@
 
 One line per user-visible change, newest first. Adding an entry is the last item on the dev checklist in `docs/ROADMAP.md`.
 
+## 2026-09-22
+
+- Docs: **forecasting benchmark report** (`docs/FORECAST-BENCHMARK.md`) — MemeLab's hand-calibration recipe scored 1–6 weeks ahead on 15 real outbreaks of 12 pathogens against standard models and baselines, plus a head-to-head with the published forecasts of the 2026 DRC Bundibugyo outbreak and a frozen 6-week forecast.
+
+## 2026-09-18
+
+- Disease: new **Long-range mixing** gene — per infectious cell per day, a chance of one extra contact anywhere on the grid (Newman–Watts shortcut). 0 keeps the local wave; a few percent gives exponential growth. Honoured by the CPU and WASM engines (bit-identical), scaled by fitted R(t) schedules and lockdown mobility, included in the analytic R₀, fittable in the R₀ Estimator, and encoded in permalinks (`mx`). GPU stays gated off while mixing is on.
+- Engine: Voronoi WASM resets reuse memoized neighbour tables (20× faster fits on Voronoi worlds, identical output).
+- Estimator (local): fitted observation comparison scale, fitted intervention intensity, and quasi-Poisson tempered posterior draws in the shared fitter (not yet exposed in the UI).
+
 ## 2026-09-16
 
+- Estimator (local): optional incident Poisson objective, explicit individual count and observation comparison scale, unavailable R² handling in results/history, and responsive controls/chart.
 - Interpretation: observed E+I trend, incubation/readiness states, and infectious peak-so-far annotation with day and cumulative deaths; retains peaks through skipped frames and resets cleanly.
 - Accessibility: closing the expanded chart with Escape restores focus to its trigger; verified responsive trend/peak layout and keyboard operation.
 - Input handling: bound grid sizes, disease-stage durations, and fitted schedules; tolerate malformed links/saved sessions; escape estimator input/history markup.

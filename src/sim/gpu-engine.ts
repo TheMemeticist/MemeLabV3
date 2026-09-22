@@ -53,7 +53,9 @@ const MAX_BATCH = 2048; // ticks per submit (uniform-ring + stats-window capacit
 const WG = 256;
 
 export function gpuCompatible(config: SimConfig): boolean {
-  return config.mutate !== true && config.reseedOnExtinction !== true;
+  // Long-range mixing needs scatter contacts, which the gather kernel has no
+  // path for yet — it stays on the CPU/WASM engines.
+  return config.mutate !== true && config.reseedOnExtinction !== true && !((config.strain.mixing ?? 0) > 0);
 }
 
 export function gpuSupported(): boolean {

@@ -1,3 +1,4 @@
+import { OUTBREAK_DATASETS } from '../lib/outbreak-datasets';
 // R₀ Estimator — inverse parameter fitting panel.
 //
 // Paste an observed outbreak curve (cumulative cases / deaths over time), pick
@@ -124,6 +125,8 @@ const FIT_GRID_CAP = 128;
 // would put the per-capita floor of one grid cell above the early counts), not
 // a literal census figure. Approximate; for exploration, not epidemiology.
 interface DemoPreset {
+  notes?: string;
+  sourceUrl?: string;
   id: string;
   label: string;
   population: number;
@@ -140,6 +143,7 @@ function series(category: FitCategory, pairs: [number, number][]): ObservedPoint
 }
 
 const HISTORICAL_PRESETS: DemoPreset[] = [
+  ...OUTBREAK_DATASETS,
   {
     id: 'covid-kr',
     label: 'COVID-19 — South Korea, early 2020',
@@ -449,6 +453,7 @@ export class R0Modal {
   // chip toggles these via setSeries (and setSeries syncs the chip back).
   private liveRawSeriesIdx: number[] = [];
   private liveDays = 0;
+  private plotResize: ResizeObserver | null = null;
   private livePop = 0;
   private pendingSnapshot: FitProgress | null = null;
   private rafId = 0;
@@ -513,6 +518,8 @@ export class R0Modal {
     this.signal.aborted = true;
     if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
     this.pendingSnapshot = null;
+    this.plotResize?.disconnect();
+    this.plotResize = null;
     this.plot?.destroy();
     this.plot = null;
     this.pool?.dispose();
@@ -559,7 +566,7 @@ export class R0Modal {
       }
     }
     if (Number.isFinite(s.K)) this.K = Math.round(s.K);
-    if (s.loss === 'mse' || s.loss === 'poisson') this.loss = s.loss;
+    if (s.loss === 'mse' || s.loss === 'poisson' || s.loss === 'poisson_incident') this.loss = s.loss;
     if (Array.isArray(s.observed)) this.observed = s.observed.map((p) => ({ ...p }));
     if (typeof s.presetId === 'string') this.presetId = s.presetId;
     if (s.optimizer === 'local' || s.optimizer === 'genetic') this.optimizer = s.optimizer;
@@ -1423,15 +1430,18 @@ export class R0Modal {
     this.renderLive(observed, raw); // persistent chart + provisional metrics, updated live
     if (expanded) this.note('Timing params added (your data spans the peak) — fitting…');
 
-    // Size the fit grid so one cell (population/size²) never exceeds the smallest
-    // positive observed value — otherwise the model's day-0 index case alone
+    // Each cell is one individual. Increase the grid so the projected count
+    // increment (comparison scale / size²) approaches the smallest positive observation — otherwise the model's day-0 index case alone
     // dwarfs the data and every curve is a giant staircase the loss can't fix.
     const base = this.fitBaseConfig();
     const liveSize = this.events.getConfig().size;
     const positives = observed.map((p) => p.value).filter((v) => v > 0);
     const minObs = positives.length ? Math.min(...positives) : Number.NaN;
     base.size = resolutionFitSize(liveSize, this.population, minObs, FIT_GRID_CAP);
-    const cellPeople = this.population / (base.size * base.size);
+    const projectedIncrement = this.population / (base.size * base.size);
+
+    const scaleSummary = this.el!.querySelector<HTMLElement>('[data-r0="fit-scale"]');
+    if (scaleSummary) scaleSummary.textContent = fitScaleSummary(base.size, this.population);
 
     const warnings: string[] = [];
     if (raw) warnings.push('downward revisions detected — fitting the cleaned (running-min) series; raw points shown greyed');
@@ -1449,8 +1459,8 @@ export class R0Modal {
     if (this.interventions.some((iv) => iv.enabled && iv.transmissionReduction > 0)) {
       warnings.push('interventions active — modeled as time-varying transmission R(t); Apply to simulation replays the same schedule (shaded on the live chart)');
     }
-    if (Number.isFinite(minObs) && cellPeople > minObs) {
-      warnings.push(`one grid cell = ${fmtNum(cellPeople)} people — larger than your smallest data point (${fmtNum(minObs)}); raise grid size or lower Population`);
+    if (Number.isFinite(minObs) && projectedIncrement > minObs) {
+      warnings.push(`one simulated infection changes the projected count by ${fmtNum(projectedIncrement)} — larger than your smallest data point (${fmtNum(minObs)}); increase grid resolution or review the observation comparison scale`);
     }
     if (warnings.length) this.note(`⚠ ${warnings.join(' · ')}`);
     try {
@@ -1655,8 +1665,8 @@ export class R0Modal {
     cfg.mutate = false;
     // Fit at the live grid size (capped for performance) so the fitted curve reproduces
     // in the live sim — the spatial wave makes per-capita dynamics size-dependent.
-    // run() may RAISE this above the live size for data resolution (one cell =
-    // population/size² people must not exceed the smallest observed value) — see
+    // run() may RAISE this above the live size for data resolution (the projected
+    // count increment is comparison scale / size²) — see
     // resolutionFitSize; it warns that Apply then needs a larger live grid.
     cfg.size = Math.min(cfg.size, FIT_GRID_CAP);
     // Single index case (patient-zero only) — the most realistic outbreak start, and
@@ -1744,7 +1754,9 @@ export class R0Modal {
     this.renderTable();
     this.renderOutput();
     this.persist();
-    this.note(p.adjust
+    this.note(p.notes
+      ? `${p.notes} Source: ${p.sourceUrl ?? ''} Select the matching pathogen before fitting.`
+      : p.adjust
       ? 'Dataset loaded with default underreporting keyframes (enabled, editable) — press Run fit.'
       : 'Dataset loaded — press Run fit.');
   }
@@ -1861,7 +1873,7 @@ export class R0Modal {
       : r.r0CI ? `95% CI ${r.r0CI[0].toFixed(2)} – ${r.r0CI[1].toFixed(2)}`
       : '95% CI —';
     const rating = gofRating(r.gof.r2);
-    const barPct = Math.max(0, Math.min(1, r.gof.r2)) * 100;
+    const barPct = r.gof.r2 != null && Number.isFinite(r.gof.r2) ? Math.max(0, Math.min(1, r.gof.r2)) * 100 : null;
     const paramRows = r.params
       .map((p) => `<tr><td>${p.label}</td><td>${fmtParam(p.name, p.value)}</td></tr>`)
       .join('')
@@ -1886,8 +1898,9 @@ export class R0Modal {
         <div class="r0-metric r0-gof ${rating.cls}">
           <span class="r0-metric-label">Goodness of fit</span>
           <span class="r0-gof-rating"><span class="r0-gof-badge ${rating.cls}">${rating.label}</span></span>
-          <span class="r0-gof-bar"><span style="width:${barPct.toFixed(1)}%"></span></span>
-          <span class="r0-metric-sub">R² ${r.gof.r2.toFixed(3)} · RMSE ${fmtNum(r.gof.rmse)}</span>
+          ${barPct == null ? '' : `<span class="r0-gof-bar"><span style="width:${barPct.toFixed(1)}%"></span></span>`}
+          <span class="r0-metric-sub">R² ${formatR2(r.gof.r2)} · RMSE ${fmtNum(r.gof.rmse)}</span>
+          ${barPct == null ? `<span class="r0-metric-sub">${escapeHtml(r.gof.r2UndefinedReason ?? 'A finite R² is unavailable for this fit.')}</span>` : ''}
           ${holdoutLine(r)}
         </div>
         <table class="r0-params-table">
@@ -1898,6 +1911,8 @@ export class R0Modal {
       <div class="r0-chart" data-r0="chart"></div>
       <div class="r0-ovl-legend" data-r0="ovl-legend" hidden></div>
     `;
+    const scaleSummary = this.el?.querySelector<HTMLElement>('[data-r0="fit-scale"]');
+    if (scaleSummary) scaleSummary.textContent = fitScaleSummary(r.config.size, r.population);
     this.createChart(r.observed, r.days, r.population, this.lastRaw, this.lastAdjust, this.lastFan, this.lastEnsemble);
     this.updateChartData(r.simulated);
   }
@@ -1905,7 +1920,8 @@ export class R0Modal {
   // ── Fit history ──
   // Past fits, grouped by the effective dataset they ran against (hash of the
   // shifted/cleaned points + population) so ranking is only ever like-for-like,
-  // best-to-worst by R² (ties → lower loss). Load restores the stored result
+  // best-to-worst by R² (ties → newest). Losses across objectives are not comparable.
+  // Load restores the stored result
   // into the panel; Apply pushes its config straight into the simulation.
   private renderHistory(): void {
     const host = this.el?.querySelector<HTMLElement>('[data-r0="history"]');
@@ -1936,7 +1952,7 @@ export class R0Modal {
       id === 'synthetic' ? 'Synthetic demo' : HISTORICAL_PRESETS.find((p) => p.id === id)?.label ?? 'Custom data';
 
     for (const [hash, entries] of ordered) {
-      entries.sort((a, b) => (b.result.gof.r2 - a.result.gof.r2) || (a.result.loss - b.result.loss));
+      entries.sort((a, b) => (rankR2(b.result.gof.r2) - rankR2(a.result.gof.r2)) || (b.t - a.t));
       const title = document.createElement('div');
       title.className = 'r0-history-group';
       title.textContent = `${presetLabel(entries[0].presetId)}${hash === currentHash ? ' — current data' : ''}`;
@@ -1950,7 +1966,7 @@ export class R0Modal {
           <span class="r0-history-rank">#${rank + 1}</span>
           <span class="r0-history-when">${when}</span>
           <span>R₀ ${e.result.r0 == null ? '—' : e.result.r0.toFixed(2)}</span>
-          <span>R² ${e.result.gof.r2.toFixed(3)}</span>
+          <span>R² ${formatR2(e.result.gof.r2)}</span>
           <span class="r0-muted">loss ${fmtLoss(e.result.loss)}</span>
           <span class="r0-history-params r0-muted" title="${escapeAttr(params)}">${escapeHtml(params)}</span>
           <button class="btn ghost" type="button" data-act="load">Load</button>
@@ -1994,6 +2010,8 @@ export class R0Modal {
     ensemble: Record<FitCategory, number[][]> | null = null,
   ): void {
     const host = this.el!.querySelector<HTMLElement>('[data-r0="chart"]')!;
+    this.plotResize?.disconnect();
+    this.plotResize = null;
     this.plot?.destroy();
     this.plot = null;
     this.liveObserved = observed;
@@ -2169,6 +2187,13 @@ export class R0Modal {
       data as uPlot.AlignedData,
       host,
     );
+    this.plotResize = new ResizeObserver(() => {
+      const width = host.clientWidth;
+      if (width > 0 && this.plot && this.plot.width !== width) {
+        this.plot.setSize({ width, height: 260 });
+      }
+    });
+    this.plotResize.observe(host);
     this.annotateSeriesLegend();
     this.renderOverlayLegend();
   }
@@ -2575,7 +2600,7 @@ function ensembleRows(r: FitResult, ens: Record<FitCategory, number[][]> | null)
 }
 
 function fmtParam(name: FitParamName, v: number): string {
-  if (name === 'attackRate' || name === 'ifr') return `${(v * 100).toFixed(1)}%`;
+  if (name === 'attackRate' || name === 'ifr' || name === 'mixing') return `${(v * 100).toFixed(1)}%`;
   if (name === 'range') return String(Math.round(v));
   return `${v.toFixed(1)} d`;
 }
@@ -2611,7 +2636,20 @@ function holdoutLine(r: FitResult): string {
 
 // Turns the R² goodness-of-fit number into a plain-language, color-coded rating
 // so a non-statistician can read the fit quality at a glance.
-function gofRating(r2: number): { label: string; cls: string } {
+function formatR2(r2: number | null): string {
+  return r2 != null && Number.isFinite(r2) ? r2.toFixed(3) : 'unavailable';
+}
+
+function rankR2(r2: number | null): number {
+  return r2 != null && Number.isFinite(r2) ? r2 : -Infinity;
+}
+
+function fitScaleSummary(size: number, population: number): string {
+  return `Simulated individuals: ${(size * size).toLocaleString()} (${size}×${size}; one individual per cell). Observation comparison scale: ${fmtNum(population)}. One simulated infection changes the projected count by ${fmtNum(population / (size * size))}.`;
+}
+
+function gofRating(r2: number | null): { label: string; cls: string } {
+  if (r2 == null || !Number.isFinite(r2)) return { label: 'Unavailable', cls: '' };
   if (r2 >= 0.95) return { label: 'Excellent', cls: 'excellent' };
   if (r2 >= 0.85) return { label: 'Good', cls: 'good' };
   if (r2 >= 0.70) return { label: 'Fair', cls: 'fair' };
@@ -2633,11 +2671,12 @@ const TEMPLATE = `
   <section class="r0-section">
     <h3>1 · Observed data</h3>
     <p class="r0-blurb">Enter real-world counts by day, or paste a CSV. Values are matched against the
-      simulation rescaled to your population.</p>
+      simulated fraction multiplied by an observation comparison scale. Each cell represents one individual; the scale does not change the number of simulated individuals.</p>
     <label class="r0-field">
-      <span>Population</span>
+      <span>Observation comparison scale</span>
       <input class="r0-in" type="number" step="any" min="1" data-r0="population" />
     </label>
+    <p class="r0-blurb r0-hint" data-r0="fit-scale">The fit will display its simulated individual count and comparison scale here.</p>
     <label class="r0-field">
       <span>Index-case offset (days)</span>
       <input class="r0-in" type="number" step="1" min="0" max="365" data-r0="offset" />
@@ -2738,7 +2777,8 @@ const TEMPLATE = `
         <button class="r0-toggle-btn" type="button" data-opt="local" title="Grid/Latin-hypercube sample → Nelder–Mead local refine">Local search</button>
       </div>
       <div class="r0-toggle" role="group" aria-label="Loss function">
-        <button class="r0-toggle-btn active" type="button" data-loss="poisson" title="Maximum-likelihood for count data">Poisson NLL</button>
+        <button class="r0-toggle-btn active" type="button" data-loss="poisson" title="Poisson loss on observed cumulative levels (default)">Cumulative Poisson</button>
+        <button class="r0-toggle-btn" type="button" data-loss="poisson_incident" title="Fits increments between reported cumulative observations, after a first-point anchor; requires nondecreasing counts">Incident Poisson</button>
         <button class="r0-toggle-btn" type="button" data-loss="mse" title="Plain least-squares">MSE</button>
       </div>
       <label class="r0-field r0-field-inline">

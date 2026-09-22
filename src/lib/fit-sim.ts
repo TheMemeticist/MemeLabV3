@@ -35,8 +35,16 @@ let cachedTopoKey: string | null = null;
 // configs or when wasm is unavailable.
 let cachedEngine: AnyEngine | null = null;
 
-function engineFor(config: SimConfig, topo: VoronoiTopology | undefined, opts: EngineOptions): AnyEngine {
-  const wantWasm = wasmCompatible(config) && wasmAvailable();
+/** Explicit selection for measured headless workloads; auto preserves UI behavior. */
+export type FitBackend = 'auto' | 'cpu' | 'wasm';
+export function resolveFitBackend(config: SimConfig, backend: FitBackend = 'auto'): 'cpu' | 'wasm' {
+  const supported = wasmCompatible(config) && wasmAvailable();
+  if (backend === 'wasm' && !supported) throw new Error('WASM is unavailable or incompatible with this fit configuration');
+  return backend !== 'cpu' && supported ? 'wasm' : 'cpu';
+}
+
+function engineFor(config: SimConfig, topo: VoronoiTopology | undefined, opts: EngineOptions, backend: FitBackend = 'auto'): AnyEngine {
+  const wantWasm = resolveFitBackend(config, backend) === 'wasm';
   if (cachedEngine === null || (cachedEngine instanceof WasmEngine) !== wantWasm) {
     cachedEngine = createEngine(config, topo ?? null, opts, wantWasm);
   } else {
@@ -66,6 +74,7 @@ export function runTrials(
   K: number,
   seed: number,
   schedule?: number[],
+  backend: FitBackend = 'auto',
 ): SimResult {
   const N = config.size * config.size;
   const len = days + 1;
@@ -98,6 +107,7 @@ export function runTrials(
       { ...config, seed: trialSeed },
       topo,
       k === 0 ? { txSchedule: schedule } : { rNaught, txSchedule: schedule },
+      backend,
     );
     if (k === 0) rNaught = engine.rNaught;
 
@@ -161,6 +171,7 @@ export function bestTrialSeed(
   K: number,
   seed: number,
   schedule?: number[],
+  backend: FitBackend = 'auto',
 ): { seed: number; kIndex: number } {
   if ((config.geometry ?? 'square') === 'voronoi' || K <= 1) return { seed: seed >>> 0, kIndex: 0 };
   const len = days + 1;
@@ -175,6 +186,7 @@ export function bestTrialSeed(
       { ...config, seed: trialSeed },
       undefined,
       k === 0 ? { txSchedule: schedule } : { rNaught, txSchedule: schedule },
+      backend,
     );
     if (k === 0) rNaught = engine.rNaught;
     const death = new Float64Array(len);
@@ -244,6 +256,7 @@ export function runTrialEnsemble(
   N: number,
   seed: number,
   schedule?: number[],
+  backend: FitBackend = 'auto',
 ): { perTrial: SimCurves[]; rNaught: number | null } {
   const cells = config.size * config.size;
   const len = days + 1;
@@ -263,6 +276,7 @@ export function runTrialEnsemble(
       { ...config, seed: trialSeed },
       topo,
       k === 0 ? { indexCell, txSchedule: schedule } : { rNaught, indexCell, txSchedule: schedule },
+      backend,
     );
     if (k === 0) rNaught = engine.rNaught;
 

@@ -22,6 +22,8 @@ import { computeLedger, costConfigFromProfile, findCurrency, formatMoney, restor
 import { appendLongDelta, emptyLongStats } from '../sim/long-history';
 import type { LongStats } from '../types';
 import { downloadText, downloadDataUrl, timestamp } from '../lib/export';
+import type { AutomationAcknowledgment, AutomationCommand, WorkerStamp } from '../domain/automation';
+import { needsRebuild } from '../domain/config-policy';
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
 const BASE_TPS = 8;
@@ -98,6 +100,9 @@ export class App {
   private chartModal: HTMLElement | null = null;
   private chartWrapHome: HTMLElement | null = null;
   private chartEscHandler: ((e: KeyboardEvent) => void) | null = null;
+  private automationGeneration = 0;
+  private automationPainted: WorkerStamp | null = null;
+  private automationWaiters = new Map<string, { ack?: AutomationAcknowledgment; resolve: () => void; reject: (error: Error) => void }>();
 
 
   constructor(root: HTMLElement) {
@@ -170,8 +175,21 @@ export class App {
 
     // Worker
     this.worker = new Worker(new URL('../worker/sim.worker.ts', import.meta.url), { type: 'module' });
-    this.worker.onmessage = (ev: MessageEvent<FrameMessage | TopologyMessage | BackendMessage | BackendProbeMessage>) => {
+    this.worker.onmessage = (ev: MessageEvent<(FrameMessage | TopologyMessage | BackendMessage | BackendProbeMessage | AutomationAcknowledgment) & Partial<WorkerStamp>>) => {
       const msg = ev.data;
+      if (import.meta.env.VITE_MEMELAB_AUTOMATION === '1' && msg.generation !== undefined) {
+        if (msg.generation < this.automationGeneration) return;
+        this.automationGeneration = msg.generation;
+      }
+      if (msg.type === 'automationAck') {
+        const waiter = this.automationWaiters.get(msg.requestId);
+        if (waiter) {
+          waiter.ack = msg;
+          if (msg.error) waiter.reject(new Error(msg.error));
+          else this.finishAutomationWaiters();
+        }
+        return;
+      }
       if (msg.type === 'topology') {
         this.petri.setVoronoiTopology(msg.topo);
       } else if (msg.type === 'backendProbe') {
@@ -571,6 +589,113 @@ export class App {
     }
 
     this.checkEpidemicEnded(msg);
+    if (import.meta.env.VITE_MEMELAB_AUTOMATION === '1') {
+      this.automationPainted = msg as FrameMessage & WorkerStamp;
+      this.finishAutomationWaiters();
+    }
+  }
+
+  private finishAutomationWaiters(): void {
+    const painted = this.automationPainted;
+    if (!painted) return;
+    for (const waiter of this.automationWaiters.values()) {
+      if (!waiter.ack) continue;
+      if (painted.generation > waiter.ack.generation) waiter.reject(new Error('Observation superseded by a new run'));
+      else if (painted.generation === waiter.ack.generation && painted.frameSequence >= waiter.ack.frameSequence) waiter.resolve();
+    }
+  }
+
+  /** Explicit local-test build only. Fence actual worker work, then wait for
+   * the corresponding real UI frame, not merely command dispatch. */
+  async automationSync(pause = true): Promise<Record<string, unknown>> {
+    if (import.meta.env.VITE_MEMELAB_AUTOMATION !== '1') throw new Error('Automation is disabled');
+    if (pause && this.playing) {
+      this.playing = false;
+      this.send({ cmd: 'pause' });
+      this.refreshPlayLabel();
+    }
+    const requestId = crypto.randomUUID();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.automationWaiters.delete(requestId);
+        reject(new Error('Worker/render synchronization timed out'));
+      }, 15000);
+      const finish = (error?: Error): void => {
+        clearTimeout(timer);
+        this.automationWaiters.delete(requestId);
+        if (error) reject(error); else resolve();
+      };
+      this.automationWaiters.set(requestId, { resolve: () => finish(), reject: finish });
+      this.worker.postMessage({ cmd: 'automationFence', requestId });
+    });
+    // ResizeObserver and chart layout enqueue a following animation frame.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    return this.automationSnapshot();
+  }
+
+  automationSnapshot(): Record<string, unknown> {
+    if (import.meta.env.VITE_MEMELAB_AUTOMATION !== '1') throw new Error('Automation is disabled');
+    const frame = this.automationPainted as (FrameMessage & WorkerStamp) | null;
+    const counts = [0, 0, 0, 0, 0];
+    let digest = 2166136261;
+    for (const state of frame?.state ?? []) { counts[state]++; digest = Math.imul(digest ^ state, 16777619); }
+    return structuredClone({
+      buildId: import.meta.env.VITE_MEMELAB_BUILD_ID ?? 'development-unversioned',
+      generation: frame?.generation ?? null, revision: frame?.revision ?? null,
+      frameSequence: frame?.frameSequence ?? null, tick: frame?.tick ?? null,
+      playing: this.playing, config: this.controls.config(),
+      requestedBackend: this.requestedBackend, activeBackend: this.activeBackend, fallbackReason: this.backendReason,
+      stats: frame?.stats ?? null, statsMeasured: this.longMirror.tick.length > 0,
+      // Day-zero worker stats are placeholders. Census is always the actual
+      // painted seeded buffer, so no fabricated zero-case claim escapes.
+      census: { s: counts[0], e: counts[1], i: counts[2], r: counts[3], d: counts[4] },
+      stateDigest: (digest >>> 0).toString(16).padStart(8, '0'),
+      history: { retainedFromTick: this.longMirror.tick[0] ?? null, throughTick: this.longMirror.tick.at(-1) ?? null, rows: this.longMirror.tick.length },
+      view: { theme: this.theme, layout: this.layoutMode, chart: this.chartView, mode: this.chart.getMode(), expanded: this.chartExpanded, speed: this.speedIdx },
+      costConfig: this.costConfig, interventions: this.interventions,
+      fit: { schedule: this.fitSchedule, windows: this.fitWindows, metadata: this.fitMeta },
+      phase: this.root.querySelector('.stat-phase')?.textContent?.trim() ?? null,
+      peak: document.querySelector('.chart-peak-summary')?.textContent?.trim() ?? null,
+    });
+  }
+
+  async automationCommand(command: AutomationCommand): Promise<Record<string, unknown>> {
+    if (import.meta.env.VITE_MEMELAB_AUTOMATION !== '1') throw new Error('Automation is disabled');
+    // Deterministic setup/actions begin at a paused acknowledged boundary.
+    await this.automationSync(true);
+    switch (command.cmd) {
+      case 'configure':
+        this.controls.hydrate(structuredClone(command.config), this.controls.currentPresetId());
+        this.onConfigChange();
+        break;
+      case 'reset': this.handleReset(); break;
+      case 'step':
+        if (!Number.isInteger(command.ticks) || command.ticks < 1 || command.ticks > 1000) throw new Error('ticks must be 1–1000');
+        this.send({ cmd: 'step', n: command.ticks });
+        break;
+      case 'pause': break;
+      case 'play': this.handlePlay(); break;
+      case 'backend': this.selectBackend(command.backend); break;
+      case 'probeBackends': return { ...(await this.probeBackends()), ...(await this.automationSync(true)) };
+      case 'fit_apply': this.applyFit(structuredClone(command.config), structuredClone(command.extras)); break;
+      case 'cost':
+        this.costConfig = structuredClone(command.config);
+        this.costModal.setConfig(this.costConfig);
+        this.onCostChange();
+        break;
+      case 'view':
+        if (command.theme && command.theme !== this.theme) this.toggleTheme();
+        if (command.layout) this.setLayoutMode(command.layout);
+        if (command.chart) this.setChartView(command.chart);
+        if (command.mode) {
+          this.chart.setMode(command.mode);
+          this.root.querySelectorAll<HTMLButtonElement>('.chart-mode-btn').forEach((button) => button.classList.toggle('active', button.dataset['mode'] === command.mode));
+        }
+        if (command.expanded !== undefined) this.setChartExpanded(command.expanded);
+        if (command.speed !== undefined) this.setSpeed(command.speed);
+        break;
+    }
+    return this.automationSync(command.cmd !== 'play');
   }
 
   // Cost is a pure derived layer: re-price the whole run from recorded counts ×
@@ -993,20 +1118,7 @@ export class App {
   }
 
   private needsRebuild(prev: SimConfig | null, next: SimConfig): boolean {
-    if (!prev) return true;
-    if (prev.size !== next.size) return true;
-    if (prev.seed !== next.seed) return true;
-    if ((prev.geometry ?? 'square') !== (next.geometry ?? 'square')) return true;
-    // Voronoi topology changes require a full rebuild.
-    if (prev.geometry === 'voronoi' && next.geometry === 'voronoi') {
-      const pv = prev.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };
-      const nv = next.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };
-      if (pv.mode !== nv.mode || pv.irregularity !== nv.irregularity) return true;
-    }
-    // Strain genes are live-patched in the engine (Engine.patchConfig calls
-    // StrainPool.updateBaseStrain), so a disease-slider drag no longer resets
-    // the run. Only size/seed/geometry require a rebuild.
-    return false;
+    return needsRebuild(prev, next);
   }
 
   private recordInterventionToggle(key: InterventionKey, on: boolean): void {

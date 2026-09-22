@@ -28,6 +28,11 @@ export class StrainPool {
     this.list[0] = { id: 0, parentId: null, birthTick: cur.birthTick, ...sanitize(genes) };
   }
 
+  /** Detached read-only inspection snapshot; never exposes mutable registry entries. */
+  snapshot(): Strain[] {
+    return this.list.map((strain) => ({ ...strain }));
+  }
+
   count(): number {
     return this.list.length;
   }
@@ -46,6 +51,7 @@ export class StrainPool {
       range: parent.range,
       immunityDays: parent.immunityDays,
       mutationRate: parent.mutationRate,
+      mixing: parent.mixing, // host movement, not a pathogen trait — never drifts
     };
 
     let mutated = false;
@@ -103,6 +109,7 @@ function sanitize(g: StrainGenes): StrainGenes {
     range: Math.max(1, Math.min(8, Math.round(g.range))),
     immunityDays: Math.max(1, Math.min(36500, Math.round(g.immunityDays))),
     mutationRate: clamp(g.mutationRate, 0, 0.5),
+    mixing: clamp(g.mixing ?? 0, 0, 1),
   };
 }
 

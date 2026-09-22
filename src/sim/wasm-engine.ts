@@ -24,6 +24,7 @@ import type { LongStats, RetiredCostTotals, SimConfig, SimStats, VoronoiTopology
 import { LongHistory } from './long-history';
 import { MAX_SCHEDULE_LEN } from './config';
 import { Rng } from './rng';
+import { StrainPool } from './strain';
 import { seed } from './population';
 import { makeGeometry, VoronoiLattice, type LatticeGeometry } from './neighbors';
 import { buildVoronoi } from './voronoi';
@@ -37,7 +38,7 @@ interface CoreExports {
   memory: WebAssembly.Memory;
   init(size: number): void;
   set_rng(s0: number, s1: number, s2: number, s3: number): void;
-  set_strain(attack: number, incub: number, infectious: number, ifr: number, immunityDays: number, range: number): void;
+  set_strain(attack: number, incub: number, infectious: number, ifr: number, immunityDays: number, range: number, mixing: number): void;
   set_defenses(
     p0: number, p1: number, p2: number, p3: number,
     s0: number, s1: number, s2: number, s3: number,
@@ -103,6 +104,36 @@ export function wasmCompatible(config: SimConfig): boolean {
 }
 
 const GEOMETRY_CODE: Record<string, number> = { square: 0, triangular: 1, hexagonal: 2, meanfield: 3, voronoi: 4 };
+
+// Flattened per-cell CSR neighbor lists per (lattice, range), built once and
+// reused by every reset that shares the topology: the fitter resets one engine
+// per trial thousands of times per fit on an unchanged Voronoi world, and
+// re-walking all n cells through getNeighborIndices per reset dominated its
+// cost. Pure memoization of the same arrays (identical order and content).
+const csrMemo = new WeakMap<VoronoiLattice, Map<number, { offsets: Int32Array; flat: Int32Array }>>();
+function flattenedCsr(lat: VoronoiLattice, n: number, range: number): { offsets: Int32Array; flat: Int32Array } {
+  let perRange = csrMemo.get(lat);
+  if (!perRange) { perRange = new Map(); csrMemo.set(lat, perRange); }
+  const hit = perRange.get(range);
+  if (hit && hit.offsets.length === n + 1) return hit;
+  const offsets = new Int32Array(n + 1);
+  const lists: Int32Array[] = new Array(n);
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    const nb = lat.getNeighborIndices!(i, range);
+    lists[i] = nb;
+    offsets[i] = total;
+    total += nb.length;
+  }
+  offsets[n] = total;
+  const flat = new Int32Array(total);
+  let w = 0;
+  for (let i = 0; i < n; i++) { flat.set(lists[i], w); w += lists[i].length; }
+  const built = { offsets, flat };
+  perRange.set(range, built);
+  return built;
+}
+
 
 export class WasmEngine {
   private exports!: CoreExports;
@@ -226,7 +257,7 @@ export class WasmEngine {
     const ex = this.exports;
     const D = resolveDefenses(config.defenses);
     const g = config.strain;
-    ex.set_strain(g.attackRate, g.incubation, g.infectious, g.ifr, g.immunityDays, g.range);
+    ex.set_strain(g.attackRate, g.incubation, g.infectious, g.ifr, g.immunityDays, g.range, Math.max(0, Math.min(1, g.mixing ?? 0)));
     ex.set_defenses(
       D.protByMask[0], D.protByMask[1], D.protByMask[2], D.protByMask[3],
       D.srcByMask[0], D.srcByMask[1], D.srcByMask[2], D.srcByMask[3],
@@ -303,28 +334,14 @@ export class WasmEngine {
         ex.csr_list_alloc(role, 0);
         continue;
       }
-      const offsets = new Int32Array(n + 1);
-      const lists: Int32Array[] = new Array(n);
-      let total = 0;
-      for (let i = 0; i < n; i++) {
-        const nb = lat.getNeighborIndices!(i, range);
-        lists[i] = nb;
-        offsets[i] = total;
-        total += nb.length;
-      }
-      offsets[n] = total;
+      const { offsets, flat } = flattenedCsr(lat, n, range);
       // Write offsets before the list alloc; a memory.grow in between preserves
       // contents, and every view is taken fresh after its own alloc.
       const offPtr = ex.csr_offsets_alloc(role, n + 1);
       new Int32Array(ex.memory.buffer as ArrayBuffer, offPtr, n + 1).set(offsets);
-      const listPtr = ex.csr_list_alloc(role, total);
-      if (total > 0) {
-        const flat = new Int32Array(ex.memory.buffer as ArrayBuffer, listPtr, total);
-        let w = 0;
-        for (let i = 0; i < n; i++) {
-          flat.set(lists[i], w);
-          w += lists[i].length;
-        }
+      const listPtr = ex.csr_list_alloc(role, flat.length);
+      if (flat.length > 0) {
+        new Int32Array(ex.memory.buffer as ArrayBuffer, listPtr, flat.length).set(flat);
       }
     }
   }
@@ -440,6 +457,11 @@ export class WasmEngine {
       dcum: this.cumDead,
     }, this.retiredCost);
     return stats;
+  }
+
+  /** WASM supports the single base strain; use the shared sanitizer. */
+  snapshotStrains(): import('../types').Strain[] {
+    return new StrainPool(this.config.strain).snapshot();
   }
 
   buffers(): { state: Uint8Array; defenses: Uint8Array; quarantined: Uint8Array; size: number } {

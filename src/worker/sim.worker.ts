@@ -5,6 +5,7 @@ import { Rng } from '../sim/rng';
 import { clampSchedule } from '../sim/config';
 import { WasmEngine, createEngine, wasmAvailable, wasmCompatible, type AnyEngine } from '../sim/wasm-engine';
 import { GpuEngine, gpuCompatible, gpuSupported } from '../sim/gpu-engine';
+import type { AutomationFence, WorkerStamp } from '../domain/automation';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -35,6 +36,13 @@ let lastStats: import('../types').SimStats | null = null;
 // Tick through which the UI's long-history mirror is up to date. -1 forces the
 // next post to carry a full snapshot (new engine / reset).
 let lastLongTick = -1;
+let generation = 0;
+let commandRevision = 0;
+let frameSequence = 0;
+const automationEnabled = import.meta.env.VITE_MEMELAB_AUTOMATION === '1';
+function stamp(): WorkerStamp | object {
+  return automationEnabled ? { generation, revision: commandRevision, frameSequence } : {};
+}
 
 // The sim steps at full `tps` for determinism, but visual frames are only
 // useful up to display refresh. Cap posted frames at ~60/s so high speeds
@@ -48,7 +56,7 @@ function activeSource(): AnyEngine | GpuEngine | null {
 }
 
 function postBackend(active: EngineBackend, reason?: string): void {
-  self.postMessage({ type: 'backend', active, requested: requestedBackend, reason });
+  self.postMessage({ type: 'backend', active, requested: requestedBackend, reason, ...stamp() });
 }
 
 function postFrame(): void {
@@ -79,6 +87,7 @@ function postFrame(): void {
     retiredCost: { ...src.retiredCost },
     rNaught: src.rNaught,
   };
+  if (automationEnabled) Object.assign(msg, { ...stamp(), frameSequence: ++frameSequence });
   // Send only the rows the UI hasn't seen; fall back to a full snapshot after
   // a rebuild/reset or if more ticks elapsed than the window still holds.
   const newRows = src.tick - lastLongTick;
@@ -120,7 +129,7 @@ function buildAndPostTopology(config: SimConfig): import('../types').VoronoiTopo
   if (cachedTopo && cachedTopoKey === key) {
     // Re-post so the main thread can rehydrate after a geometry toggle without
     // paying the build cost again.
-    self.postMessage({ type: 'topology', topo: cachedTopo } satisfies TopologyMessage);
+    self.postMessage({ type: 'topology', topo: cachedTopo, ...stamp() } satisfies TopologyMessage);
     return cachedTopo;
   }
   const n = config.size * config.size;
@@ -132,7 +141,7 @@ function buildAndPostTopology(config: SimConfig): import('../types').VoronoiTopo
   const topo = buildVoronoi(n, config.voronoiConfig, topoRng, false);
   cachedTopo = topo;
   cachedTopoKey = key;
-  const msg: TopologyMessage = { type: 'topology', topo };
+  const msg: TopologyMessage = { type: 'topology', topo, ...stamp() };
   self.postMessage(msg); // structured clone — engine's typed array refs stay valid
   return topo;
 }
@@ -151,6 +160,7 @@ function wasmBlockReason(_config: SimConfig): string {
 
 function gpuBlockReason(config: SimConfig): string {
   if (config.mutate === true) return wasmBlockReason(config);
+  if ((config.strain.mixing ?? 0) > 0) return 'long-range mixing runs on the CPU/WASM engines — set mixing to 0 to use GPU';
   return 'extinction reseed runs on the CPU engines — disable it to use GPU';
 }
 
@@ -170,6 +180,8 @@ function gpuInitFailReason(err: unknown): string {
  *  guessing. Checks runtime support AND the current config's gates; the GPU
  *  check goes as far as acquiring a real adapter (refusing software ones). */
 async function probeBackends(): Promise<void> {
+  const probeStamp = stamp();
+  let adapterInfo: { vendor: string; architecture: string; device: string; description: string; software: boolean } | null = null;
   const cfg = currentConfig;
   const wasm: import('../types').BackendAvailability = !wasmAvailable()
     ? { ok: false, reason: 'WebAssembly unavailable in this browser' }
@@ -194,6 +206,7 @@ async function probeBackends(): Promise<void> {
       } else {
         const info = (adapter as GPUAdapter & { info?: GPUAdapterInfo }).info;
         const softId = `${info?.vendor ?? ''} ${info?.architecture ?? ''} ${info?.description ?? ''}`.toLowerCase();
+        adapterInfo = { vendor: info?.vendor ?? '', architecture: info?.architecture ?? '', device: info?.device ?? '', description: info?.description ?? '', software: /swiftshader|llvmpipe|software/.test(softId) };
         gpuAvail = /swiftshader|llvmpipe|software/.test(softId)
           ? { ok: false, reason: 'only a software adapter (SwiftShader) — enable chrome://flags/#enable-vulkan and relaunch to use your real GPU' }
           : { ok: true };
@@ -202,7 +215,7 @@ async function probeBackends(): Promise<void> {
       gpuAvail = { ok: false, reason: gpuInitFailReason(err) };
     }
   }
-  self.postMessage({ type: 'backendProbe', wasm, gpu: gpuAvail } satisfies import('../types').BackendProbeMessage);
+  self.postMessage({ type: 'backendProbe', wasm, gpu: gpuAvail, ...probeStamp, ...(automationEnabled ? { adapterInfo } : {}) } satisfies import('../types').BackendProbeMessage);
 }
 
 /** After a (re)build, resume the right loop if the user was playing. */
@@ -255,6 +268,7 @@ function flushRebuild(): void {
 /** (Re)build the simulation for `config` under the requested backend, with
  *  automatic fallback gpu → wasm → cpu. */
 function rebuild(config: SimConfig): void {
+  if (automationEnabled) generation++;
   // A direct rebuild (backend switch, patch compat-crossing) supersedes any
   // pending debounced one — never rebuild twice.
   pendingRebuild = null;
@@ -383,8 +397,22 @@ function gpuLoop(): void {
   }
 }
 
-self.onmessage = (ev: MessageEvent<WorkerCommand>) => {
+self.onmessage = (ev: MessageEvent<WorkerCommand | AutomationFence>) => {
   const m = ev.data;
+  if (m.cmd === 'automationFence') {
+    if (!automationEnabled) return;
+    // The fence follows controller commands on the same ordered channel.
+    // Flush trailing rebuilds, then await real asynchronous GPU completion.
+    flushRebuild();
+    void gpuChain.then(() => {
+      postFrame();
+      self.postMessage({ type: 'automationAck', requestId: m.requestId, tick: activeSource()?.tick ?? 0, ...stamp() });
+    }).catch((error: unknown) => {
+      self.postMessage({ type: 'automationAck', requestId: m.requestId, tick: activeSource()?.tick ?? 0, error: String(error), ...stamp() });
+    });
+    return;
+  }
+  if (automationEnabled) commandRevision++;
   switch (m.cmd) {
     case 'init':
     case 'updateConfig': {

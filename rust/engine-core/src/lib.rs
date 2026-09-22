@@ -85,6 +85,7 @@ struct Params {
     ifr: f64,
     immunity_days: f64,
     range: i32,
+    mixing: f64,
     // defenses
     prot_by_mask: [f64; 4],
     src_by_mask: [f64; 4],
@@ -631,6 +632,41 @@ impl Sim {
                     new_infections += 1;
                 }
             }
+
+            // Long-range mixing — the exact TS jump block: draws only when the
+            // gene is nonzero, schedule multiplier on the contact frequency,
+            // lockdown skip for compliant sources, one uniform target.
+            let mix = self.p.mixing;
+            if mix > 0.0 {
+                let p_jump = mix * tx_mul;
+                if src_under_lockdown && lockdown_skip_p > 0.0 && self.rng.bernoulli(lockdown_skip_p) {
+                    continue;
+                }
+                if !self.rng.bernoulli(p_jump) {
+                    continue;
+                }
+                let j = self.rng.int_range(self.n);
+                if j == i || self.state[j] != ST_S {
+                    continue;
+                }
+                let mut prot_mul = self.p.prot_by_mask[(self.defenses[j] & 3) as usize];
+                if quarantine_on && self.quarantined[j] != 0 {
+                    prot_mul *= self.p.q_prot_mul;
+                }
+                let p = atk_src * prot_mul;
+                if p <= 0.0 {
+                    continue;
+                }
+                if self.rng.bernoulli(p) && self.next[j] == ST_S {
+                    self.next[j] = ST_E;
+                    self.exposed_at[j] = tick;
+                    let t2 = tick + self.p.incub.max(1);
+                    self.schedule_life(j as u32, t2);
+                    self.census[ST_S as usize] -= 1;
+                    self.census[ST_E as usize] += 1;
+                    new_infections += 1;
+                }
+            }
         }
         new_infections
     }
@@ -667,6 +703,41 @@ impl Sim {
                 }
                 let j = self.csr_list[0][k] as usize;
                 if self.state[j] != ST_S {
+                    continue;
+                }
+                let mut prot_mul = self.p.prot_by_mask[(self.defenses[j] & 3) as usize];
+                if quarantine_on && self.quarantined[j] != 0 {
+                    prot_mul *= self.p.q_prot_mul;
+                }
+                let p = atk_src * prot_mul;
+                if p <= 0.0 {
+                    continue;
+                }
+                if self.rng.bernoulli(p) && self.next[j] == ST_S {
+                    self.next[j] = ST_E;
+                    self.exposed_at[j] = tick;
+                    let t2 = tick + self.p.incub.max(1);
+                    self.schedule_life(j as u32, t2);
+                    self.census[ST_S as usize] -= 1;
+                    self.census[ST_E as usize] += 1;
+                    new_infections += 1;
+                }
+            }
+
+            // Long-range mixing — the exact TS jump block: draws only when the
+            // gene is nonzero, schedule multiplier on the contact frequency,
+            // lockdown skip for compliant sources, one uniform target.
+            let mix = self.p.mixing;
+            if mix > 0.0 {
+                let p_jump = mix * tx_mul;
+                if src_under_lockdown && lockdown_skip_p > 0.0 && self.rng.bernoulli(lockdown_skip_p) {
+                    continue;
+                }
+                if !self.rng.bernoulli(p_jump) {
+                    continue;
+                }
+                let j = self.rng.int_range(self.n);
+                if j == i || self.state[j] != ST_S {
                     continue;
                 }
                 let mut prot_mul = self.p.prot_by_mask[(self.defenses[j] & 3) as usize];
@@ -873,7 +944,7 @@ pub extern "C" fn set_rng(s0: u32, s1: u32, s2: u32, s3: u32) {
 }
 
 #[no_mangle]
-pub extern "C" fn set_strain(attack: f64, incub: i32, infectious: i32, ifr: f64, immunity_days: f64, range: i32) {
+pub extern "C" fn set_strain(attack: f64, incub: i32, infectious: i32, ifr: f64, immunity_days: f64, range: i32, mixing: f64) {
     let p = &mut sim().p;
     p.attack = attack;
     p.incub = incub;
@@ -881,6 +952,7 @@ pub extern "C" fn set_strain(attack: f64, incub: i32, infectious: i32, ifr: f64,
     p.ifr = ifr;
     p.immunity_days = immunity_days;
     p.range = range;
+    p.mixing = mixing;
 }
 
 #[no_mangle]

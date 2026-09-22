@@ -66,7 +66,8 @@ export interface SimResult {
   bestSeed?: number;
 }
 
-export type LossType = 'poisson' | 'mse';
+/** Legacy cumulative-level Poisson remains the default; incident mode is opt-in. */
+export type LossType = 'poisson' | 'poisson_incident' | 'mse';
 
 /** How to read the R₀ confidence interval:
  *  - `interval`: a genuine 95% profile-likelihood interval `[lo, hi]`.
@@ -86,9 +87,15 @@ export type FitParamName =
   | 'incubation'
   | 'infectious'
   | 'ifr'
-  // Synthetic search dimension (not a gene, not in FIT_PARAMS): the index-date
-  // offset, evolved by the optimizer when FitRequest.offset is set.
-  | 'indexOffset';
+  | 'mixing'
+  // Synthetic search dimensions (not genes, not in FIT_PARAMS): the index-date
+  // offset (FitRequest.offset), the log10 observation comparison scale
+  // (FitRequest.scale) and the intervention intensity multiplier
+  // (FitRequest.interventionIntensity).
+  | 'indexOffset'
+  | 'populationScale'
+  | 'interventionIntensity'
+  | 'txMultiplier';
 
 export interface FitParamDef {
   name: FitParamName;
@@ -139,6 +146,18 @@ export const FIT_PARAMS: FitParamDef[] = [
     set: (g, v) => { g.infectious = Math.max(0, v); },
   },
   {
+    name: 'mixing',
+    label: 'Long-range mixing',
+    // Per infectious cell per day, the chance of one random far contact. A few
+    // percent already turns a lattice wave into exponential growth; the full
+    // range is searchable because fast national growth needs the long-range
+    // channel to dominate.
+    bounds: [0, 1],
+    display: 'percent',
+    get: (g) => g.mixing ?? 0,
+    set: (g, v) => { g.mixing = clamp(v, 0, 1); },
+  },
+  {
     name: 'ifr',
     // Bounds expressed as fractions: 0.01% – 99.99%.
     label: 'Fatality rate (IFR)',
@@ -174,6 +193,90 @@ export function poissonNLL(observed: ObservedPoint[], curves: SimCurves, N: numb
   return total;
 }
 
+/** One non-overlapping cumulative-report interval, first-report stock, or
+ * active-prevalence level. Days are exact integer simulation indices. */
+export interface IncidentCountTerm {
+  category: FitCategory;
+  day: number;
+  previousDay: number | null;
+  value: number;
+  kind: 'initial_cumulative' | 'interval_cumulative' | 'active_level';
+}
+
+/** Validate before fitting and difference within each category in day order.
+ * The first cumulative observation anchors the entire reported stock at its
+ * day: observed y(first) versus N*C(first), including the model's initial seed.
+ * Later terms cover (previousDay, day]; unequal intervals are never converted
+ * to daily averages. No future observations or revision cleaning are inferred.
+ * Inputs are never reordered or modified in place. */
+export function incidentCountTerms(observed: ObservedPoint[]): IncidentCountTerm[] {
+  for (const point of observed) {
+    if (!FIT_CATEGORIES.includes(point.category)) throw new Error('Incident Poisson: unknown observation category');
+    if (!Number.isSafeInteger(point.day) || point.day < 0) {
+      throw new Error('Incident Poisson requires finite nonnegative integer observation days');
+    }
+    if (!Number.isFinite(point.value) || point.value < 0) {
+      throw new Error('Incident Poisson requires finite nonnegative observed counts');
+    }
+  }
+  const terms: IncidentCountTerm[] = [];
+  for (const category of FIT_CATEGORIES) {
+    const points = observed.filter((point) => point.category === category).sort((a, b) => a.day - b.day);
+    let previous: ObservedPoint | undefined;
+    for (const point of points) {
+      if (previous?.day === point.day) {
+        throw new Error(`Incident Poisson: duplicate ${category} observation at day ${point.day}`);
+      }
+      const cumulative = category !== 'active_infections';
+      const value = cumulative && previous ? point.value - previous.value : point.value;
+      if (value < 0) {
+        throw new Error(`Incident Poisson: downward cumulative revision in ${category} between days ${previous!.day} and ${point.day}; resolve revisions explicitly before fitting`);
+      }
+      terms.push({
+        category, day: point.day, value,
+        previousDay: cumulative && previous ? previous.day : null,
+        kind: cumulative ? (previous ? 'interval_cumulative' : 'initial_cumulative') : 'active_level',
+      });
+      previous = point;
+    }
+  }
+  return terms;
+}
+
+function incidentNLLFromTerms(terms: IncidentCountTerm[], curves: SimCurves, N: number, offset = 0): number {
+  if (!Number.isFinite(N) || N <= 0) throw new Error('Incident Poisson requires a finite positive population');
+  let total = 0;
+  for (const term of terms) {
+    const at = (day: number): number => {
+      const value = curves[term.category]?.[day + offset];
+      if (!Number.isFinite(value) || value < 0) {
+        throw new Error(`Incident Poisson requires a finite nonnegative simulated ${term.category} value at day ${day + offset}; the simulation must cover every observed interval`);
+      }
+      return value;
+    };
+    const current = at(term.day);
+    const expected = N * (term.previousDay === null ? current : current - at(term.previousDay));
+    if (!Number.isFinite(expected) || expected < 0) {
+      throw new Error(`Incident Poisson: invalid simulated cumulative increment for ${term.category} ending at day ${term.day + offset}`);
+    }
+    // Same epsilon convention and omitted log-factorial constants as poissonNLL.
+    const lambda = Math.max(expected, EPS);
+    total += lambda - term.value * Math.log(lambda);
+  }
+  if (!Number.isFinite(total)) throw new Error('Incident Poisson loss is outside the finite numeric range');
+  return total;
+}
+
+/** Poisson NLL on report increments, plus one first-stock anchor per cumulative
+ * category. Active-infection observations retain a level Poisson objective.
+ * Counts are reports, not necessarily infections: ascertainment, dependence,
+ * overdispersion and the report-date/onset-date distinction remain modeling
+ * assumptions. Fractional adjusted counts produce a quasi-likelihood objective.
+ * Negative observed revisions are rejected rather than clipped or enveloped. */
+export function incidentPoissonNLL(observed: ObservedPoint[], curves: SimCurves, N: number): number {
+  return incidentNLLFromTerms(incidentCountTerms(observed), curves, N);
+}
+
 export function mse(observed: ObservedPoint[], curves: SimCurves, N: number): number {
   if (observed.length === 0) return 0;
   let total = 0;
@@ -191,6 +294,7 @@ export function lossOf(
   N: number,
   type: LossType,
 ): number {
+  if (type === 'poisson_incident') return incidentPoissonNLL(observed, curves, N);
   return type === 'poisson' ? poissonNLL(observed, curves, N) : mse(observed, curves, N);
 }
 
@@ -206,7 +310,9 @@ function sampleCurve(curves: SimCurves, cat: FitCategory, day: number): number {
 
 export interface GoodnessOfFit {
   rmse: number;
-  r2: number;
+  /** Null only when the score is not representable as a finite number. */
+  r2: number | null;
+  r2UndefinedReason?: string;
 }
 
 export function goodnessOfFit(observed: ObservedPoint[], curves: SimCurves, N: number): GoodnessOfFit {
@@ -226,9 +332,11 @@ export function goodnessOfFit(observed: ObservedPoint[], curves: SimCurves, N: n
     const d = pt.value - meanObs;
     ssTot += d * d;
   }
+  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
   return {
     rmse: Math.sqrt(ssRes / n),
-    r2: ssTot > 0 ? 1 - ssRes / ssTot : 0,
+    r2: Number.isFinite(r2) ? r2 : null,
+    ...(!Number.isFinite(r2) ? { r2UndefinedReason: 'A finite R² cannot be represented at this residual-error/observed-variance scale.' } : {}),
   };
 }
 
@@ -625,13 +733,62 @@ export interface FitRequest extends FitOptions {
    *  over the fitted parameters (flat priors within their bounds), each draw's
    *  curve simulated (pool-memoized), percentiles across draws. Heavier than
    *  the live path — runs once, after the optimum lands. */
-  posterior?: { draws?: number; burn?: number };
+  posterior?: {
+    draws?: number;
+    burn?: number;
+    /** Deviance divisor for the chain. A Poisson likelihood on counts in the
+     *  thousands is razor-sharp, so the chain would collapse onto the optimum
+     *  even though reported counts are overdispersed. 'quasi' estimates the
+     *  quasi-Poisson dispersion φ = Pearson χ² / (terms − dimensions) at the
+     *  optimum (floored at 1) and tempers the acceptance ratio by it; a
+     *  number fixes φ directly; default 1 (plain likelihood). 'quasi-median'
+     *  is the robust variant: the median Pearson contribution divided by the
+     *  χ²₁ median (0.4549) — one term whose expected count is near zero while
+     *  the data are large cannot blow φ up and flatten the chain. */
+    dispersion?: number | 'quasi' | 'quasi-median';
+  };
   /** Active interventions (time-varying transmission R(t)). Every simulation
    *  in the fit runs under the resulting per-tick schedule; with an evolved
    *  index offset the schedule shifts per candidate (the pool cache keys on
    *  the schedule, so this is safe — but it does mean offsets no longer share
    *  one sim while interventions are active). */
   interventions?: InterventionSpec[];
+  /** Fit the observation comparison scale (the population the simulated
+   *  fractions are multiplied by before meeting the counts) as an extra
+   *  search dimension, log-uniform within `bounds` (people). Like the offset
+   *  it only touches the loss, so same-gene candidates at different scales
+   *  share one memoized sim. `population` is then only the starting point.
+   *  Off by default: the caller's `population` stays fixed. */
+  scale?: {
+    bounds: [number, number];
+    /** Profile the scale analytically instead of searching it: for every
+     *  candidate the Poisson MLE of a common multiplier is Σobserved / Σsimulated
+     *  over the loss's own terms (least squares for MSE), clamped to `bounds`.
+     *  Removes one search dimension and evaluates each shape at its best
+     *  scale. The posterior chain then samples the other dimensions with the
+     *  scale profiled per draw; `posteriorDraws` still carries a
+     *  populationScale column (log10 of the profiled value). */
+    profile?: boolean;
+  };
+  /** Fit one intensity multiplier s ∈ bounds (⊂ [0, 2]) applied to EVERY
+   *  intervention's transmission reduction: the per-tick schedule becomes
+   *  max(0.02, 1 − s·(1 − schedule(t))), so s > 1 can push a nominal ladder
+   *  toward (never past) a 98% reduction. Dated policies supply WHEN
+   *  transmission changed; the data decide HOW MUCH. Only identifiable when
+   *  some intervention is active inside the observed window. Requires
+   *  `interventions`; off by default (s = 1, the nominal strengths). */
+  interventionIntensity?: { bounds: [number, number] };
+  /** Dated transmission change points with FITTED multipliers: `ticks` are
+   *  data days (sorted) at which behaviour may have changed — policy dates
+   *  supply WHEN, the data decide HOW MUCH. Each tick adds one search
+   *  dimension m_k ∈ bounds (default [0.02, 1]); the per-tick multiplier is
+   *  m of the last tick ≤ day (1 before the first) and is HELD after the
+   *  last tick, so a forecast assumes current behaviour persists. Applies to
+   *  per-contact transmission and long-range mixing, composed multiplicatively
+   *  on top of any `interventions` schedule. `penalty` λ adds
+   *  λ·Σ(ln m_k − ln m_{k−1})² to the loss (a random-walk prior on log
+   *  multipliers; the caller sets λ on the data's own scale). */
+  transmissionChangePoints?: { ticks: number[]; bounds?: [number, number]; penalty?: number };
   /** Runs K trials of `config` for `days` days and returns mean per-capita curves
    *  plus the candidate's analytic R₀. `schedule` is the per-tick transmission
    *  multiplier (interventions); implementations may ignore it only if the
@@ -667,6 +824,23 @@ export interface FitResult {
   /** Evolved index-date offset (days), present when FitRequest.offset was set.
    *  `observed` is already shifted by it. */
   indexOffset?: number;
+  /** Fitted observation comparison scale (people), present when
+   *  FitRequest.scale was set; `population` then equals it. */
+  fittedPopulation?: number;
+  /** Fitted intervention intensity multiplier, present when
+   *  FitRequest.interventionIntensity was set. */
+  interventionIntensity?: number;
+  /** Fitted change-point multipliers (one per tick, in tick order), present
+   *  when FitRequest.transmissionChangePoints was set. */
+  transmissionMultipliers?: number[];
+  /** Retained Metropolis draws over the full search vector (after burn-in),
+   *  present when FitRequest.posterior was set: `names` labels each column
+   *  (gene params first, then the synthetic dimensions in search order —
+   *  populationScale is log10 people). Lets callers propagate parameter
+   *  uncertainty into their own projections. */
+  posteriorDraws?: { names: FitParamName[]; draws: number[][] } | null;
+  /** Dispersion φ the posterior chain was tempered by (1 = plain likelihood). */
+  posteriorDispersion?: number;
   /** Profile-likelihood CI for the index date (null when not evolved). */
   offsetCI?: OffsetCI | null;
   /** Bayesian posterior-predictive band per category: three per-capita rows —
@@ -692,6 +866,12 @@ export const ENSEMBLE_PROBS = [5, 25, 50, 75, 95];
 export const ENSEMBLE_CENTRAL = 2; // index of the median row in ENSEMBLE_PROBS order
 
 export async function runFit(req: FitRequest): Promise<FitResult> {
+  // Validate/difference once before any candidate allocations. Offset search only
+  // shifts the already defined interval endpoints; it never changes its counts.
+  const incidentTerms = req.loss === 'poisson_incident' ? incidentCountTerms(req.observed) : null;
+  if (incidentTerms && (!incidentTerms.length || !Number.isFinite(req.population) || req.population <= 0)) {
+    throw new Error('Incident Poisson fit requires observations and a finite positive population');
+  }
   const maxObsDay = Math.max(1, ...req.observed.map((p) => Math.round(p.day)));
   // With an evolved index offset the sim horizon must cover the data at the
   // largest candidate shift; without one this reduces to the old fixed horizon.
@@ -716,9 +896,100 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
         set: () => { /* not a gene — applied in the loss day mapping */ },
       }
     : null;
-  const allParams = offsetDef ? [...req.params, offsetDef] : req.params;
+  // Two more loss-side dimensions may follow the offset: the log10 comparison
+  // scale and the intervention intensity. Neither touches the SimConfig.
+  const profileScale = req.scale?.profile === true;
+  if (req.scale) {
+    const [lo, hi] = req.scale.bounds;
+    if (!(lo > 0) || !(hi >= lo) || !Number.isFinite(hi)) throw new Error('scale bounds must satisfy 0 < lo ≤ hi');
+  }
+  const scaleDef: FitParamDef | null = req.scale && !profileScale
+    ? (() => {
+        const [lo, hi] = req.scale.bounds;
+        if (!(lo > 0) || !(hi >= lo) || !Number.isFinite(hi)) throw new Error('scale bounds must satisfy 0 < lo ≤ hi');
+        return {
+          name: 'populationScale' as const,
+          label: 'Comparison scale (log10 people)',
+          bounds: [Math.log10(lo), Math.log10(hi)] as [number, number],
+          get: () => 0,
+          set: () => { /* not a gene — applied in the loss scaling */ },
+        };
+      })()
+    : null;
+  const intensityDef: FitParamDef | null = req.interventionIntensity
+    ? (() => {
+        const [lo, hi] = req.interventionIntensity.bounds;
+        if (!(lo >= 0) || !(hi <= 2) || !(hi >= lo)) throw new Error('interventionIntensity bounds must satisfy 0 ≤ lo ≤ hi ≤ 2');
+        if (!req.interventions?.length) throw new Error('interventionIntensity requires interventions');
+        return {
+          name: 'interventionIntensity' as const,
+          label: 'Intervention intensity',
+          bounds: [lo, hi] as [number, number],
+          get: () => 0,
+          set: () => { /* not a gene — applied to the transmission schedule */ },
+        };
+      })()
+    : null;
+  const cp = req.transmissionChangePoints;
+  const cpTicks = cp ? cp.ticks.map((t) => Math.round(t)) : [];
+  const cpBounds: [number, number] = cp?.bounds ?? [0.02, 1];
+  if (cp) {
+    if (!(cpBounds[0] > 0) || !(cpBounds[1] <= 1) || !(cpBounds[1] >= cpBounds[0])) throw new Error('transmissionChangePoints bounds must satisfy 0 < lo ≤ hi ≤ 1');
+    for (let i = 1; i < cpTicks.length; i++) if (!(cpTicks[i] > cpTicks[i - 1])) throw new Error('transmissionChangePoints ticks must be strictly increasing');
+  }
+  const cpDefs: FitParamDef[] = cpTicks.map((t) => ({
+    name: 'txMultiplier' as const,
+    label: `Transmission multiplier from day ${t}`,
+    bounds: cpBounds,
+    get: () => 1,
+    set: () => { /* not a gene — applied to the transmission schedule */ },
+  }));
+  const allParams: FitParamDef[] = [...req.params];
+  if (offsetDef) allParams.push(offsetDef);
+  const scaleIdx = scaleDef ? allParams.push(scaleDef) - 1 : -1;
+  const intensityIdx = intensityDef ? allParams.push(intensityDef) - 1 : -1;
+  const cpIdx = cpDefs.length ? allParams.push(...cpDefs) - cpDefs.length : -1;
+  // Quantized to 1e-3 so nearby proposals share one sim.
+  const multsOf = (values: number[]): number[] =>
+    cpDefs.map((_, k) => Math.round(clamp(values[cpIdx + k], cpBounds[0], cpBounds[1]) * 1000) / 1000);
+  const cpPenalty = (mults: number[]): number => {
+    const lam = cp?.penalty ?? 0;
+    if (!(lam > 0) || mults.length < 2) return 0;
+    let acc = 0;
+    for (let k = 1; k < mults.length; k++) { const d = Math.log(mults[k]) - Math.log(mults[k - 1]); acc += d * d; }
+    return lam * acc;
+  };
   const offsetOf = (values: number[]): number =>
     offsetDef ? clamp(Math.round(values[req.params.length]), offLo, offHi) : 0;
+  // Profiled scales are memoized per evaluated vector so the chain's draws can
+  // be labelled with the scale they were scored at.
+  const profiled = new Map<string, number>();
+  const keyOf = (values: number[]): string => values.map((v) => v.toPrecision(12)).join(',');
+  const profileN = (curves: SimCurves, o: number): number => {
+    const [lo, hi] = req.scale!.bounds;
+    let num = 0, den = 0;
+    if (incidentTerms) {
+      for (const term of incidentTerms) {
+        const cur = curves[term.category]?.[term.day + o];
+        const prev = term.previousDay === null ? 0 : curves[term.category]?.[term.previousDay + o];
+        if (!Number.isFinite(cur) || !Number.isFinite(prev)) continue;
+        num += term.value; den += Math.max(0, cur - prev);
+      }
+    } else if (req.loss === 'mse') {
+      for (const pt of req.observed) { const sim = sampleCurve(curves, pt.category, pt.day + o); num += pt.value * sim; den += sim * sim; }
+    } else {
+      for (const pt of req.observed) { num += pt.value; den += sampleCurve(curves, pt.category, pt.day + o); }
+    }
+    const raw = den > 0 ? num / den : hi;
+    return clamp(Number.isFinite(raw) ? raw : hi, lo, hi);
+  };
+  const popOf = (values: number[]): number =>
+    scaleDef ? Math.pow(10, clamp(values[scaleIdx], scaleDef.bounds[0], scaleDef.bounds[1]))
+      : profileScale ? (profiled.get(keyOf(values)) ?? req.population)
+      : req.population;
+  // Quantized to 1e-3 so nearby simplex/chain proposals share one sim.
+  const intensityOf = (values: number[]): number =>
+    intensityDef ? Math.round(clamp(values[intensityIdx], intensityDef.bounds[0], intensityDef.bounds[1]) * 1000) / 1000 : 1;
   const shiftPts = (pts: ObservedPoint[], o: number): ObservedPoint[] =>
     o ? pts.map((p) => ({ ...p, day: p.day + o })) : pts;
 
@@ -733,11 +1004,20 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   // the final best, and the CI sweeps all share results for free.
   // Intervention schedules depend only on the candidate's offset (integer),
   // so memoize per offset instead of rebuilding per eval.
-  const schedCache = new Map<number, number[] | undefined>();
-  const schedFor = (o: number): number[] | undefined => {
-    if (!req.interventions?.length) return undefined;
-    if (!schedCache.has(o)) schedCache.set(o, transmissionSchedule(req.interventions, days + 1, o));
-    return schedCache.get(o);
+  const schedCache = new Map<string, number[] | undefined>();
+  const schedFor = (o: number, s = 1, mults: number[] = []): number[] | undefined => {
+    if (!req.interventions?.length && !mults.length) return undefined;
+    const key = `${o}|${s}|${mults.join(',')}`;
+    if (!schedCache.has(key)) {
+      const base = req.interventions?.length ? transmissionSchedule(req.interventions, days + 1, o) : undefined;
+      let out = base && s !== 1 ? base.map((f) => Math.max(0.02, 1 - s * (1 - f))) : base;
+      if (mults.length) {
+        const cps = changePointSchedule(cpTicks, mults, days + 1, o);
+        out = out ? out.map((f, t) => f * cps[t]) : cps;
+      }
+      schedCache.set(key, out);
+    }
+    return schedCache.get(key);
   };
 
   const EMPTY_EVAL = {
@@ -753,9 +1033,13 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     // a fresh simulate would run for real — so never issue one once aborted.
     if (req.signal?.aborted) return EMPTY_EVAL;
     try {
-      const result = await req.simulate(configFor(values), days, K, baseSeed, schedFor(offsetOf(values)));
+      const mults = multsOf(values);
+      const result = await req.simulate(configFor(values), days, K, baseSeed, schedFor(offsetOf(values), intensityOf(values), mults));
       const shifted = shiftPts(req.observed, offsetOf(values));
-      return { loss: lossOf(shifted, result.curves, req.population, req.loss), r0: result.rNaught, result };
+      if (profileScale) profiled.set(keyOf(values), profileN(result.curves, offsetOf(values)));
+      const N = popOf(values);
+      const base = incidentTerms ? incidentNLLFromTerms(incidentTerms, result.curves, N, offsetOf(values)) : lossOf(shifted, result.curves, N, req.loss);
+      return { loss: base + cpPenalty(mults), r0: result.rNaught, result };
     } catch (err) {
       // A cancelled pool rejects every pending sim so nothing awaits a message
       // that will never arrive — swallow those into +Inf losses and let the
@@ -905,9 +1189,17 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   // index-case ensemble percentiles this replaces for the FINAL band. The live
   // streaming path stays the cheap one.
   let bayes: Record<FitCategory, number[][]> | null = null;
+  let posteriorDraws: FitResult['posteriorDraws'] = null;
+  let posteriorDispersion = 1;
   if (req.posterior && !req.signal?.aborted) {
     // (postDraws/postBurn hoisted above for the progress accounting; burn-in
     // doubles as the step-adaptation phase.)
+    if (req.posterior.dispersion === 'quasi' || req.posterior.dispersion === 'quasi-median') {
+      const at = await evalAt(bestValues, req.K);
+      posteriorDispersion = quasiDispersion(req.observed, incidentTerms, at.result.curves, popOf(bestValues), offsetOf(bestValues), req.loss, allParams.length, req.posterior.dispersion === 'quasi-median');
+    } else if (typeof req.posterior.dispersion === 'number' && Number.isFinite(req.posterior.dispersion) && req.posterior.dispersion > 0) {
+      posteriorDispersion = req.posterior.dispersion;
+    }
     const chain = await metropolisChain(
       async (v) => (await evalAt(v, req.K)).loss,
       bestValues,
@@ -919,6 +1211,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
       req.observed.length,
       req.signal,
       postTick,
+      posteriorDispersion,
     );
     // TRUE posterior-predictive: for each retained parameter draw, sample ONE
     // stochastic realization (K = 1, per-draw decorrelated seed) instead of the
@@ -935,7 +1228,7 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
           days,
           1,
           (baseSeed ^ ((0x51ab3d7 + i * 0x9e3779b1) >>> 0)) >>> 0,
-          schedFor(offsetOf(v)),
+          schedFor(offsetOf(v), intensityOf(v), multsOf(v)),
         );
         if (one.curves.cumulative_infections.length) drawCurves.push(one.curves);
       } catch (err) {
@@ -944,6 +1237,11 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
       postTick();
     }
     if (drawCurves.length && !req.signal?.aborted) bayes = percentileBands(drawCurves, BAND_PROBS);
+    if (chain.length && !req.signal?.aborted) {
+      posteriorDraws = profileScale
+        ? { names: [...allParams.map((p) => p.name), 'populationScale'], draws: chain.map((v) => [...v, Math.log10(profiled.get(keyOf(v)) ?? popOf(bestValues))]) }
+        : { names: allParams.map((p) => p.name), draws: chain.map((v) => v.slice()) };
+    }
   }
 
   const bestConfig = configFor(bestValues);
@@ -951,6 +1249,9 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   postDone = postTotal; // final re-eval — the bar completes at 100%
   report();
   const bestOffset = offsetOf(bestValues);
+  const bestPop = popOf(bestValues);
+  const bestIntensity = intensityOf(bestValues);
+  const bestMults = multsOf(bestValues);
   const shiftedObserved = shiftPts(req.observed, bestOffset);
   const ciEval = (values: number[]) => evalAt(values, req.K).then((r) => ({ loss: r.loss, r0: r.r0 }));
   const { ci: r0CI, kind: r0CIKind } = await profileR0CI({ values: bestValues, loss: bestLossFinal }, req, ciEval);
@@ -959,8 +1260,8 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
   let holdout: { loss: number } | null = null;
   try {
     if (!req.signal?.aborted) {
-      const hv = await req.simulate(bestConfig, days, req.K, (baseSeed ^ 0x484f4c44) >>> 0, schedFor(bestOffset));
-      holdout = { loss: lossOf(shiftedObserved, hv.curves, req.population, req.loss) };
+      const hv = await req.simulate(bestConfig, days, req.K, (baseSeed ^ 0x484f4c44) >>> 0, schedFor(bestOffset, bestIntensity, bestMults));
+      holdout = { loss: lossOf(shiftedObserved, hv.curves, bestPop, req.loss) };
     }
   } catch {
     holdout = null;
@@ -977,18 +1278,71 @@ export async function runFit(req: FitRequest): Promise<FitResult> {
     r0: best.r0,
     r0CI,
     r0CIKind,
-    gof: goodnessOfFit(shiftedObserved, best.result.curves, req.population),
+    gof: goodnessOfFit(shiftedObserved, best.result.curves, bestPop),
     loss: bestLossFinal,
     days,
-    population: req.population,
+    population: bestPop,
     observed: shiftedObserved,
     simulated: best.result.curves,
     config: bestConfig,
     indexOffset: offsetDef ? bestOffset : undefined,
+    fittedPopulation: req.scale ? bestPop : undefined,
+    interventionIntensity: intensityDef ? bestIntensity : undefined,
+    transmissionMultipliers: cpDefs.length ? bestMults : undefined,
     offsetCI,
     bayes,
     holdout,
+    posteriorDraws,
+    posteriorDispersion: req.posterior ? posteriorDispersion : undefined,
   };
+}
+
+/** Quasi-Poisson dispersion at a fitted curve: Pearson χ² over the loss's own
+ *  terms (report-interval counts for the incident objective, cumulative
+ *  levels otherwise) divided by the residual degrees of freedom, floored at 1.
+ *  MSE has no count structure and returns 1. */
+export function quasiDispersion(
+  observed: ObservedPoint[],
+  incidentTerms: IncidentCountTerm[] | null,
+  curves: SimCurves,
+  N: number,
+  offset: number,
+  loss: LossType,
+  dims: number,
+  robust = false,
+): number {
+  if (loss === 'mse') return 1;
+  const contributions: number[] = [];
+  if (incidentTerms) {
+    for (const term of incidentTerms) {
+      const cur = curves[term.category]?.[term.day + offset];
+      const prev = term.previousDay === null ? 0 : curves[term.category]?.[term.previousDay + offset];
+      if (!Number.isFinite(cur) || !Number.isFinite(prev)) continue;
+      const lambda = Math.max(N * (cur - prev), EPS);
+      contributions.push((term.value - lambda) ** 2 / lambda);
+    }
+  } else {
+    for (const pt of observed) {
+      const lambda = Math.max(sampleCurve(curves, pt.category, pt.day + offset) * N, EPS);
+      contributions.push((pt.value - lambda) ** 2 / lambda);
+    }
+  }
+  const n = contributions.length;
+  const df = n - dims;
+  if (robust) {
+    // Median of the per-term Pearson contributions, scaled by the median of χ²₁
+    // (≈ 0.4549) so it estimates the same φ as the mean under a quasi-Poisson
+    // model, but a single explosive term cannot dominate it.
+    if (n < 3) return 1;
+    const sorted = contributions.slice().sort((a, b) => a - b);
+    const mid = n >> 1;
+    const median = n % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    if (!Number.isFinite(median)) return 1;
+    return Math.max(1, median / 0.45494);
+  }
+  const pearson = contributions.reduce((a, b) => a + b, 0);
+  if (!(df > 0) || !Number.isFinite(pearson)) return 1;
+  return Math.max(1, pearson / df);
 }
 
 /** Seeded random-walk Metropolis over the fit parameters, flat priors within
@@ -1009,8 +1363,10 @@ export async function metropolisChain(
   nObs = 1,
   signal?: { aborted: boolean },
   onStep?: () => void,
+  dispersion = 1,
 ): Promise<number[][]> {
   const rng = new Rng((seed ^ 0x6d636d63) >>> 0);
+  const temper = dispersion > 0 && Number.isFinite(dispersion) ? dispersion : 1;
   const lo = params.map((p) => p.bounds[0]);
   const hi = params.map((p) => p.bounds[1]);
   const step = params.map((p, i) => {
@@ -1034,7 +1390,7 @@ export async function metropolisChain(
     const prop = decode(cur.map((x, i) => x + rng.gaussian() * step[i]));
     const propDev = deviance(await nll(prop), lossType, nObs);
     // Accept with probability exp(devCur − devProp) — the likelihood ratio.
-    if (Math.log(Math.max(rng.random(), 1e-12)) < curDev - propDev) {
+    if (Math.log(Math.max(rng.random(), 1e-12)) < (curDev - propDev) / temper) {
       cur = prop;
       curDev = propDev;
       accepted++;
@@ -1110,7 +1466,7 @@ export function profileOffsetCI(
 }
 
 // Parameters that move R₀ — the CI is only profiled over these.
-const R0_DRIVERS = new Set<FitParamName>(['attackRate', 'range', 'infectious']);
+const R0_DRIVERS = new Set<FitParamName>(['attackRate', 'range', 'infectious', 'mixing']);
 
 // χ²₁,₀.₉₅ / 2 — the profile-likelihood deviance threshold for a 95% interval on a
 // single parameter (here R₀, profiled through its driving genes).
@@ -1124,7 +1480,7 @@ const CHI2_HALF = 1.920729;
 // directly to a raw MSE (which can run into the thousands) puts *every* off-optimum
 // candidate past the cutoff and collapses the interval to a point.
 function deviance(loss: number, type: LossType, n: number): number {
-  return type === 'poisson' ? loss : (n / 2) * Math.log(Math.max(loss, EPS));
+  return type === 'mse' ? (n / 2) * Math.log(Math.max(loss, EPS)) : loss;
 }
 
 export interface CIResult {
@@ -1655,6 +2011,20 @@ export function interventionWindows(
       };
     })
     .filter((w) => Number.isFinite(w.from));
+}
+
+/** Per-tick multiplier from dated change points: at sim tick t the data day is
+ *  d = t − offsetDays and the multiplier is `values[k]` for the last
+ *  `ticks[k] ≤ d`, 1 before the first tick, and HELD after the last. */
+export function changePointSchedule(ticks: number[], values: number[], len: number, offsetDays = 0): number[] {
+  const out = new Array<number>(len);
+  for (let t = 0; t < len; t++) {
+    const d = t - offsetDays;
+    let m = 1;
+    for (let k = 0; k < ticks.length; k++) { if (ticks[k] <= d) m = values[k]; else break; }
+    out[t] = m;
+  }
+  return out;
 }
 
 export function transmissionSchedule(

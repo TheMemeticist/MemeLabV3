@@ -2668,6 +2668,12 @@ select.r0-in { width: auto; font-family: var(--font-sans); }
   .r0-body { padding: 18px 14px 16px; }
   .r0-row { grid-template-columns: 1fr 1.2fr 1.6fr 28px; gap: 4px; }
   .r0-run-controls { gap: 12px; }
+  .r0-actions .r0-check { min-width: 0; max-width: 100%; }
+  .r0-actions select { min-width: 0; flex: 1; }
+  .r0-param { grid-template-columns: 18px minmax(0, 1fr); }
+  .r0-param-bounds { grid-column: 2; flex-wrap: wrap; }
+  .r0-toggle { max-width: 100%; }
+  .r0-toggle-btn { min-width: 0; }
   .r0-ga-grid { grid-template-columns: 1fr; }
 }
 

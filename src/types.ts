@@ -24,6 +24,14 @@ export interface StrainGenes {
    *  (e.g. 36500) for "lifelong" immunity. Daily wane probability = 1/immunityDays. */
   immunityDays: number;
   mutationRate: number; // 0..1 per-replication per-gene
+  /** Long-range mixing: per infectious cell per tick, the probability of one
+   *  extra contact with a uniformly random cell anywhere on the grid (a
+   *  Newman–Watts shortcut, redrawn every tick — Moore & Newman 2000;
+   *  Buscarino et al. 2008). 0 (default) keeps spread purely local: a lattice
+   *  wave that grows polynomially. A few percent makes growth exponential.
+   *  Describes host movement, not the pathogen, so it never drifts under
+   *  mutation. Mean-field ignores it (already fully mixed). */
+  mixing?: number; // 0..1
 }
 
 export interface Strain extends StrainGenes {

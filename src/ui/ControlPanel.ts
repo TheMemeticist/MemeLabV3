@@ -29,7 +29,7 @@ export class ControlPanel {
   private vaxSliders!: { protection: Slider; sourceControl: Slider; mortalityReduction: Slider; uptake: Slider };
   private lockdownSliders!: { mobility: Slider; transmission: Slider; compliance: Slider };
   private quarantineSliders!: { detection: Slider; range: Slider; protection: Slider; sourceControl: Slider; duration: Slider };
-  private strainSliders!: { attackRate: Slider; incubation: Slider; infectious: Slider; ifr: Slider; range: Slider; immunityDays: Slider; mutationRate: Slider };
+  private strainSliders!: { attackRate: Slider; incubation: Slider; infectious: Slider; ifr: Slider; range: Slider; mixing: Slider; immunityDays: Slider; mutationRate: Slider };
   private r0Slider!: Slider;
   private picker!: PresetPicker;
   private switches: Record<string, HTMLInputElement> = {};
@@ -426,6 +426,13 @@ export class ControlPanel {
         editable: true, editSuffix: 'tiles',
         onChange: (v) => { this.cfg.strain.range = v | 0; this.dirty(); },
       }),
+      mixing: new Slider({
+        id: 'mixing', label: 'Long-range mixing', min: 0, max: 30, step: 0.1, unit: '%',
+        value: (s.mixing ?? 0) * 100,
+        hint: 'Chance per infectious cell per day of one extra contact anywhere on the grid (travel, commuting). 0 = purely local spread, which grows as a wave; a few percent makes growth exponential. Lockdown mobility and fitted R(t) schedules reduce it. Runs on CPU/WASM only.',
+        editable: true, editSuffix: '%',
+        onChange: (v) => { this.cfg.strain.mixing = v / 100; this.dirty(); },
+      }),
       immunityDays: new Slider({
         // Log-scaled 0..1000 → 90 days .. 36500 days. Linear was useless: 25%
         // of slider already read "lifelong" and 99% of the dial sat in years
@@ -456,7 +463,7 @@ export class ControlPanel {
     // Note: attackRate and range stay direct children of strainHost — the R₀
     // slider is inserted before attackRate below, and geometry visibility
     // toggles both regardless of parent.
-    const primaryKeys: (keyof typeof this.strainSliders)[] = ['attackRate', 'range', 'incubation', 'infectious', 'ifr'];
+    const primaryKeys: (keyof typeof this.strainSliders)[] = ['attackRate', 'range', 'mixing', 'incubation', 'infectious', 'ifr'];
     const advancedKeys: (keyof typeof this.strainSliders)[] = ['immunityDays', 'mutationRate'];
     for (const k of primaryKeys) strainHost.appendChild(this.strainSliders[k].el);
     const strainAdv = this.advancedGroup(strainHost);

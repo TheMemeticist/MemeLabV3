@@ -78,6 +78,7 @@ export function encode(opts: PermalinkOptions): string {
   ival('rg', sg.range, bg.range);
   ival('im', sg.immunityDays, bg.immunityDays);
   num('mr', sg.mutationRate, bg.mutationRate);
+  num('mx', sg.mixing ?? 0, bg.mixing ?? 0);
 
   // Voronoi tuning is only meaningful under voronoi geometry.
   if ((c.geometry ?? 'square') === 'voronoi') {
@@ -257,6 +258,9 @@ export function applyEncoded(p: URLSearchParams, baseArg: SimConfig): {
       range: clampInt(int(p, 'rg', base.strain.range), 1, 8),
       immunityDays: clampInt(int(p, 'im', base.strain.immunityDays), 1, 36500),
       mutationRate: clamp01(num(p, 'mr', base.strain.mutationRate)),
+      // Only materialize the key when the link or the preset carries it, so
+      // mixing-free presets decode to exactly their own gene object.
+      ...(p.has('mx') || base.strain.mixing !== undefined ? { mixing: clamp01(num(p, 'mx', base.strain.mixing ?? 0)) } : {}),
     },
     defenses: [
       {

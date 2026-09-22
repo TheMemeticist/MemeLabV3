@@ -1,0 +1,226 @@
+[
+  {
+    "id": "validation-covid-italy",
+    "label": "COVID-19 \u2014 Italy, 2020 \u2014 first 8 weeks (sourced)",
+    "population": 715888,
+    "points": [
+      {
+        "day": 0,
+        "value": 155,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 7,
+        "value": 1694,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 14,
+        "value": 7375,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 21,
+        "value": 24747,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 28,
+        "value": 59138,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 35,
+        "value": 97689,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 42,
+        "value": 128948,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 49,
+        "value": 156363,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 56,
+        "value": 178972,
+        "category": "cumulative_infections"
+      }
+    ],
+    "startDate": "2020-02-23",
+    "sourceUrl": "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv",
+    "sourceSha256": "e6234a59eec4359d2577358b5220e1a7e3da74c162913cdb7d882db1413f98c2",
+    "notes": "JHU CSSE confirmed reported cases, latest archived revisions; aggregated country rows. CC BY 4.0. Daily cumulative reports; case counts are a proxy, not all infections. Effective population is 4\u00d7 the last training count (minimum 1,000), not the census. No future-response intervention defaults."
+  },
+  {
+    "id": "validation-covid-korea",
+    "label": "COVID-19 \u2014 Korea, South, 2020 \u2014 first 8 weeks (sourced)",
+    "population": 42256,
+    "points": [
+      {
+        "day": 0,
+        "value": 31,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 7,
+        "value": 977,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 14,
+        "value": 5186,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 21,
+        "value": 7513,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 28,
+        "value": 8320,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 35,
+        "value": 9037,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 42,
+        "value": 9786,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 49,
+        "value": 10331,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 56,
+        "value": 10564,
+        "category": "cumulative_infections"
+      }
+    ],
+    "startDate": "2020-02-18",
+    "sourceUrl": "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv",
+    "sourceSha256": "e6234a59eec4359d2577358b5220e1a7e3da74c162913cdb7d882db1413f98c2",
+    "notes": "JHU CSSE confirmed reported cases, latest archived revisions; aggregated country rows. CC BY 4.0. Daily cumulative reports; case counts are a proxy, not all infections. Effective population is 4\u00d7 the last training count (minimum 1,000), not the census. No future-response intervention defaults."
+  },
+  {
+    "id": "validation-covid-us",
+    "label": "COVID-19 \u2014 US, 2020 \u2014 first 8 weeks (sourced)",
+    "population": 3902148,
+    "points": [
+      {
+        "day": 0,
+        "value": 32,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 7,
+        "value": 519,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 14,
+        "value": 3212,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 21,
+        "value": 34944,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 28,
+        "value": 143544,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 35,
+        "value": 353117,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 42,
+        "value": 571551,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 49,
+        "value": 768888,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 56,
+        "value": 975537,
+        "category": "cumulative_infections"
+      }
+    ],
+    "startDate": "2020-03-01",
+    "sourceUrl": "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv",
+    "sourceSha256": "e6234a59eec4359d2577358b5220e1a7e3da74c162913cdb7d882db1413f98c2",
+    "notes": "JHU CSSE confirmed reported cases, latest archived revisions; aggregated country rows. CC BY 4.0. Daily cumulative reports; case counts are a proxy, not all infections. Effective population is 4\u00d7 the last training count (minimum 1,000), not the census. No future-response intervention defaults."
+  },
+  {
+    "id": "validation-mpox-spain",
+    "label": "Mpox \u2014 Spain, 2022 \u2014 first 8 weeks (sourced)",
+    "population": 4964,
+    "points": [
+      {
+        "day": 0,
+        "value": 0,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 7,
+        "value": 0,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 14,
+        "value": 1,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 21,
+        "value": 60,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 28,
+        "value": 147,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 35,
+        "value": 279,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 42,
+        "value": 468,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 49,
+        "value": 801,
+        "category": "cumulative_infections"
+      },
+      {
+        "day": 56,
+        "value": 1241,
+        "category": "cumulative_infections"
+      }
+    ],
+    "startDate": "2022-05-01",
+    "sourceUrl": "https://opendata.ecdc.europa.eu/monkeypox/casedistribution/csv/data.csv",
+    "sourceSha256": "05b90302c29e855bc3a0b5529434562561d8691624513211a0c078d2f88df14f",
+    "notes": "ECDC confirmed cases by reporting date, summed into cumulative reports. Dataset provided by ECDC based on reporting-country authorities and/or WHO. Adapted by cumulative aggregation; no dates interpolated. CC BY 4.0 / ECDC database attribution terms. Last record 2023-02-13; unavailable targets are excluded. Effective population is 4\u00d7 the last training count (minimum 1,000), not the census. No future-response intervention defaults."
+  }
+]
