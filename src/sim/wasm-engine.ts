@@ -25,7 +25,7 @@ import { LongHistory } from './long-history';
 import { MAX_SCHEDULE_LEN } from './config';
 import { Rng } from './rng';
 import { StrainPool } from './strain';
-import { seed } from './population';
+import { seed, susceptibilityCVOf } from './population';
 import { makeGeometry, VoronoiLattice, type LatticeGeometry } from './neighbors';
 import { buildVoronoi } from './voronoi';
 import { resolveDefenses } from './defense';
@@ -52,6 +52,8 @@ interface CoreExports {
   csr_offsets_alloc(role: number, len: number): number;
   csr_list_alloc(role: number, len: number): number;
   sched_alloc(len: number): number;
+  susceptibility_init(cv: number): void;
+  susceptibility_ptr(): number;
   finalize_init(): void;
   step(): void;
   tick(): number;
@@ -241,6 +243,13 @@ export class WasmEngine {
     this.pushTables(config);
     this.txSchedule = opts?.txSchedule && opts.txSchedule.length > 0 ? opts.txSchedule : null;
     this.pushSchedule(this.txSchedule);
+    // Susceptibility heterogeneity: Rust draws the multipliers from the main
+    // stream handed over by set_rng above — the same position at which
+    // Engine.reset draws them (right after seed(); nothing in between draws).
+    // Called after every view above has been used, since the allocation may
+    // grow wasm memory. Off ⇒ not called: no draws, core keeps `sus` empty.
+    const susCV = susceptibilityCVOf(config);
+    if (susCV > 0) ex.susceptibility_init(susCV);
     ex.finalize_init();
 
     this.tick = 0;
@@ -462,6 +471,16 @@ export class WasmEngine {
   /** WASM supports the single base strain; use the shared sanitizer. */
   snapshotStrains(): import('../types').Strain[] {
     return new StrainPool(this.config.strain).snapshot();
+  }
+
+  /** The per-cell susceptibility multipliers (a fresh view into wasm memory),
+   *  or null when SimConfig.susceptibilityCV is off. For tests/inspection. */
+  susceptibilityBuffer(): Float64Array | null {
+    const ex = this.exports;
+    const ptr = ex.susceptibility_ptr();
+    if (ptr === 0) return null;
+    const n = this.config.size * this.config.size;
+    return new Float64Array(ex.memory.buffer as ArrayBuffer, ptr, n);
   }
 
   buffers(): { state: Uint8Array; defenses: Uint8Array; quarantined: Uint8Array; size: number } {

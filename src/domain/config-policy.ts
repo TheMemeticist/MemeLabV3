@@ -1,4 +1,5 @@
 import type { SimConfig } from '../types';
+import { susceptibilityCVOf } from '../sim/population';
 
 /** Shared UI/headless routing policy: only structural changes rebuild a world.
  * Optional defaults are normalized; inactive Voronoi settings do not affect a
@@ -8,6 +9,8 @@ export function needsRebuild(prev: SimConfig | null, next: SimConfig): boolean {
   if (prev.size !== next.size) return true;
   if (prev.seed !== next.seed) return true;
   if ((prev.geometry ?? 'square') !== (next.geometry ?? 'square')) return true;
+  // Susceptibility multipliers are drawn once at reset (structural, like seed).
+  if (susceptibilityCVOf(prev) !== susceptibilityCVOf(next)) return true;
   if (prev.geometry === 'voronoi' && next.geometry === 'voronoi') {
     const pv = prev.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };
     const nv = next.voronoiConfig ?? { mode: 'jittered', irregularity: 0.5 };

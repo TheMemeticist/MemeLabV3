@@ -41,7 +41,7 @@
 import type { LongStats, RetiredCostTotals, SimConfig, SimStats, VoronoiTopology } from '../types';
 import { LongHistory } from './long-history';
 import { Rng } from './rng';
-import { seed } from './population';
+import { seed, susceptibilityCVOf } from './population';
 import { makeGeometry, VoronoiLattice } from './neighbors';
 import { buildVoronoi } from './voronoi';
 import { resolveDefenses } from './defense';
@@ -54,8 +54,12 @@ const WG = 256;
 
 export function gpuCompatible(config: SimConfig): boolean {
   // Long-range mixing needs scatter contacts, which the gather kernel has no
-  // path for yet — it stays on the CPU/WASM engines.
-  return config.mutate !== true && config.reseedOnExtinction !== true && !((config.strain.mixing ?? 0) > 0);
+  // path for yet — it stays on the CPU/WASM engines. Susceptibility
+  // heterogeneity (susceptibilityCV) would need a per-cell multiplier buffer
+  // and the Gamma draws in the kernel's setup; it is refused here too, so the
+  // constructor throws and the worker falls back to CPU/WASM.
+  return config.mutate !== true && config.reseedOnExtinction !== true && !((config.strain.mixing ?? 0) > 0)
+    && susceptibilityCVOf(config) === 0;
 }
 
 export function gpuSupported(): boolean {

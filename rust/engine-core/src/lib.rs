@@ -21,6 +21,13 @@
 // Geometry neighbor tables (per row/cell parity) are computed by the TS
 // geometry layer and copied in verbatim, so neighbor iteration order is the
 // TS order by construction.
+//
+// Susceptibility heterogeneity (SimConfig.susceptibilityCV) is drawn HERE, not
+// copied in: `susceptibility_init` runs the identical Marsaglia–Tsang Gamma
+// sampler (`Rng::gamma`, a port of `Rng.gamma` in src/sim/rng.ts) on the main
+// stream right after `set_rng` — the same stream position at which the TS
+// engine draws them (immediately after seed()). The wrapper calls it only when
+// the option is on; off, `sus` stays empty and no path changes.
 
 use std::collections::HashMap;
 
@@ -36,6 +43,53 @@ struct Rng {
 }
 
 impl Rng {
+    /// Standard normal, Marsaglia polar method — exact port of
+    /// `Rng.normalPolar` (second variate discarded). Uses the portable
+    /// `det_log`, never the platform `ln`, so it matches TS bit-for-bit.
+    fn normal_polar(&mut self) -> f64 {
+        loop {
+            let u = 2.0 * self.random() - 1.0;
+            let v = 2.0 * self.random() - 1.0;
+            let s = u * u + v * v;
+            if s > 0.0 && s < 1.0 {
+                return u * ((-2.0 * det_log(s)) / s).sqrt();
+            }
+        }
+    }
+
+    /// Gamma(shape, 1), Marsaglia–Tsang with the shape < 1 boost — exact port
+    /// of `Rng.gamma` (same draws, same floating-point order, same portable
+    /// det_log/det_exp).
+    fn gamma(&mut self, shape: f64) -> f64 {
+        if shape < 1.0 {
+            let g = self.gamma(shape + 1.0);
+            let u = self.random();
+            return g * det_exp(det_log(u) / shape);
+        }
+        let d = shape - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let mut x;
+            let mut v;
+            loop {
+                x = self.normal_polar();
+                v = 1.0 + c * x;
+                if v > 0.0 {
+                    break;
+                }
+            }
+            v = v * v * v;
+            let u = self.random();
+            let x2 = x * x;
+            if u < 1.0 - 0.0331 * (x2 * x2) {
+                return d * v;
+            }
+            if det_log(u) < 0.5 * x2 + d * (1.0 - v + det_log(v)) {
+                return d * v;
+            }
+        }
+    }
+
     #[inline(always)]
     fn next(&mut self) -> u32 {
         let s = &mut self.s;
@@ -74,6 +128,160 @@ impl Rng {
     fn int_range(&mut self, n: usize) -> usize {
         (self.random() * n as f64).floor() as usize
     }
+}
+
+// ── Portable log / exp ───────────────────────────────────────────────────────
+// Exact ports of `detLog` / `detExp` in src/sim/rng.ts (fdlibm 5.3 e_log.c and
+// e_exp.c): only IEEE-754 +, −, ×, / and bit manipulation, so the results are
+// bit-identical to the TS versions. f64::ln / powf come from Rust's libm, which
+// differs from V8's Math.log / Math.pow by 1 ulp on some inputs — not good
+// enough for the Gamma draws, whose bits the parity tests compare.
+
+const LN2_HI: f64 = 6.93147180369123816490e-01;
+const LN2_LO: f64 = 1.90821492927058770002e-10;
+const TWO54: f64 = 1.80143985094819840000e+16;
+const LG1: f64 = 6.666666666666735130e-01;
+const LG2: f64 = 3.999999999940941908e-01;
+const LG3: f64 = 2.857142874366239149e-01;
+const LG4: f64 = 2.222219843214978396e-01;
+const LG5: f64 = 1.818357216161805012e-01;
+const LG6: f64 = 1.531383769920937332e-01;
+const LG7: f64 = 1.479819860511658591e-01;
+
+#[inline(always)]
+fn hi_word(x: f64) -> i32 {
+    (x.to_bits() >> 32) as u32 as i32
+}
+
+#[inline(always)]
+fn with_hi_word(x: f64, hi: i32) -> f64 {
+    f64::from_bits(((hi as u32 as u64) << 32) | (x.to_bits() & 0xffff_ffff))
+}
+
+/// Natural log — exact port of `detLog` (fdlibm e_log.c).
+#[allow(clippy::excessive_precision)]
+fn det_log(mut x: f64) -> f64 {
+    let mut hx = hi_word(x);
+    let lx = x.to_bits() as u32;
+    let mut k: i32 = 0;
+    if hx < 0x0010_0000 {
+        if ((hx & 0x7fff_ffff) as u32 | lx) == 0 {
+            return f64::NEG_INFINITY;
+        }
+        if hx < 0 {
+            return f64::NAN;
+        }
+        k -= 54;
+        x *= TWO54;
+        hx = hi_word(x);
+    }
+    if hx >= 0x7ff0_0000 {
+        return x + x;
+    }
+    k += (hx >> 20) - 1023;
+    hx &= 0x000f_ffff;
+    let i = (hx + 0x95f64) & 0x10_0000;
+    x = with_hi_word(x, hx | (i ^ 0x3ff0_0000));
+    k += i >> 20;
+    let f = x - 1.0;
+    if (0x000f_ffff & (2 + hx)) < 3 {
+        if f == 0.0 {
+            if k == 0 {
+                return 0.0;
+            }
+            let dk0 = k as f64;
+            return dk0 * LN2_HI + dk0 * LN2_LO;
+        }
+        let r0 = f * f * (0.5 - 0.33333333333333333 * f);
+        if k == 0 {
+            return f - r0;
+        }
+        let dk1 = k as f64;
+        return dk1 * LN2_HI - ((r0 - dk1 * LN2_LO) - f);
+    }
+    let s = f / (2.0 + f);
+    let dk = k as f64;
+    let z = s * s;
+    let mut ii = hx - 0x6147a;
+    let w = z * z;
+    let j = 0x6b851 - hx;
+    let t1 = w * (LG2 + w * (LG4 + w * LG6));
+    let t2 = z * (LG1 + w * (LG3 + w * (LG5 + w * LG7)));
+    ii |= j;
+    let r = t2 + t1;
+    if ii > 0 {
+        let hfsq = 0.5 * f * f;
+        if k == 0 {
+            return f - (hfsq - s * (hfsq + r));
+        }
+        return dk * LN2_HI - ((hfsq - (s * (hfsq + r) + dk * LN2_LO)) - f);
+    }
+    if k == 0 {
+        return f - s * (f - r);
+    }
+    dk * LN2_HI - ((s * (f - r) - dk * LN2_LO) - f)
+}
+
+const O_THRESHOLD: f64 = 7.09782712893383973096e+02;
+const U_THRESHOLD: f64 = -7.45133219101941108420e+02;
+const INVLN2: f64 = 1.44269504088896338700e+00;
+const TWOM1000: f64 = 9.33263618503218878990e-302;
+const P1: f64 = 1.66666666666666019037e-01;
+const P2: f64 = -2.77777777770155933842e-03;
+const P3: f64 = 6.61375632143793436117e-05;
+const P4: f64 = -1.65339022054652515390e-06;
+const P5: f64 = 4.13813679705723846039e-08;
+
+/// e^x — exact port of `detExp` (fdlibm e_exp.c).
+#[allow(clippy::excessive_precision)]
+fn det_exp(mut x: f64) -> f64 {
+    let mut hx = (x.to_bits() >> 32) as u32;
+    let xsb = ((hx >> 31) & 1) as i32;
+    hx &= 0x7fff_ffff;
+    let mut hi = 0.0;
+    let mut lo = 0.0;
+    let k: i32;
+    if hx >= 0x4086_2e42 {
+        if hx >= 0x7ff0_0000 {
+            if ((hx & 0xfffff) | (x.to_bits() as u32)) != 0 {
+                return x + x;
+            }
+            return if xsb == 0 { x } else { 0.0 };
+        }
+        if x > O_THRESHOLD {
+            return f64::INFINITY;
+        }
+        if x < U_THRESHOLD {
+            return 0.0;
+        }
+    }
+    if hx > 0x3fd6_2e42 {
+        if hx < 0x3ff0_a2b2 {
+            hi = x - (if xsb == 0 { LN2_HI } else { -LN2_HI });
+            lo = if xsb == 0 { LN2_LO } else { -LN2_LO };
+            k = 1 - xsb - xsb;
+        } else {
+            k = (INVLN2 * x + (if xsb == 0 { 0.5 } else { -0.5 })) as i32;
+            let t = k as f64;
+            hi = x - t * LN2_HI;
+            lo = t * LN2_LO;
+        }
+        x = hi - lo;
+    } else if hx < 0x3e30_0000 {
+        return 1.0 + x;
+    } else {
+        k = 0;
+    }
+    let t = x * x;
+    let c = x - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
+    if k == 0 {
+        return 1.0 - ((x * c) / (c - 2.0) - x);
+    }
+    let y = 1.0 - ((lo - (x * c) / (2.0 - c)) - hi);
+    if k >= -1021 {
+        return with_hi_word(y, hi_word(y).wrapping_add(k << 20));
+    }
+    with_hi_word(y, hi_word(y).wrapping_add((k + 1000) << 20)) * TWOM1000
 }
 
 #[derive(Default)]
@@ -140,6 +348,8 @@ struct Sim {
     csr_offsets: [Vec<i32>; 3],
     csr_list: [Vec<i32>; 3],
     sched: Vec<f64>,
+    // Per-cell susceptibility multipliers (susceptibilityCV); empty = off.
+    sus: Vec<f64>,
     // per-step stats out: [s,e,i,r,d,newInf,newInfectious,newDeaths,newRecovered,masked,vax,quar]
     stats: [i32; 12],
 }
@@ -538,6 +748,12 @@ impl Sim {
                     if self.p.quarantine_on {
                         import_p *= self.p.q_src_mul;
                     }
+                    if !self.sus.is_empty() {
+                        import_p *= self.sus[idx];
+                        if import_p > 1.0 {
+                            import_p = 1.0;
+                        }
+                    }
                     if import_p > 0.0 && self.rng.bernoulli(import_p) {
                         self.state[idx] = ST_I;
                         self.census[ST_S as usize] -= 1;
@@ -577,6 +793,7 @@ impl Sim {
         let lockdown_on = self.p.lockdown_on;
         let lockdown_skip_p = if lockdown_on { self.p.mobility } else { 0.0 };
         let quarantine_on = self.p.quarantine_on;
+        let sus_on = !self.sus.is_empty();
         let mut new_infections = 0i32;
 
         let i_count = self.i_list.len();
@@ -618,7 +835,13 @@ impl Sim {
                 if quarantine_on && self.quarantined[j] != 0 {
                     prot_mul *= self.p.q_prot_mul;
                 }
-                let p = atk_src * prot_mul;
+                let mut p = atk_src * prot_mul;
+                if sus_on {
+                    p *= self.sus[j];
+                    if p > 1.0 {
+                        p = 1.0;
+                    }
+                }
                 if p <= 0.0 {
                     continue;
                 }
@@ -653,7 +876,13 @@ impl Sim {
                 if quarantine_on && self.quarantined[j] != 0 {
                     prot_mul *= self.p.q_prot_mul;
                 }
-                let p = atk_src * prot_mul;
+                let mut p = atk_src * prot_mul;
+                if sus_on {
+                    p *= self.sus[j];
+                    if p > 1.0 {
+                        p = 1.0;
+                    }
+                }
                 if p <= 0.0 {
                     continue;
                 }
@@ -680,6 +909,7 @@ impl Sim {
         let lockdown_on = self.p.lockdown_on;
         let lockdown_skip_p = if lockdown_on { self.p.mobility } else { 0.0 };
         let quarantine_on = self.p.quarantine_on;
+        let sus_on = !self.sus.is_empty();
         let mut new_infections = 0i32;
 
         let i_count = self.i_list.len();
@@ -709,7 +939,13 @@ impl Sim {
                 if quarantine_on && self.quarantined[j] != 0 {
                     prot_mul *= self.p.q_prot_mul;
                 }
-                let p = atk_src * prot_mul;
+                let mut p = atk_src * prot_mul;
+                if sus_on {
+                    p *= self.sus[j];
+                    if p > 1.0 {
+                        p = 1.0;
+                    }
+                }
                 if p <= 0.0 {
                     continue;
                 }
@@ -744,7 +980,13 @@ impl Sim {
                 if quarantine_on && self.quarantined[j] != 0 {
                     prot_mul *= self.p.q_prot_mul;
                 }
-                let p = atk_src * prot_mul;
+                let mut p = atk_src * prot_mul;
+                if sus_on {
+                    p *= self.sus[j];
+                    if p > 1.0 {
+                        p = 1.0;
+                    }
+                }
                 if p <= 0.0 {
                     continue;
                 }
@@ -775,6 +1017,7 @@ impl Sim {
         let mob_keep = if self.p.lockdown_on { 1.0 - self.p.mobility } else { 1.0 };
         let src_mul = self.p.trans_mul * self.p.q_src_mul;
         let quarantine_on = self.p.quarantine_on;
+        let sus_on = !self.sus.is_empty();
 
         // Per-cohort exposure probabilities: index = (defense mask << 1) | quarantined.
         let mut p_table = [0.0f64; 8];
@@ -791,13 +1034,32 @@ impl Sim {
         }
 
         let incub0 = self.p.incub.max(1);
+        // Monomorphised sweep: the option-off instance compiles to the exact
+        // pre-feature loop (no per-cell branch or bounds check on `sus`).
+        if sus_on {
+            self.mean_field_sweep::<true>(tick, &p_table, incub0, quarantine_on)
+        } else {
+            self.mean_field_sweep::<false>(tick, &p_table, incub0, quarantine_on)
+        }
+    }
+
+    #[inline(always)]
+    fn mean_field_sweep<const HET: bool>(&mut self, tick: i32, p_table: &[f64; 8], incub0: i32, quarantine_on: bool) -> i32 {
+        let n = self.n;
         let mut new_infections = 0i32;
         for j in 0..n {
             if self.state[j] != ST_S {
                 continue;
             }
             let q = if quarantine_on && self.quarantined[j] != 0 { 1usize } else { 0usize };
-            let pe = p_table[(((self.defenses[j] & 3) as usize) << 1) | q];
+            let mut pe = p_table[(((self.defenses[j] & 3) as usize) << 1) | q];
+            // Heterogeneous susceptibility: exact cohort lookup, then × s_j.
+            if HET {
+                pe *= self.sus[j];
+                if pe > 1.0 {
+                    pe = 1.0;
+                }
+            }
             if pe <= 0.0 {
                 continue;
             }
@@ -931,6 +1193,7 @@ pub extern "C" fn init(size: u32) {
         csr_offsets: Default::default(),
         csr_list: Default::default(),
         sched: Vec::new(),
+        sus: Vec::new(),
         stats: [0; 12],
     };
     unsafe {
@@ -1036,6 +1299,38 @@ pub extern "C" fn sched_alloc(len: u32) -> *mut f64 {
         std::ptr::null_mut()
     } else {
         s.as_mut_ptr()
+    }
+}
+
+/// Draw the per-cell susceptibility multipliers s_i ~ Gamma(1/cv², cv²), in
+/// cell order, from the main stream (exact port of `drawSusceptibility` in
+/// population.ts). Call after `set_rng` and before `finalize_init`/`step`.
+/// cv <= 0 (or non-finite) = off: clears `sus` and draws nothing.
+#[no_mangle]
+pub extern "C" fn susceptibility_init(cv: f64) {
+    let sim = sim();
+    sim.sus.clear();
+    if !(cv.is_finite() && cv > 0.0) {
+        return;
+    }
+    let theta = cv * cv;
+    let shape = 1.0 / theta;
+    let n = sim.n;
+    sim.sus.reserve_exact(n);
+    for _ in 0..n {
+        let g = sim.rng.gamma(shape);
+        sim.sus.push(g * theta);
+    }
+}
+
+/// Pointer to the susceptibility multipliers (n f64s), or null when off.
+#[no_mangle]
+pub extern "C" fn susceptibility_ptr() -> *const f64 {
+    let s = &sim().sus;
+    if s.is_empty() {
+        std::ptr::null()
+    } else {
+        s.as_ptr()
     }
 }
 

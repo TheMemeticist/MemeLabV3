@@ -3,7 +3,7 @@ import type { LongStats, RetiredCostTotals, SimConfig, SimStats, StrainGenes, Vo
 import { LongHistory } from './long-history';
 import { Rng } from './rng';
 import { StrainPool } from './strain';
-import { allocate, seed, type PopulationBuffers } from './population';
+import { allocate, seed, drawSusceptibility, susceptibilityCVOf, type PopulationBuffers } from './population';
 import { makeGeometry, torus, VoronoiLattice, type LatticeGeometry } from './neighbors';
 import { buildVoronoi } from './voronoi';
 import {
@@ -145,6 +145,10 @@ export class Engine {
   /** tick → cells whose quarantine may expire that tick. Entries can be stale
    *  (expiry raised by a later detection); the firing guard re-checks. */
   private qBuckets = new Map<number, number[]>();
+  /** Per-cell susceptibility multipliers s_i (SimConfig.susceptibilityCV), or
+   *  null when the feature is off — the hot loops test for null, so the
+   *  homogeneous engine does no extra arithmetic and no extra draws. */
+  private susceptibility: Float64Array | null = null;
 
   /** Full ordered snapshot of the ring-buffered history. Allocates on every
    *  access — for tests/exports, not for per-frame use (the worker sends
@@ -199,6 +203,18 @@ export class Engine {
       patientZero: true,
       indexCell: opts?.indexCell,
     });
+    // Susceptibility heterogeneity: drawn from the single main RNG, AFTER all
+    // existing setup draws (seed() above; nothing below draws), and only when
+    // the option is on — off ⇒ no draws, null buffer, bit-identical stream.
+    const susCV = susceptibilityCVOf(config);
+    if (susCV > 0) {
+      if (this.susceptibility === null || this.susceptibility.length !== this.pop.n) {
+        this.susceptibility = new Float64Array(this.pop.n);
+      }
+      drawSusceptibility(this.susceptibility, susCV, this.rng);
+    } else {
+      this.susceptibility = null;
+    }
     this.tick = 0;
     this.newInfectionsHistory = [];
     this.newInfectiousHistory = [];
@@ -677,6 +693,10 @@ export class Engine {
               if (quarantineOn && quarantined[idx]) protMul *= qProtMul;
               let importP = protMul * lockdownTransMul;
               if (quarantineOn) importP *= qSrcMul;
+              // The import is an infection of this susceptible cell, gated by
+              // its protection like a per-contact trial, so s_i applies too.
+              const sus = this.susceptibility;
+              if (sus !== null) { importP *= sus[idx]; if (importP > 1) importP = 1; }
               if (importP > 0 && this.rng.bernoulli(importP)) {
                 cur[idx] = ST_I;
                 strainId[idx] = 0;
@@ -754,6 +774,8 @@ export class Engine {
     const exposedAt = this.exposedAt;
     const iList = this.iList;
     const iCount = this.iCount;
+    // Per-target susceptibility (null when off: branch-only, bit-identical).
+    const sus = this.susceptibility;
 
     let newInfections = 0;
     // Hoisted per-step transmission multiplier (interventions R(t) schedule);
@@ -781,7 +803,8 @@ export class Engine {
           if (state[j] !== ST_S) continue;
           let protMul = protByMask[defenses[j] & MASK_ALL];
           if (quarantineOn && quarantined[j]) protMul *= qProtMul;
-          const p = atkSrc * protMul;
+          let p = atkSrc * protMul;
+          if (sus !== null) { p *= sus[j]; if (p > 1) p = 1; }
           if (p <= 0) continue;
           if (rng.bernoulli(p) && next[j] === ST_S) {
             next[j] = ST_E;
@@ -813,7 +836,8 @@ export class Engine {
           if (state[j] !== ST_S) continue;
           let protMul = protByMask[defenses[j] & MASK_ALL];
           if (quarantineOn && quarantined[j]) protMul *= qProtMul;
-          const p = atkSrc * protMul;
+          let p = atkSrc * protMul;
+          if (sus !== null) { p *= sus[j]; if (p > 1) p = 1; }
           if (p <= 0) continue;
           if (rng.bernoulli(p) && next[j] === ST_S) {
             next[j] = ST_E;
@@ -840,7 +864,8 @@ export class Engine {
           if (state[j] !== ST_S) continue;
           let protMul = protByMask[defenses[j] & MASK_ALL];
           if (quarantineOn && quarantined[j]) protMul *= qProtMul;
-          const p = atkSrc * protMul;
+          let p = atkSrc * protMul;
+          if (sus !== null) { p *= sus[j]; if (p > 1) p = 1; }
           if (p <= 0) continue;
           if (rng.bernoulli(p) && next[j] === ST_S) {
             next[j] = ST_E;
@@ -871,7 +896,8 @@ export class Engine {
         if (j === i || state[j] !== ST_S) continue;
         let protMul = protByMask[defenses[j] & MASK_ALL];
         if (quarantineOn && quarantined[j]) protMul *= qProtMul;
-        const p = atkSrc * protMul;
+        let p = atkSrc * protMul;
+        if (sus !== null) { p *= sus[j]; if (p > 1) p = 1; }
         if (p <= 0) continue;
         if (rng.bernoulli(p) && next[j] === ST_S) {
           next[j] = ST_E;
@@ -916,6 +942,7 @@ export class Engine {
     const ST_E = CellState.Exposed;
     const ST_I = CellState.Infectious;
     const exposedAt = this.exposedAt;
+    const sus = this.susceptibility;
 
     const iCount = census[ST_I];
     if (iCount <= 0) return 0;
@@ -948,7 +975,9 @@ export class Engine {
     for (let j = 0; j < n; j++) {
       if (state[j] !== ST_S) continue;
       const idx = ((defenses[j] & MASK_ALL) << 1) | (quarantineOn && quarantined[j] ? 1 : 0);
-      const pe = pTable[idx];
+      let pe = pTable[idx];
+      // Heterogeneous susceptibility: exact cohort lookup first, then × s_j.
+      if (sus !== null) { pe *= sus[j]; if (pe > 1) pe = 1; }
       if (pe <= 0) continue;
       if (rng.bernoulli(pe) && next[j] === ST_S) {
         next[j] = ST_E;
@@ -1037,6 +1066,12 @@ export class Engine {
   /** Detached strain genealogy for inspectors and data exports. */
   snapshotStrains(): import('../types').Strain[] {
     return this.strains.snapshot();
+  }
+
+  /** The per-cell susceptibility multipliers, or null when
+   *  SimConfig.susceptibilityCV is off. Live buffer — for tests/inspection. */
+  susceptibilityBuffer(): Float64Array | null {
+    return this.susceptibility;
   }
 
   buffers(): { state: Uint8Array; defenses: Uint8Array; quarantined: Uint8Array; size: number } {

@@ -525,6 +525,7 @@ export class ControlPanel {
       g.infectious === preset.genes.infectious &&
       Math.abs(g.ifr - preset.genes.ifr) < 1e-6 &&
       g.range === preset.genes.range &&
+      Math.abs((g.mixing ?? 0) - (preset.genes.mixing ?? 0)) < 1e-6 &&
       g.immunityDays === preset.genes.immunityDays &&
       Math.abs(g.mutationRate - preset.genes.mutationRate) < 1e-6;
     this.picker.markCustom(!same);
@@ -648,6 +649,7 @@ export class ControlPanel {
     this.strainSliders.infectious.setValue(g.infectious, true);
     this.strainSliders.ifr.setValue(g.ifr * 100, true);
     this.strainSliders.range.setValue(g.range, true);
+    this.strainSliders.mixing.setValue((g.mixing ?? 0) * 100, true);
     this.strainSliders.immunityDays.setValue(immunityDaysToPos(Math.max(90, g.immunityDays)), true);
     this.strainSliders.mutationRate.setValue(g.mutationRate * 100, true);
     if ((this.cfg.geometry ?? 'square') === 'meanfield') {

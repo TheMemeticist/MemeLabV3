@@ -49,6 +49,24 @@ export const PRESETS: DiseasePreset[] = [
     }),
   },
   {
+    id: 'plague-pneumonic',
+    label: 'Pneumonic plague (pessimistic)',
+    blurb: 'Person-to-person plague, typically by respiratory droplets. Pessimistic settings: untreated fatality and the high end of published R0. Early antibiotics change both.',
+    // Stage durations: mean incubation 4.3 d, infectious 2.5 d in untreated
+    // historical cases (Gani & Leach 2004), in whole days. Untreated fatality is
+    // close to 100% (same source); treated confirmed cases in Madagascar 2017
+    // were 8/32 = 25% (Randremanana et al. 2019). attackRate 0.4 with mixing 0.2
+    // reads R0 ~2.7 on the square lattice: the high end of published estimates
+    // (about 1.2 to 3.5; Gani & Leach 2004, Tsuzuki et al. 2017, Nishiura 2006).
+    // For the low end use attackRate ~0.17 (R0 ~1.3).
+    genes: { attackRate: 0.4, incubation: 4, infectious: 2, ifr: 0.95, range: 1, immunityDays: 3650, mutationRate: 0.005, mixing: 0.2 },
+    cost: mkCost(3650, {
+      hospitalizationRate: 0.95, icuRate: 0.40, symptomaticFraction: 0.99, workCapacityLoss: 1.0,
+      medCostMild: 150, medCostHospWard: 2_000, medCostICU: 8_000,
+      quarantineIsHospital: true,
+    }),
+  },
+  {
     id: 'sars2-wild',
     label: 'SARS-2: Wild-Type',
     blurb: 'The original lineage. Reinfection within months.',

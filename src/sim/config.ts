@@ -14,6 +14,18 @@ export const MAX_GRID_SIZE = 320;
 export const MIN_STAGE_DAYS = 1;
 export const MAX_STAGE_DAYS = 365;
 
+/** Upper bound on SimConfig.susceptibilityCV accepted from permalinks and
+ *  saved state (CV 10 ⇒ Gamma shape 0.01: nearly all cells ~0, a few huge). */
+export const MAX_SUSCEPTIBILITY_CV = 10;
+/** Smallest non-zero heterogeneity the app accepts. Share links carry three
+ *  decimals, and far smaller values overflow the Gamma shape (1/cv²) into
+ *  non-finite multipliers, so anything below this is treated as off. */
+export const MIN_SUSCEPTIBILITY_CV = 0.001;
+export function clampSusceptibilityCV(v: number): number {
+  if (!Number.isFinite(v) || v < MIN_SUSCEPTIBILITY_CV) return 0;
+  return Math.min(MAX_SUSCEPTIBILITY_CV, v);
+}
+
 /** Maximum length of a fitted per-day transmission schedule (days). */
 export const MAX_SCHEDULE_LEN = 10_000;
 
@@ -62,6 +74,9 @@ export function restoreSimConfig(value: unknown, fallback: SimConfig): SimConfig
   result.birthRate = fraction(value.birthRate, fallback.birthRate);
   result.mutate = flag(value.mutate, fallback.mutate);
   if (typeof value.reseedOnExtinction === 'boolean') result.reseedOnExtinction = value.reseedOnExtinction;
+  if (typeof value.susceptibilityCV === 'number' && Number.isFinite(value.susceptibilityCV)) {
+    result.susceptibilityCV = clampSusceptibilityCV(value.susceptibilityCV);
+  }
   const strain = value.strain;
   const baseStrain = fallback.strain;
   result.strain = {
@@ -73,6 +88,9 @@ export function restoreSimConfig(value: unknown, fallback: SimConfig): SimConfig
     immunityDays: bounded(strain.immunityDays, baseStrain.immunityDays, 1, 36500, true),
     mutationRate: fraction(strain.mutationRate, baseStrain.mutationRate),
   };
+  if (typeof strain.mixing === 'number' && Number.isFinite(strain.mixing)) {
+    result.strain.mixing = fraction(strain.mixing, baseStrain.mixing ?? 0);
+  }
   const defenses = value.defenses;
   result.defenses = fallback.defenses.map((base) => {
     const defense = defenses.find((candidate) => object(candidate) && candidate.id === base.id);

@@ -52,4 +52,12 @@ describe('saved simulation configuration', () => {
     expect(restored.defenses[0]).toMatchObject({ enabled: base.defenses[0].enabled, uptake: 0 });
     expect(restored.defenses[1]).toEqual(base.defenses[1]);
   });
+  it('keeps the long-range mixing gene of a saved strain', () => {
+    const base = baseSimConfig('plague-pneumonic');
+    expect(base.strain.mixing).toBe(0.2);
+    const restored = restoreSimConfig(JSON.parse(JSON.stringify(base)), baseSimConfig('bdbv'));
+    expect(restored.strain.mixing).toBe(0.2);
+    const plain = restoreSimConfig(JSON.parse(JSON.stringify(baseSimConfig('sars2-wild'))), base);
+    expect(plain.strain.mixing ?? 0).toBe(0);
+  });
 });

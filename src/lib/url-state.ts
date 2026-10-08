@@ -10,6 +10,7 @@
 // Keys are terse but inline-editable. Map:
 //   p   preset id        s   seed            z   grid size       g   geometry
 //   si  seed infections  br  birth rate      mu  mutate          n   custom name
+//   sv  susceptibility CV (heterogeneity; absent/0 = off)
 //   t   theme            sp  speed index
 //   strain: at attack · ic incubation · if infectious · fr ifr · rg range
 //           im immunity days · mr mutation rate
@@ -27,7 +28,8 @@
 import type { CostConfig, GeometryType, VoronoiMode, SimConfig } from '../types';
 import { findCurrency, costConfigFromProfile } from './cost';
 import { baseSimConfig, findPreset } from '../sim/presets';
-import { MIN_GRID_SIZE, MAX_GRID_SIZE, MIN_STAGE_DAYS, MAX_STAGE_DAYS } from '../sim/config';
+import { MIN_GRID_SIZE, MAX_GRID_SIZE, MIN_STAGE_DAYS, MAX_STAGE_DAYS, clampSusceptibilityCV } from '../sim/config';
+import { susceptibilityCVOf } from '../sim/population';
 
 const VALID_GEOMETRIES = new Set<string>(['square', 'triangular', 'hexagonal', 'meanfield', 'voronoi']);
 const VALID_VORONOI_MODES = new Set<string>(['uniform', 'jittered', 'relaxed', 'settlements']);
@@ -68,6 +70,7 @@ export function encode(opts: PermalinkOptions): string {
   num('si', c.seedInfections, b.seedInfections);
   num('br', c.birthRate, b.birthRate);
   flag('mu', c.mutate, b.mutate);
+  num('sv', susceptibilityCVOf(c), susceptibilityCVOf(b));
 
   // Strain genes.
   const sg = c.strain, bg = b.strain;
@@ -250,6 +253,11 @@ export function applyEncoded(p: URLSearchParams, baseArg: SimConfig): {
     birthRate: clamp01(num(p, 'br', base.birthRate)),
     mutate: bool(p, 'mu', base.mutate),
     reseedOnExtinction: base.reseedOnExtinction,
+    // Structural engine option; only materialized when the link or the preset
+    // carries it, so heterogeneity-free links decode to the same object shape.
+    ...(p.has('sv') || base.susceptibilityCV !== undefined
+      ? { susceptibilityCV: clampSusceptibilityCV(num(p, 'sv', base.susceptibilityCV ?? 0)) }
+      : {}),
     strain: {
       attackRate: clamp01(num(p, 'at', base.strain.attackRate)),
       incubation: clampInt(int(p, 'ic', base.strain.incubation), MIN_STAGE_DAYS, MAX_STAGE_DAYS),

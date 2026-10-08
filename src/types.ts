@@ -111,6 +111,15 @@ export interface SimConfig {
    *  false so that effective measures actually end an outbreak instead of
    *  triggering perpetual reseeds. */
   reseedOnExtinction?: boolean;
+  /** Heterogeneity in individual susceptibility. When a finite number > 0,
+   *  each cell gets a fixed multiplier s_i ~ Gamma(mean 1, CV = this value),
+   *  drawn at reset from the main RNG right after the population seed draws
+   *  (only when on — n Gamma variates, so the run's trajectory changes), and every
+   *  per-contact infection probability for susceptible cell i is multiplied
+   *  by s_i, clamped to [0, 1]. Undefined / 0 = off: no draws, bit-identical
+   *  to the homogeneous engine. Structural (like seed): takes effect on
+   *  reset(), not patchConfig(). CPU and WASM engines only (GPU refuses it). */
+  susceptibilityCV?: number;
   strain: StrainGenes;
   defenses: DefenseSpec[];
   lockdown: LockdownSpec;

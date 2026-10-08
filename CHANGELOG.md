@@ -2,6 +2,16 @@
 
 One line per user-visible change, newest first. Adding an entry is the last item on the dev checklist in `docs/ROADMAP.md`.
 
+## 2026-10-07
+
+- Engine: optional **varied susceptibility** (`susceptibilityCV`; share-link key `sv`, 0.001 to 10, off by default, no control in the interface yet): each cell draws a Gamma-distributed susceptibility multiplier with mean 1. CPU and WASM only. Values below 0.001 are treated as off.
+- Fix: the GPU picker now gives the right reason when varied susceptibility keeps a run off the GPU.
+
+## 2026-10-05
+
+- Fix: the **Long-range mixing** slider now shows the value a preset or share link sets, and a page reload keeps the mixing value (it was silently reset to 0).
+- Disease: new **Pneumonic plague (pessimistic)** preset — incubation 4 d and infectious 2 d (Gani & Leach 2004), untreated fatality, and a spread rate at the high end of published R0 (about 2.7), with long-range mixing 0.2.
+
 ## 2026-09-22
 
 - Docs: **forecasting benchmark report** (`docs/FORECAST-BENCHMARK.md`) — MemeLab's hand-calibration recipe scored 1–6 weeks ahead on 15 real outbreaks of 12 pathogens against standard models and baselines, plus a head-to-head with the published forecasts of the 2026 DRC Bundibugyo outbreak and a frozen 6-week forecast.

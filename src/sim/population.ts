@@ -1,5 +1,27 @@
 import { CellState, DefenseFlag } from '../types';
+import type { SimConfig } from '../types';
 import type { Rng } from './rng';
+
+/** The effective susceptibility CV for a config: the field when it is a
+ *  finite number > 0, else 0 (feature off). */
+export function susceptibilityCVOf(config: SimConfig): number {
+  const cv = config.susceptibilityCV;
+  return typeof cv === 'number' && Number.isFinite(cv) && cv > 0 ? cv : 0;
+}
+
+/**
+ * Fill `out` with per-cell susceptibility multipliers s_i ~ Gamma(shape 1/CV²,
+ * scale CV²) — mean 1, coefficient of variation `cv` — drawn in cell order
+ * from `rng`. Requires cv > 0. The engines call it on their single main RNG
+ * ONLY when the option is on, immediately after `seed()` (after every other
+ * setup draw), so the option-off stream is untouched. `WasmEngine` makes the
+ * same draws in Rust (`susceptibility_init`) on the handed-over stream.
+ */
+export function drawSusceptibility(out: Float64Array, cv: number, rng: Rng): void {
+  const theta = cv * cv;
+  const shape = 1 / theta;
+  for (let i = 0; i < out.length; i++) out[i] = rng.gamma(shape) * theta;
+}
 
 export interface PopulationBuffers {
   size: number;

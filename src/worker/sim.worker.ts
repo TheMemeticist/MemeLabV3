@@ -161,6 +161,7 @@ function wasmBlockReason(_config: SimConfig): string {
 function gpuBlockReason(config: SimConfig): string {
   if (config.mutate === true) return wasmBlockReason(config);
   if ((config.strain.mixing ?? 0) > 0) return 'long-range mixing runs on the CPU/WASM engines — set mixing to 0 to use GPU';
+  if ((config.susceptibilityCV ?? 0) > 0) return 'varied susceptibility runs on the CPU/WASM engines — remove it from the link to use GPU';
   return 'extinction reseed runs on the CPU engines — disable it to use GPU';
 }
 
