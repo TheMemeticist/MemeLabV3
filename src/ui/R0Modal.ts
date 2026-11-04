@@ -1056,7 +1056,7 @@ export class R0Modal {
           <label class="r0-check" title="Include this intervention in the fit's transmission schedule.">
             <input type="checkbox" data-iv="on" ${iv.enabled ? 'checked' : ''} />
           </label>
-          <input class="r0-in r0-itv-name" type="text" value="${iv.label.replace(/"/g, '&quot;')}" data-iv="label" aria-label="Intervention name" />
+          <input class="r0-in r0-itv-name" type="text" value="${escapeAttr(String(iv.label))}" data-iv="label" aria-label="Intervention name" />
           <select class="r0-in" data-iv="tax" title="The live sim's intervention taxonomy — selecting a type seeds the SAME rich controls the main sim uses (from the current sim config); main-sim toggles of this key sync the enabled state.">
             ${['custom', 'mask', 'vaccine', 'lockdown', 'quarantine']
               .map((k) => `<option value="${k}"${iv.intervention === k ? ' selected' : ''}>${k}</option>`).join('')}
@@ -1118,7 +1118,7 @@ export class R0Modal {
         row.innerHTML = `
           <div class="r0-kf-row-head" role="button" tabindex="0" aria-label="Toggle keyframe ${ki + 1} sliders">
             <button class="r0-kf-caret" type="button" aria-label="Expand or collapse this keyframe">${icon('caretRight')}</button>
-            <label>day <input class="r0-in tiny" type="number" step="1" value="${kf.tick}" data-kf="day" aria-label="Keyframe day" /></label>
+            <label>day <input class="r0-in tiny" type="number" step="1" value="${escapeAttr(String(kf.tick))}" data-kf="day" aria-label="Keyframe day" /></label>
             <button class="r0-del" type="button" aria-label="Delete keyframe" ${kfs.length <= 1 ? 'disabled' : ''}>${icon('delete')}</button>
           </div>
           <div class="r0-kf-body" hidden></div>
@@ -1300,8 +1300,8 @@ export class R0Modal {
         const row = document.createElement('div');
         row.className = 'r0-adjust-row';
         row.innerHTML = `
-          <label>day <input class="r0-in tiny" type="number" step="1" value="${f.day}" data-kf="day" aria-label="${label} keyframe day" /></label>
-          <label>× <input class="r0-in tiny" type="number" step="0.1" min="1" value="${f.m}" data-kf="m" aria-label="${label} keyframe multiplier" /></label>
+          <label>day <input class="r0-in tiny" type="number" step="1" value="${escapeAttr(String(f.day))}" data-kf="day" aria-label="${label} keyframe day" /></label>
+          <label>× <input class="r0-in tiny" type="number" step="0.1" min="1" value="${escapeAttr(String(f.m))}" data-kf="m" aria-label="${label} keyframe multiplier" /></label>
           <button class="r0-del" type="button" aria-label="Delete keyframe" ${frames.length <= 1 ? 'disabled' : ''}>${icon('delete')}</button>
         `;
         row.querySelector<HTMLInputElement>('[data-kf="day"]')!.addEventListener('change', (e) => {
@@ -1875,7 +1875,7 @@ export class R0Modal {
     const rating = gofRating(r.gof.r2);
     const barPct = r.gof.r2 != null && Number.isFinite(r.gof.r2) ? Math.max(0, Math.min(1, r.gof.r2)) * 100 : null;
     const paramRows = r.params
-      .map((p) => `<tr><td>${p.label}</td><td>${fmtParam(p.name, p.value)}</td></tr>`)
+      .map((p) => `<tr><td>${escapeHtml(String(p.label))}</td><td>${fmtParam(p.name, p.value)}</td></tr>`)
       .join('')
       + (r.indexOffset == null ? '' : `<tr>
           <td title="Evolved during the fit. The interval is a PROFILE-LIKELIHOOD CI — calibrated via 2·ln(Lmax/L) ≤ 3.84 (95%) / 1.0 (68%) over the index-date grid with the other parameters at their best. It is a parameter interval, distinct from the fan chart's ensemble percentile bands (predictive spread).">Index date (head start)</td>

@@ -65,6 +65,10 @@ function topologyFor(config: SimConfig, baseSeed: number): VoronoiTopology | und
   return cachedTopo;
 }
 
+/** The worker's shared trial engine and Voronoi topology cache, for estimators that run their own trial loops
+ *  (fit-recipe.ts). Same backend choice and reuse rules as every runner in this file. */
+export { engineFor as trialEngine, topologyFor as trialTopology };
+
 /** Run K stochastic trials of `config` for `days` days; returns mean per-capita
  *  SEIR curves (fractions in [0..1], length days + 1) plus the engine's analytic
  *  R₀ for the candidate (identical across trials — same genes + topology). */

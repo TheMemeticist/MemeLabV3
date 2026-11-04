@@ -175,7 +175,7 @@ export function decodeCostConfig(p: URLSearchParams, base: CostConfig): CostConf
   return {
     regionId: p.get('cR') ?? base.regionId,
     currencyCode,
-    currencyRate: num(p, 'crt', p.has('cC') ? findCurrency(currencyCode).rateVsUsd : base.currencyRate),
+    currencyRate: Math.max(0, num(p, 'crt', p.has('cC') ? findCurrency(currencyCode).rateVsUsd : base.currencyRate)),
     profile: {
       hospitalizationRate: clamp01(num(p, 'chr', b.hospitalizationRate)),
       icuRate: clamp01(num(p, 'cic', b.icuRate)),

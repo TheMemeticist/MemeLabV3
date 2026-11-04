@@ -1,3 +1,4 @@
+/// <reference types="node" />
 // Headless tick-rate benchmark — the Phase 0 perf harness required by
 // docs/wasm-plan.md §2. Run with `npm run bench` (vite-node; no browser).
 //

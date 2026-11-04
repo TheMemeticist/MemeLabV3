@@ -1,3 +1,4 @@
+/// <reference types="node" />
 // Backend A/B harness — TS engine vs the Rust/WASM core on the identical
 // workload, plus a grid-size scaling sweep. Companion to `tests/bench.ts`
 // (which measures the TS engine alone and its per-pass split).

@@ -1592,7 +1592,7 @@ export function parseObservedCSV(text: string, defaultCategory: FitCategory = 'c
     const value = Number(cells[1]);
     if (!Number.isFinite(day) || !Number.isFinite(value)) { skipped++; continue; } // header / junk
     const catRaw = (cells[2] ?? '').toLowerCase().replace(/\s+/g, '_');
-    const category = CATEGORY_ALIASES[catRaw] ?? defaultCategory;
+    const category = (Object.hasOwn(CATEGORY_ALIASES, catRaw) ? CATEGORY_ALIASES[catRaw] : undefined) ?? defaultCategory;
     points.push({ day, value, category });
   }
   return { points, skipped };

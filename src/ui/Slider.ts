@@ -46,7 +46,7 @@ export class Slider {
           : opts.label}</span>
         <span class="slider-value" data-value></span>
       </div>
-      <input id="slider-${opts.id}" type="range"
+      <input id="slider-${escapeAttr(opts.id)}" type="range"
         min="${opts.min}" max="${opts.max}" step="${opts.step ?? 1}" value="${opts.value}"
         aria-label="${opts.label}" ${opts.hint ? `aria-description="${escapeAttr(opts.hint)}"` : ''} />
     `;

@@ -22,6 +22,7 @@ has been verified for publication.
 | Five geometries (square, triangular, hexagonal, Voronoi, mean-field) | **Done** | `src/types.ts` geometry union, `src/sim/neighbors.ts`, `src/sim/voronoi.ts` |
 | Interventions + live patching | **Done** | `src/sim/defense.ts`, `Engine.patchConfig()` |
 | Inverse fitting / R₀ estimator with GA optimizer | **Done** | `src/lib/ga.ts`, `src/lib/fit*.ts`, `src/ui/R0Modal.ts` |
+| Individual-scale recipe estimator (benchmark-confirmed forecasting) | **Implemented (library + worker), no UI** | `src/lib/fit-recipe.ts`, `tests/fit-recipe.test.ts`; same code as the benchmark harness, parity proved 2026-10-26; parallel driver `src/lib/fit-recipe-parallel.ts` (identical for any worker count); opt-in `pooledFits` (seed-pooled fits, off by default) |
 | Economic cost model | **Done** | `src/lib/cost.ts`, `src/ui/CostModal.ts` |
 | R_eff = 1 reference line on chart | **Done** | `src/ui/Chart.ts`, `paintReffThreshold()` |
 | Observed outbreak phase and peak annotation | **Implemented and verified, September 16** | `src/lib/outbreak.ts`, `Stats.ts`, `Chart.ts`; E+I trend, infectious peak so far, reset/history edge cases |

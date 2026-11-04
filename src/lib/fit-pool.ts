@@ -40,6 +40,8 @@ function toResult(r: FitWorkerResult): SimResult {
 // are constant per run, but we include them so the key is self-contained.
 // FNV-1a over a transmission schedule so scheduled and unscheduled runs (and
 // runs under different schedules) can never collide in the cache.
+// Every byte of each rounded value is hashed (the high bytes too: two multipliers that differ only above the
+// low 16 bits, e.g. 0.5 and 0.565536, must not collide), and the length is part of the key.
 function scheduleHash(s?: number[]): string {
   if (!s || s.length === 0) return '0';
   let h = 0x811c9dc5;
@@ -47,13 +49,21 @@ function scheduleHash(s?: number[]): string {
     const v = Math.round(s[i] * 1e6);
     h ^= v & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
     h ^= (v >> 8) & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+    h ^= (v >> 16) & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+    h ^= (v >>> 24) & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
   }
-  return (h >>> 0).toString(16);
+  return `${s.length}:${(h >>> 0).toString(16)}`;
 }
 
-function cacheKey(cmd: FitWorkerCommand): string {
+/** Cache key of one pool command. The fitted genes are quantized (so grid/refine overlaps reuse results); every
+ *  other field that changes a trial — the long-range mixing gene, susceptibility spread, initial seeding, waning
+ *  immunity, defences, interventions, geometry details, every other strain gene — is keyed exactly. Exported for
+ *  tests. */
+export function fitPoolCacheKey(cmd: FitWorkerCommand): string {
   const g = cmd.config.strain;
   const q = (x: number, p = 1e4) => Math.round(x * p) / p;
+  const { strain: _strain, ...world } = cmd.config;
+  const { attackRate: _a, range: _r, incubation: _i, infectious: _f, ifr: _d, mixing: _m, ...otherGenes } = g;
   return [
     cmd.pickSeed ? 'S' : cmd.ensemble ? 'E' : 'M', // modes must never collide
     scheduleHash(cmd.schedule),
@@ -67,6 +77,9 @@ function cacheKey(cmd: FitWorkerCommand): string {
     q(g.incubation, 100),
     q(g.infectious, 100),
     q(g.ifr),
+    q(g.mixing ?? 0),
+    JSON.stringify(otherGenes),
+    JSON.stringify(world),
   ].join('|');
 }
 
@@ -109,7 +122,7 @@ export class FitPool {
   }
 
   private enqueue(cmd: FitWorkerCommand): Promise<SimResult> {
-    const key = cacheKey(cmd);
+    const key = fitPoolCacheKey(cmd);
     const cached = this.cache.get(key);
     if (cached) return Promise.resolve(cached);
     return new Promise<SimResult>((resolve, reject) => {

@@ -2,6 +2,16 @@
 
 One line per user-visible change, newest first. Adding an entry is the last item on the dev checklist in `docs/ROADMAP.md`.
 
+## 2026-11-04
+
+- Security: build and test tooling upgraded (Vite 5 → 7, Vitest 2 → 4, standalone `vite-node` for `npm run bench`); `npm audit` reports no known vulnerabilities. The production bundle is unchanged in behaviour.
+- Security: saved R₀ Estimator values (keyframes, intervention names and ids, fitted parameter labels) are escaped before they are written into the page; a pasted CSV category such as `__proto__` falls back to the default category; a negative currency rate in a share link is clamped to 0.
+
+## 2026-10-26
+
+- Estimator (local): an opt-in **individual-scale forecasting estimator** (`lib/fit-recipe.ts`, fit worker command `recipe`; one simulated person per cell, bounded turn multipliers, state anchor at the forecast date). Off by default and not yet in the interface. It can run across several workers (`lib/fit-recipe-parallel.ts`, default one fewer than the CPU cores, at most 8) with byte-identical results; about 4–5× faster with 8 workers. Opt-in extra `pooledFits` (default 1 = off, unchanged results): forecast from the pooled trials of several fits that differ only in seed (3 is the tested setting; 3× the CPU).
+- Fix: the R₀ Estimator's simulation cache ignored the long-range mixing gene (and susceptibility spread, initial seeding, waning immunity, defences, and the high bits of schedule values), so a fit could reuse a result from a different setting.
+
 ## 2026-10-07
 
 - Engine: optional **varied susceptibility** (`susceptibilityCV`; share-link key `sv`, 0.001 to 10, off by default, no control in the interface yet): each cell draws a Gamma-distributed susceptibility multiplier with mean 1. CPU and WASM only. Values below 0.001 are treated as off.
